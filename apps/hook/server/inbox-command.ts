@@ -32,6 +32,9 @@ import {
 import { handleInboxServerReady, startInboxServer } from "@plannotator/server/inbox";
 import { exposureWarning, type InboxTailscaleState } from "@plannotator/server/inbox-tailscale";
 import { openBrowser } from "@plannotator/server/browser";
+import { agentSpec, createAgentEnvironment, formatConnectReport, inboxConnectDisabled } from "@plannotator/server/inbox-agents";
+import { addInboxNote, inboxNotesDisabled, markNotesAsked } from "@plannotator/server/inbox-agent-notes";
+import { INBOX_AGENT_LABELS, INBOX_NOTE_AGENT_IDS, type InboxConnectReport, type InboxNoteAgentId } from "@plannotator/core/inbox-types";
 import { writeUrlQr } from "@plannotator/server/qr";
 import { getCliVersion } from "./cli";
 import { inboxHostSessionFromEnv, runInboxMcpShim } from "./inbox-mcp-shim";
@@ -39,6 +42,14 @@ import { inboxHostSessionFromEnv, runInboxMcpShim } from "./inbox-mcp-shim";
 export const INBOX_LOG_FILE = "inbox.log";
 /** Set by a starter that holds the start lock for the detached Inbox it spawns. */
 const LOCK_HELD_ENV = "PLANNOTATOR_INBOX_LOCK_HELD";
+/**
+ * Set on an Inbox started detached (`--background`, a connection or the shim
+ * starting a stopped one, the window's Restart): such a start never connects
+ * agents, which only a person's `plannotator inbox` does. Scrubbed at start.
+ * LOCK_HELD_ENV alone means the same (an older Inbox's spawn, which predates
+ * this marker; see runInboxCommand).
+ */
+const DETACHED_ENV = "PLANNOTATOR_INBOX_DETACHED";
 /** How long a starter waits for a detached Inbox to answer its health check. */
 const START_TIMEOUT_MS = 20_000;
 
@@ -67,7 +78,7 @@ function spawnDetachedInbox(dataDir: string, tailscale: boolean): void {
     cwd: dir,
     windowsHide: true,
     stdio: ["ignore", log, log],
-    env: { ...process.env, PLANNOTATOR_DATA_DIR: dataDir, [LOCK_HELD_ENV]: "1" },
+    env: { ...process.env, PLANNOTATOR_DATA_DIR: dataDir, [LOCK_HELD_ENV]: "1", [DETACHED_ENV]: "1" },
   });
   child.unref();
   closeSync(log);
@@ -177,8 +188,36 @@ async function publishRunningInbox(entry: InboxRegistryEntry): Promise<void> {
   }
 }
 
+/** What connecting the agents did, on stderr (stdout is unchanged). Nothing when nothing changed. */
+function reportConnect(report: InboxConnectReport | undefined): void {
+  if (!report) return;
+  for (const line of formatConnectReport(report)) process.stderr.write(`${line}\n`);
+}
+
+/**
+ * `plannotator inbox` with an Inbox already running (an agent may have
+ * started it with --background): ask it to connect the agents on this
+ * computer, through its token-guarded connection route. An Inbox that
+ * predates the route answers 404, and connects nothing.
+ */
+async function connectRunningInbox(entry: InboxRegistryEntry): Promise<void> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${entry.port}/api/inbox/control/connect`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${entry.token}`, "Content-Type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(40_000),
+    });
+    if (!response.ok) return;
+    const body = (await response.json()) as { connect?: InboxConnectReport };
+    reportConnect(body.connect);
+  } catch {
+    // The agents are connected at the next run.
+  }
+}
+
 /** Run the Inbox server in this process until a signal or the stop route ends it. */
-async function serveInbox(dataDir: string, open: boolean, htmlContent: string | undefined, tailscale: boolean): Promise<never> {
+async function serveInbox(dataDir: string, open: boolean, htmlContent: string | undefined, tailscale: boolean, connect: boolean): Promise<never> {
   // A detached Inbox runs under its starter's lock; anyone else takes it, so
   // two people (or a person and an agent) never start two writers on one store.
   const lockHeldByStarter = process.env[LOCK_HELD_ENV] === "1";
@@ -193,6 +232,7 @@ async function serveInbox(dataDir: string, open: boolean, htmlContent: string | 
     process.stderr.write(`Plannotator Inbox: ${running.url}\n`);
     if (tailscale) await publishRunningInbox(running);
     if (open) await openBrowser(running.url);
+    if (connect) await connectRunningInbox(running);
     process.exit(0);
   }
   let inbox: Awaited<ReturnType<typeof startInboxServer>>;
@@ -203,6 +243,7 @@ async function serveInbox(dataDir: string, open: boolean, htmlContent: string | 
       process.stderr.write(`Plannotator Inbox: ${entry.url}\n`);
       if (tailscale) await publishRunningInbox(entry);
       if (open) await openBrowser(entry.url);
+      if (connect) await connectRunningInbox(entry);
       process.exit(0);
     }
     inbox = await startInboxServer({
@@ -237,6 +278,9 @@ async function serveInbox(dataDir: string, open: boolean, htmlContent: string | 
   process.once("SIGINT", () => shutdown(130));
   process.once("SIGTERM", () => shutdown(143));
   await handleInboxServerReady(inbox, { open });
+  // Off the request path: the window is already open, and its note dialog shows
+  // what this did once it is done (GET /api/inbox/agents).
+  if (connect) void inbox.connectAgents().then(reportConnect, () => {});
   const tailnet = inbox.tailscale.state();
   if (tailnet.on || tailscale) {
     // This process's stderr already carries the server's own exposure warning.
@@ -244,6 +288,60 @@ async function serveInbox(dataDir: string, open: boolean, htmlContent: string | 
     if (tailnet.url && tailnet.source === "flag") reportFlagScope();
   }
   return new Promise<never>(() => {});
+}
+
+/**
+ * `plannotator inbox --notes codex,gemini`: add the Inbox note to these
+ * agents' instructions files (inbox-agent-notes.ts), for the install prompt
+ * once the person agreed in chat, and mark the window's one-time question as
+ * answered. Starts nothing. Exit 0 when every note is there, 1 otherwise.
+ */
+async function writeNotes(dataDir: string, list: string): Promise<number> {
+  const ids = [...new Set(list.split(",").map((id) => id.trim()).filter(Boolean))];
+  const unknown = ids.filter((id) => !(INBOX_NOTE_AGENT_IDS as readonly string[]).includes(id));
+  if (ids.length === 0 || unknown.length > 0) {
+    process.stderr.write(`Unknown agent${unknown.length === 1 ? "" : "s"} for --notes: ${unknown.join(", ") || "(none)"}. Use any of: ${INBOX_NOTE_AGENT_IDS.join(", ")}.\n`);
+    return 1;
+  }
+  const environment = createAgentEnvironment();
+  if (inboxNotesDisabled(environment.env)) {
+    process.stderr.write("PLANNOTATOR_INBOX_NOTES=0 is set: notes are off, nothing was written.\n");
+    return 1;
+  }
+  let ok = true;
+  const added: InboxNoteAgentId[] = [];
+  for (const id of ids as InboxNoteAgentId[]) {
+    const label = INBOX_AGENT_LABELS[id];
+    // Never a file for an agent that is not on this computer.
+    if (!agentSpec(id).detect(environment)) {
+      ok = false;
+      process.stderr.write(`${label}: not added (${label} was not found on this computer).\n`);
+      continue;
+    }
+    const change = addInboxNote(id, dataDir, environment);
+    if (!change.ok) {
+      ok = false;
+      process.stderr.write(`${label}: not added (${change.reason}).\n`);
+      continue;
+    }
+    added.push(id);
+    const said = {
+      added: `Added a marked section to ${change.path}`,
+      created: `Created ${change.path}`,
+      updated: `Updated the note in ${change.path}`,
+      unchanged: `${change.path} already has the note`,
+      "kept-edited": `${change.path} has the note as you edited it; left as it is`,
+      shared: `${change.path} already has the note (a file another agent reads too)`,
+      "kept-shared": "",
+      removed: "",
+      deleted: "",
+    }[change.action];
+    process.stderr.write(`${label}: ${said}.\n`);
+  }
+  // The window never asks about an agent whose note is there now; the others are still asked, once each.
+  await markNotesAsked(added, { dataDir, selfCommand: selfCommand(), environment });
+  if (ok) process.stderr.write("Each agent reads it from its next session. Remove it in the Inbox's Settings or with plannotator uninstall.\n");
+  return ok ? 0 : 1;
 }
 
 function usageError(message: string): never {
@@ -258,6 +356,15 @@ export interface InboxCommandAssets {
 
 export async function runInboxCommand(args: readonly string[], assets: InboxCommandAssets = {}): Promise<never> {
   const dataDir = getPlannotatorDataDir();
+  // Only a person's `plannotator inbox` connects agents, never a detached start.
+  // An Inbox older than DETACHED_ENV (0.28.17 and before) spawns its detached
+  // starts (its Restart into an updated binary, --background, a connection)
+  // with only LOCK_HELD_ENV, which every detached start has carried since the
+  // first Inbox and a person's run never does; so it counts as detached too.
+  const detached = process.env[DETACHED_ENV] === "1" || process.env[LOCK_HELD_ENV] === "1";
+  delete process.env[DETACHED_ENV];
+  // PLANNOTATOR_INBOX_CONNECT=0 in this shell skips it, also on an Inbox an agent started.
+  const connect = !detached && !inboxConnectDisabled(process.env);
 
   if (args[0] === "mcp") {
     if (args.length > 1) usageError(`Unknown inbox mcp option: ${args[1]}`);
@@ -270,6 +377,11 @@ export async function runInboxCommand(args: readonly string[], assets: InboxComm
     process.exit(0);
   }
 
+  if (args[0] === "--notes") {
+    if (args.length !== 2) usageError("--notes takes one list of agents, e.g. --notes codex,gemini, and no other option.");
+    process.exit(await writeNotes(dataDir, args[1]!));
+  }
+
   let background = false;
   let noOpen = false;
   let tailscale = false;
@@ -277,6 +389,7 @@ export async function runInboxCommand(args: readonly string[], assets: InboxComm
     if (arg === "--background") background = true;
     else if (arg === "--no-open") noOpen = true;
     else if (arg === "--tailscale") tailscale = true;
+    else if (arg === "--notes") usageError("--notes goes first and alone: plannotator inbox --notes codex,gemini");
     else usageError(`Unknown inbox option: ${arg}`);
   }
 
@@ -307,7 +420,8 @@ export async function runInboxCommand(args: readonly string[], assets: InboxComm
     process.stderr.write(`Plannotator Inbox: ${entry.url}\n`);
     if (tailscale) await publishRunningInbox(entry);
     if (!noOpen) await openBrowser(entry.url);
+    if (connect) await connectRunningInbox(entry);
     process.exit(0);
   }
-  return serveInbox(dataDir, !noOpen, assets.htmlContent, tailscale);
+  return serveInbox(dataDir, !noOpen, assets.htmlContent, tailscale, connect);
 }

@@ -95,7 +95,7 @@ import {
 	resolveHtmlAssetRoute,
 	rewriteHtmlAssetReferences,
 } from "../generated/html-assets.ts";
-import { inlineHtmlLocalAssets, isWithinDirectory, MAX_HTML_ASSET_BYTES, resolveOpenInTarget } from "../generated/html-assets-node.ts";
+import { folderSessionAssetAllowed, htmlAssetContext, inlineHtmlLocalAssets, isWithinDirectory, MAX_HTML_ASSET_BYTES, resolveOpenInTarget } from "../generated/html-assets-node.ts";
 import {
 	supportsAnnotateAgentTerminalMode,
 	type AgentTerminalCapability,
@@ -150,30 +150,35 @@ function firstHeader(value: string | string[] | undefined): string | null {
 	return value ?? null;
 }
 
-function createHtmlAssetRegistry() {
+function createHtmlAssetRegistry(folderPath?: string) {
 	const rootsByToken = new Map<string, string>();
-	const tokensByRoot = new Map<string, string>();
+	const tokensByScope = new Map<string, string>();
+	/** Folder-session tokens: one per (selected folder, document directory), as in the Bun registry. */
+	const docDirByToken = new Map<string, string>();
 
-	function register(baseDir: string): string {
+	function register(baseDir: string, docDir: string | null = null): string {
 		const root = resolvePath(baseDir);
-		const existing = tokensByRoot.get(root);
+		const scope = docDir ? `${root}\0${docDir}` : root;
+		const existing = tokensByScope.get(scope);
 		if (existing) return existing;
 		const token = randomUUID().replace(/-/g, "").slice(0, 16);
-		tokensByRoot.set(root, token);
+		tokensByScope.set(scope, token);
 		rootsByToken.set(token, root);
+		if (docDir) docDirByToken.set(token, docDir);
 		return token;
 	}
 
 	function rewriteHtml(htmlContent: string, htmlFilePath: string): string {
 		if (/^https?:\/\//i.test(htmlFilePath)) return htmlContent;
 		try {
-			const token = register(dirname(resolvePath(htmlFilePath)));
+			const { root, basePath, docDir } = htmlAssetContext(htmlFilePath, folderPath);
+			const token = register(root, docDir);
 			return rewriteHtmlAssetReferences(
 				htmlContent,
 				(assetPath) => `${HTML_ASSET_ROUTE_PREFIX}/${token}/${encodeHtmlAssetPath(assetPath)}`,
 				// Root-relative on purpose: a srcdoc document resolves its own
 				// <base href> against the PARENT's URL, which is this server.
-				{ baseHref: htmlAssetBaseHref(token) },
+				{ baseHref: htmlAssetBaseHref(token) + (basePath ? `${encodeHtmlAssetPath(basePath)}/` : ""), assetBasePath: basePath },
 			);
 		} catch {
 			return htmlContent;
@@ -181,7 +186,7 @@ function createHtmlAssetRegistry() {
 	}
 
 	function inlineHtml(htmlContent: string, htmlFilePath: string): string {
-		return inlineHtmlLocalAssets(htmlContent, htmlFilePath);
+		return inlineHtmlLocalAssets(htmlContent, htmlFilePath, folderPath);
 	}
 
 	function assetError(
@@ -214,10 +219,17 @@ function createHtmlAssetRegistry() {
 			return true;
 		}
 
-		const { root, assetPath, contentType, document, asDocument, maxBytes } = decision;
+		const { token, root, assetPath, contentType, document, asDocument, maxBytes } = decision;
 		const resolved = resolvePath(root, assetPath);
 		if (!isWithinDirectory(resolved, root)) {
 			assetError(res, 403, "Access denied", asDocument, assetPath);
+			return true;
+		}
+		// A folder session: the page's own directory as before, the rest of the
+		// folder minus hidden paths and the dotenv family (mirrors the Bun route).
+		const docDir = docDirByToken.get(token);
+		if (docDir && !folderSessionAssetAllowed(root, docDir, assetPath)) {
+			assetError(res, 404, "Not found", asDocument, assetPath);
 			return true;
 		}
 
@@ -640,7 +652,7 @@ export async function startAnnotateServer(options: {
 	// Set once bound: "Ask this session" answers only a loopback Host with this port.
 	let boundPort: number | undefined;
 	const aiRuntime = resolveAIEnabled() ? await createPiAIRuntime({ sessionBridge: options.sessionBridge, getServerPort: () => boundPort }) : null;
-	const htmlAssets = createHtmlAssetRegistry();
+	const htmlAssets = createHtmlAssetRegistry(options.mode === "annotate-folder" ? options.folderPath : undefined);
 	let agentTerminalCapability: AgentTerminalCapability = {
 		enabled: false,
 		reason: "unsupported-runtime",

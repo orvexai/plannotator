@@ -30,6 +30,9 @@ import { INBOX_MCP_TOOLS, INBOX_WAIT_DEFAULT_MS, INBOX_WAIT_MAX_SECONDS } from "
 import { INBOX_TOOL_DEFAULTS, INBOX_TOOL_HOSTS } from "@plannotator/shared/config";
 import { INBOX_FILLED_ARGUMENTS, INBOX_TOOL_NAME } from "@plannotator/shared/inbox/connection";
 import { INBOX_COMMAND_USAGE } from "./cli";
+import { createAgentEnvironment, displayPath, type AgentEnvironment } from "@plannotator/server/inbox-agents";
+import { noteTarget } from "@plannotator/server/inbox-agent-notes";
+import { INBOX_AGENT_LABELS, INBOX_NOTE_AGENT_IDS } from "@plannotator/core/inbox-types";
 
 export type InboxMcpToolName = (typeof INBOX_MCP_TOOLS)[number];
 
@@ -203,6 +206,8 @@ export interface InboxHelpOptions {
   /** The resolved data dir (`getPlannotatorDataDir()`). */
   dataDir: string;
   platform?: ConnectContext["platform"];
+  /** Where the agents' instructions files are (for the note section). Default: this process's home and environment. */
+  agentEnvironment?: AgentEnvironment;
 }
 
 export function inboxHelpPlatform(platform: NodeJS.Platform = process.platform): ConnectContext["platform"] {
@@ -222,6 +227,13 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
   const ctx: ConnectContext = { command: mcpCommand, mcpUrl: INBOX_HELP_MCP_URL, platform: options.platform ?? inboxHelpPlatform() };
   const inboxPath = join(options.dataDir, "inbox");
   const configPath = join(options.dataDir, "config.json");
+  const agents = options.agentEnvironment ?? createAgentEnvironment();
+  const noteLines = INBOX_NOTE_AGENT_IDS.map((id) => {
+    const target = noteTarget(id, agents);
+    const shown = displayPath(target.path, agents);
+    if (target.reason) return `- ${INBOX_AGENT_LABELS[id]} (\`${id}\`): none. ${target.reason}`;
+    return `- ${INBOX_AGENT_LABELS[id]} (\`${id}\`): ${code(shown ?? "")}, ${target.create ? "creates the file" : "adds a marked section"}.`;
+  });
   const on = INBOX_TOOL_HOSTS.filter((host) => INBOX_TOOL_DEFAULTS[host]).map(hostLabel);
   const off = INBOX_TOOL_HOSTS.filter((host) => !INBOX_TOOL_DEFAULTS[host]).map(hostLabel);
   const defaults = [on.length ? `on by default in ${on.join(" and ")}` : "", off.length ? `off by default in ${off.join(" and ")}` : ""]
@@ -235,7 +247,7 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     "",
     "## What it is",
     "",
-    `The Plannotator Inbox is one local window per machine where you leave the person messages, questions, files to annotate, guided reviews and decisions. It binds 127.0.0.1; the person may publish the window over their tailnet, but the MCP server and agent tools answer only on this computer. Its data lives in ${code(inboxPath)} (the data dir is set by \`PLANNOTATOR_DATA_DIR\`). The person reads your message there and answers when they can. Nothing holds your session open: you send, then keep working or end your turn.`,
+    `The Plannotator Inbox is one local window per machine where you leave the person messages, questions, files to annotate, guided reviews and decisions. It binds 127.0.0.1 whatever \`PLANNOTATOR_REMOTE\` and \`PLANNOTATOR_PORT\` say; the person may publish the window over their tailnet, but the MCP server and agent tools answer only on this computer. Its data lives in ${code(inboxPath)} (the data dir is set by \`PLANNOTATOR_DATA_DIR\`). The person reads your message there and answers when they can. Nothing holds your session open: you send, then keep working or end your turn.`,
     "",
     "## When to use it",
     "",
@@ -271,6 +283,8 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     `- **Claude Code** with the Plannotator plugin: nothing else to do. Check \`claude plugin list\` for \`plannotator@plannotator\`; if it is missing, run \`claude plugin marketplace add backnotprop/plannotator\` and \`claude plugin install plannotator@plannotator\`. The \`${INBOX_TOOL_NAME}\` tool appears after Claude Code restarts (\`claude --continue\` returns to this conversation). It needs Claude Code 2.1.287 or later, on macOS or Linux, in an interactive session (not \`claude -p\`).`,
     `- **Pi** with the Plannotator extension (\`pi install npm:@plannotator/pi-extension\` if it is missing), or **OpenCode** with the Plannotator plugin (\`@plannotator/opencode@latest\` in opencode.json: \`"plugin": [...]\` on OpenCode 1, \`"plugins": [{ "package": ... }]\` on OpenCode 2): the inbox tool is off by default there. Turn it on for your host by merging ${code(`{ "inboxTool": { "pi": true } }`)} (or \`"opencode"\`) into ${code(configPath)}, keeping its other keys, or with the switch in the Inbox's Settings. Then start a new Pi session (or \`/reload\`), or restart OpenCode.`,
     "- **Anything else**: register the stdio server; \"Connecting other agents\" below has the line for your host.",
+    "",
+    "When the person runs `plannotator inbox` themselves, it already connects the terminal agents it finds (Codex, Gemini CLI, Cursor, Windsurf/Devin, Amp, Kiro, Pi 0.99+, OpenCode with its plugin) and the Claude app, so check before adding a second entry: a `plannotator-inbox` server that runs this binary is already the connection.",
     "",
     `A connection takes effect in the next session, never in the one already running. Until then, send through the stdio server directly: ${code(mcp)}.`,
     "",
@@ -329,7 +343,13 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     "",
     ...HARNESSES.map((harness) => harnessHelpLine(harness, ctx)),
     "",
-    `The \`${INBOX_TOOL_NAME}\` tool is ${defaults}. \`PLANNOTATOR_INBOX_TOOL=1\` or \`0\` turns it on or off everywhere, and config.json \`inboxTool\` takes \`true\`, \`false\` or one per host (\`{ "pi": true }\`); the environment variable wins. A host decides once, at start (Claude Code and OpenCode when the process starts, Pi per session or \`/reload\`), and registers the tool only if the Inbox has run once on this machine by then (\`inbox/inbox.json\` exists). So the tool appears in sessions started after that, never in one already running.`,
+    `The \`${INBOX_TOOL_NAME}\` tool is ${defaults}. \`PLANNOTATOR_INBOX_TOOL=1\` or \`0\` turns it on or off everywhere, and config.json \`inboxTool\` takes \`true\`, \`false\` or one per host (\`{ "pi": true }\`); the environment variable wins. A host decides once, at start (Claude Code and OpenCode when the process starts, Pi per session or \`/reload\`), and registers the tool only if the Inbox has run once on this machine by then (\`inbox/inbox.json\` exists); Claude Code registers it anyway, and its first call starts the Inbox. So the tool appears in sessions started after that, never in one already running. Once the Inbox has run here, a session with the tool also gets one line at its start saying when to use the Inbox; config.json \`inboxReminder\` (\`false\`, or one per host) turns that line off.`,
+    "",
+    "## A note in each agent's instructions",
+    "",
+    "Plannotator can add a short, marked note about the Inbox to an agent's own instructions file, so it sends decisions and finished work here while the person is away. Only with the person's yes: show them this list, then run `plannotator inbox --notes <ids>` with only the agents they agreed to (comma-separated). It never overwrites a note the person edited; the Inbox's Settings and `plannotator uninstall` remove it. On this computer:",
+    "",
+    ...noteLines,
     "",
     "## Commands and flags",
     "",
@@ -344,6 +364,7 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     `- Everything lives in ${code(inboxPath)}: threads by project, the versions of the files you sent, decisions, and \`inbox.json\` (where the running Inbox is).`,
     "- The person deletes a thread or a project in the window's Settings.",
     "- `plannotator uninstall` keeps the data. `plannotator uninstall --purge` stops a running Inbox, then deletes it (if it cannot stop it, it says so and keeps the data).",
+    "- Both remove the `plannotator-inbox` MCP entries `plannotator inbox` added to the agents on this computer (`plannotator uninstall --dry-run` lists them); an entry changed by hand to run something else is left.",
     "- Never run uninstall, delete threads or projects, or edit these files for the person.",
     "",
   ].join("\n");

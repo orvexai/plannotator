@@ -1,4 +1,5 @@
 import { GUIDE_CLI_USAGE } from "@plannotator/server/guide-cli";
+import { T3_CLI_USAGE } from "@plannotator/t3-code/usage";
 
 const HELP_FLAGS = new Set(["--help", "-h"]);
 
@@ -183,9 +184,10 @@ export function formatTopLevelHelp(): string {
  * To launch one, delete it from this set, add its usage lines to
  * formatTopLevelHelp() and document it in apps/skills/core/plannotator/SKILL.md.
  *
- * Empty: `inbox` (the Plannotator Inbox) was the last one, and launched.
+ * `inbox` (the Plannotator Inbox) was the last one to launch. Today: the
+ * opt-in T3 Code connection (`t3`, and `t3-hook`, its Claude hook).
  */
-export const HIDDEN_SUBCOMMANDS: ReadonlySet<string> = new Set<string>();
+export const HIDDEN_SUBCOMMANDS: ReadonlySet<string> = new Set<string>(["t3", "t3-hook"]);
 
 /**
  * `plannotator inbox`'s commands and flags. `plannotator inbox --help` prints
@@ -198,6 +200,7 @@ export const INBOX_COMMAND_USAGE = [
   "Usage:",
   "  plannotator inbox [--background | --no-open] [--tailscale]",
   "  plannotator inbox mcp",
+  "  plannotator inbox --notes <ids>",
   "",
   "  plannotator inbox               Start the Inbox and open it in the browser,",
   "                                  or open the one already running",
@@ -210,10 +213,21 @@ export const INBOX_COMMAND_USAGE = [
   "                                  an Inbox already running, asks it to publish.",
   "  plannotator inbox mcp           The stdio MCP server for agents. Starts a stopped",
   "                                  Inbox in the background (no browser tab).",
+  "  plannotator inbox --notes <ids> Add the Inbox note to these agents' instructions",
+  "                                  files (claude-code, codex, gemini, pi, opencode,",
+  "                                  comma-separated). Only with the person's yes;",
+  "                                  starts nothing.",
   "",
   "Over the tailnet at every start: the Inbox's Settings, PLANNOTATOR_INBOX_TAILSCALE=1,",
   "or { \"inboxTailscale\": true } in config.json. Agents and MCP stay on this computer;",
   "another Tailscale login is let in only when config.json inboxTailscaleAllow names it.",
+  "",
+  "A person's plannotator inbox (not --background) also connects the agents found on",
+  "this computer that are not connected yet: a plannotator-inbox MCP server in each",
+  "terminal agent and the Claude app, the inbox tool for Pi and OpenCode with",
+  "Plannotator's extension or plugin. It never adds back one removed or turned off,",
+  "never replaces another plannotator-inbox, and says what it added on stderr.",
+  "PLANNOTATOR_INBOX_CONNECT=0 skips it. plannotator uninstall removes what it added.",
 ].join("\n");
 
 /** `plannotator update`'s usage; the command is update-command.ts. */
@@ -396,6 +410,16 @@ export const SUBCOMMAND_HELP: Record<string, string> = {
     "",
     "Purge data is local-only: it is not stored on a Plannotator server and",
     "cannot be recovered after purge. Unrecognized custom files are preserved.",
+  ].join("\n"),
+  // Unreleased (HIDDEN_SUBCOMMANDS): the opt-in T3 Code connection.
+  t3: T3_CLI_USAGE,
+  "t3-hook": [
+    "Usage:",
+    "  plannotator t3-hook install --settings <settings.json> --executable <plannotator>",
+    "  plannotator t3-hook remove --settings <settings.json>",
+    "",
+    "Internal: the Claude Bash hook of the opt-in T3 Code connection and its",
+    "settings helper (install.sh --with-t3 / --without-t3). Agents never run it.",
   ].join("\n"),
 };
 

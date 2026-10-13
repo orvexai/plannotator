@@ -32,12 +32,63 @@ Run `plannotator inbox` once before you connect an agent. That first run writes 
 
 You never need to keep the Inbox running yourself. When an agent calls it and it is stopped, it starts in the background, and no tab opens.
 
+### Your agents are connected for you
+
+When you run `plannotator inbox` (not `--background`, which is how agents start it), it connects the agents it finds on this computer that are not connected yet, and says which on the terminal:
+
+```
+Connected Codex, Gemini CLI and Cursor to the Inbox (Claude Code was already on).
+Pi needs connecting by hand: Pi before 0.99 has no `pi mcp`; update Pi, or add plannotator-inbox to ~/.pi/agent/mcp.json by hand.
+Agents use it from their next session. PLANNOTATOR_INBOX_CONNECT=0 skips this step; plannotator uninstall removes what it added.
+```
+
+| Agent | Found when | What is added |
+|-------|------------|---------------|
+| Claude Code | the Plannotator plugin is enabled | nothing: the plugin already gives it the `plannotator_inbox` tool |
+| Pi, OpenCode | Plannotator's extension or plugin is installed | the inbox tool turned on (`inboxTool` in `~/.plannotator/config.json`) |
+| Pi without the extension | Pi 0.99 or later on your `PATH` (older Pi has no `pi mcp`: connect it by hand) | `pi mcp add plannotator-inbox` |
+| Codex | `codex` 0.35 or later on your `PATH` (older Codex has no `codex mcp add`, and a `~/.codex` or `$CODEX_HOME` folder without the CLI: connect it by hand) | `codex mcp add plannotator-inbox` (the Codex app and IDE extension share it) |
+| Gemini CLI | `gemini` 0.1.19 or later on your `PATH` (older has no `gemini mcp add`: connect it by hand; `$GEMINI_CLI_HOME` honored) | `gemini mcp add -s user plannotator-inbox` |
+| Windsurf / Devin, Amp | `devin` or `amp` on your `PATH` | the agent's own `mcp add plannotator-inbox` |
+| Cursor, Kiro | `~/.cursor` exists or `cursor` / `cursor-agent` is on your `PATH`; `~/.kiro` exists or `kiro-cli` is on your `PATH` | one `plannotator-inbox` key in `~/.cursor/mcp.json` or `~/.kiro/settings/mcp.json` |
+| The Claude app | its settings folder exists | one key in `claude_desktop_config.json` (restart the Claude app) |
+
+Each entry runs `<your plannotator binary> inbox mcp`. The agent uses it from its next session. Before it runs an agent's own command, Plannotator checks the program's `--version`, so a different program with the same name is never handed it. Cline is not connected automatically yet: add it in Cline's MCP settings. When an agent started the Inbox in the background, a later `plannotator inbox` connects agents with the Inbox's environment (the `PATH` and home it was started with).
+
+- Every later `plannotator inbox` connects an agent installed since, and says so once ("Connected Amp to the Inbox (new on this computer)").
+- An agent you turned off (its switch in the Inbox's Settings → Agents, or `inboxTool: false` in config.json for Pi and OpenCode), or whose `plannotator-inbox` entry you removed after Plannotator added or found it, is never added back by itself. Turn it back on in Settings → Agents.
+- An agent only you can connect (no CLI on your `PATH`, Pi before 0.99, Cline) is named once on the terminal with the reason, and again only if the reason changes.
+- An existing `plannotator-inbox` entry that runs something else is never replaced.
+- In a JSON file only that one entry is added; every other byte of the file stays as it was, and removing it gives the file back exactly as it was (an empty file stays empty; a file Plannotator created is deleted). A file Plannotator cannot edit that way (comments, a duplicate key) is left as it was, and the terminal says why.
+- Editors (VS Code, Zed, JetBrains, Goose) are never changed. Settings has a one-click link or a snippet for each.
+- `PLANNOTATOR_INBOX_CONNECT=0` skips this step.
+- `plannotator uninstall` removes every entry it recorded adding (never one you added yourself). `--dry-run` lists them first. If its record (`~/.plannotator/inbox/agents.json`) is gone, it removes none: an entry that runs this Plannotator is named with how to remove it, since you may have added it by hand.
+
+### A note in each agent's instructions
+
+The first time you open the Inbox after it connected your agents, a dialog asks whether to add a short note about the Inbox to each agent's own instructions file, so agents send you decisions and finished work there while you are away. It lists each agent with the exact file, every agent ticked (Claude Code too), and writes nothing until you press **Add**: untick an agent to leave it out, or choose **Not now**. The top of the dialog says which agents `plannotator inbox` just connected. Each agent is asked once: an agent you connect later (say, Codex next week) gets the same dialog for itself alone. The dialog never opens on the same page load as another one-time dialog (the sound dialog comes first). The files:
+
+| Agent | File |
+|-------|------|
+| Claude Code | `~/.claude/rules/plannotator-inbox.md` (a file of its own) |
+| Codex | `~/.codex/AGENTS.override.md` when you have one, else `~/.codex/AGENTS.md` |
+| Gemini CLI | `~/.gemini/GEMINI.md` (or your `context.fileName`) |
+| Pi | the one instructions file Pi reads in `~/.pi/agent/` |
+| OpenCode | `~/.config/opencode/AGENTS.md`, only when you already have it: creating it would stop OpenCode 1 reading your `~/.claude/CLAUDE.md` |
+
+The note sits between two marker lines at the end of the file. Plannotator never overwrites a note you edited, and removing it removes only that section. `plannotator inbox --notes codex,gemini` adds it from the terminal (the agent install prompt runs this only after you say yes). `plannotator inbox --help` lists the exact files on your computer.
+
+### Settings → Agents
+
+Settings lists each agent found on this computer with up to three switches: **Reaches the Inbox** (its MCP entry, or the inbox tool for Claude Code, Pi and OpenCode), **Reminder at session start** (Claude Code, Pi and OpenCode: one line at the start of each session that has the inbox tool) and **Note in its instructions**. A change applies to that agent's next session. An agent you turn off here is never connected again by `plannotator inbox`. Agents not found are folded under **Not found on this computer**, with the command or one-click link for each, editors included.
+
 ## What you see
 
 - **The list.** One row per thread, in sections: Stopped on you, Holding up work, Waiting on you, New since you looked, Sent, and Quiet (folded). Sent waits on the agent, not on you, so it sits below what is new. A row shows the project, the agent, the subject and how many questions wait. New agent activity does not reorder the rows under you. It waits behind "N new in <project>" until you act. Nothing you do in an open thread reorders the list either: the list catches up when you leave the thread.
 - **Projects.** The sidebar lists each project an agent wrote from: the repository, or the folder when there is none. Click a project to see only its threads.
+- **Copy connect prompt.** Just above **Settings** in the sidebar. One click copies a short prompt to paste into any agent on this computer (Codex, Cursor, a new Claude Code session, any other). The prompt names the full path of your `plannotator` and tells the agent to read `plannotator inbox --help`, connect itself, and send you a first message offering to send some real recent work. The row reads **Copied** for two seconds.
 - **A thread.** It reads like email. Questions render as cards, and a click saves your pick at once. **Send** carries your picks, your words and your annotations as one reply. **Mod+Enter** sends. A Send skips the questions you left unanswered, and the reply tells the agent so; the reply box says how many before you send, and **Keep open** leaves them open for that Send. After a Send the reply reads "Saved for <agent>" until the agent reads it, then "Delivered to <agent>, <time>". Messages you already read fold to one line (click one to open it, or **Expand all**), and a thread opens at **New since you looked**; `j` and `k` move between messages and `n` jumps to the first new one.
-- **Mark read.** To get a thread out of the top without answering it, press **Mark read** in the thread's header (or `E`, or the button that shows when you hover a row). The thread moves to Quiet, marked "Read", and its unanswered questions close. A few seconds later the agent that asked gets one note from you: "Set aside for now; don't wait on these:" and the questions. The thread comes back to the top when the agent writes again. **Undo** in the toast, or `Z`, reopens the questions as they were; the pressed **Read** button does the same later. If an agent was stopped on the thread, the toast says so and offers **Reply**.
+- **Mark read.** To get a thread out of the top without answering it, press **Mark read** in the thread's header (or `E`, or the button that shows when you hover a row). The thread moves to Quiet, marked "Read", and its unanswered questions close. A few seconds later the agent that asked gets one note from you: "Set aside for now; don't wait on these:" and the questions. The thread comes back to the top when the agent writes again. **Undo** in the toast, or `Z`, reopens the questions that Mark read closed, as they were; the pressed **Read** button does the same later. Questions an earlier Mark read closed stay closed. If an agent was stopped on the thread, the toast says so and offers **Reply**.
 - **Archive.** The archive icon in the thread's header ends the thread: its questions close, and the agent's next message starts a new thread. **Unarchive** in the thread's foot reopens it. (Agents call this `resolve_message`.)
 - **New message.** Next to Reply, **New message** writes to an agent session that is running now in the thread's project (Claude Code, Pi or OpenCode 2 with the inbox tool; Pi and OpenCode 2 sessions are listed once they have written in that project). With one session running, the message goes to it; with several, you pick one. The session takes it as its next turn. The message belongs only to the session you picked: another agent session reading the thread does not take it. When no session is running, the button says so and offers Reply instead.
 - **When the session that asked has ended.** A reply goes to the session that asked. If the session asked through the Claude Code, Pi or OpenCode 2 connection and is no longer running (the Inbox has not heard from it for a minute), the thread says so before you reply: the message reads "session ended" and a note sits above the reply box. When you press **Send** and another session is running in the project, you choose where the reply goes: one of those sessions, or **Leave it for the next agent**. The button names your choice. **Esc** goes back to your reply. The session you pick is told that the reply was written to a session that ended, and to read the thread first. When no session is running, **Send** saves the reply in the thread until an agent reads it. Nothing is ever sent to another session unless you pick it. An agent connected through MCP alone (or OpenCode 1) is never called ended, because the Inbox cannot tell when it stops; your reply goes to it as before.
@@ -56,13 +107,13 @@ How to write questions is described in [Questions in Plans and Documents](/docs/
 
 ### Claude Code
 
-With the Plannotator plugin and [the Plannotator mod](/docs/guides/claude-code/#the-plannotator-mod) (Claude Code 2.1.287 or newer), Claude Code gets a `plannotator_inbox` tool when the Inbox is installed. The tool is on by default for Claude Code. Run `plannotator inbox` once, then restart Claude Code: the tool is added when Claude Code starts, not when you start a new conversation in a running one. When you send a reply, it arrives in that session as a new turn after Claude finishes what it is doing. The thread then shows "Delivered to Claude Code".
+With the Plannotator plugin and [the Plannotator mod](/docs/guides/claude-code/#the-plannotator-mod) (Claude Code 2.1.287 or newer), Claude Code gets a `plannotator_inbox` tool. The tool is on by default for Claude Code, also before you ever ran the Inbox: the first time Claude uses it, it starts the Inbox in the background. The tool is added when Claude Code starts, not when you start a new conversation in a running one, so restart Claude Code after you change the setting. When you send a reply, it arrives in that session as a new turn after Claude finishes what it is doing. The thread then shows "Delivered to Claude Code".
 
 The mod is off in `claude -p`, in SDK runs and on Windows. There the tool is not added. Use the MCP server instead (see [Other agents](#other-agents)).
 
 ### Pi
 
-Install the [Pi extension](/docs/getting-started/installation/#pi), then turn the inbox tool on for Pi. It is off by default on Pi, because Pi sends every tool's full definition with each request:
+Install the [Pi extension](/docs/getting-started/installation/#pi), then run `plannotator inbox`: it turns the inbox tool on for Pi when it finds the extension. The tool is off by default on Pi, because Pi sends every tool's full definition with each request. To turn it on yourself:
 
 ```bash
 export PLANNOTATOR_INBOX_TOOL=1
@@ -72,7 +123,7 @@ Start a new Pi session (or `/reload`). A reply arrives as a follow-up message on
 
 ### OpenCode
 
-Add the [OpenCode plugin](/docs/getting-started/installation/#opencode), then turn the inbox tool on for OpenCode. It is off by default on OpenCode, for the same reason as Pi:
+Add the [OpenCode plugin](/docs/getting-started/installation/#opencode), then run `plannotator inbox`: it turns the inbox tool on for OpenCode when it finds the plugin in your global opencode config. The tool is off by default on OpenCode, for the same reason as Pi. To turn it on yourself:
 
 ```bash
 export PLANNOTATOR_INBOX_TOOL=1
@@ -86,10 +137,12 @@ You can open one Pi session twice (`pi -c` or `--session`), or run two OpenCode 
 
 ## The inbox tool setting
 
-The `plannotator_inbox` tool is one tool. Its actions are the Inbox's MCP tools (listed below). It files messages under the project of the agent's working folder; an agent working in another folder (a notes folder, say) can pass `project_path` to name the repository or folder the message is about. Your host adds it only when both of these are true at session start:
+The `plannotator_inbox` tool is one tool. Its actions are the Inbox's MCP tools (listed below). It files messages under the project of the agent's working folder; an agent working in another folder (a notes folder, say) can pass `project_path` to name the repository or folder the message is about. Pi and OpenCode add it only when both of these are true at session start:
 
 - the Inbox is installed (you ran `plannotator inbox` once), and
 - the inbox tool setting is on for that host.
+
+Claude Code needs only the setting: before the Inbox was ever installed, the tool's first call starts it.
 
 | Host | Default |
 |------|---------|
@@ -104,6 +157,20 @@ There are three ways to change it. The first that decides wins:
 3. The default in the table above.
 
 The setting is read when a session starts and never during one, because a change to the tool list mid-session would invalidate the model's prompt cache. After a change, restart Claude Code or OpenCode, or start a new Pi session (or `/reload`).
+
+### The reminder at session start
+
+Once you have run the Inbox on this computer, a session that has the tool also gets one line, so the agent knows when the Inbox is the right place:
+
+> Plannotator Inbox is on: when you finish long work, or need a decision the person isn't here to give, send it with plannotator_inbox send_message and keep going. Their reply comes back here. Run `plannotator inbox --help` for how it works.
+
+Where it goes:
+
+- **Claude Code:** once, in the context of the conversation's first message. It names the tool by its full name (`mcp__…__plannotator_inbox`), so Claude can find it.
+- **Pi:** once, as a hidden message with the session's first prompt.
+- **OpenCode:** a line in the system prompt of every request. On OpenCode 1, and on an OpenCode 2 that cannot bring a reply back by itself, the sentence about the reply says to call `wait_for_reply` instead.
+
+The text is fixed and never changes during a session, so it costs little and does not invalidate the prompt cache. It never appears without the tool. To turn it off, set `inboxReminder` in `~/.plannotator/config.json`: `false` for every host, or one per host, for example `{ "inboxReminder": { "claude-code": false } }`.
 
 ## Other agents
 
@@ -183,9 +250,10 @@ Everything lives under `~/.plannotator/inbox/` (or `$PLANNOTATOR_DATA_DIR/inbox/
 | `blobs/<sha256>` | The version of each attached file as it was sent, and each guided review |
 | `markups/<sha256>.png` | The images you marked up when commenting on an image attachment |
 | `seq.json` | The highest event number ever written, kept across deletions |
+| `agents.json` | The agents `plannotator inbox` found or connected, so it never adds one back that you turned off |
 | `claims/`, `leases/` and `connection-tools.json` | Bookkeeping for the Pi and OpenCode connections |
 
-The Inbox stores the files agents attached as they were when sent, the messages and your replies. It sets no size limits. To free space, use **Delete thread** or **Delete project** in **Settings**, which also remove sent files that nothing else uses. Your choices for the inbox tool, notifications and the tailnet are kept in `~/.plannotator/config.json` (`inboxTool`, `inboxNotifications`, `inboxSound`, `inboxTailscale`, `inboxTailscaleAllow`).
+The Inbox stores the files agents attached as they were when sent, the messages and your replies. It sets no size limits. To free space, use **Delete thread** or **Delete project** in **Settings**, which also remove sent files that nothing else uses. Your choices for the inbox tool, notifications and the tailnet are kept in `~/.plannotator/config.json` (`inboxTool`, `inboxReminder`, `inboxNotifications`, `inboxSound`, `inboxTailscale`, `inboxTailscaleAllow`).
 
 ## Uninstall
 
@@ -195,13 +263,13 @@ The Inbox stores the files agents attached as they were when sent, the messages 
 plannotator uninstall --purge
 ```
 
-This stops a running Inbox first, then deletes `~/.plannotator/inbox/` with the rest of the Plannotator data. If the Inbox does not stop, uninstall still removes the plugins, skills, hooks and config entries, but keeps your Plannotator data (`~/.plannotator`) and the `plannotator` binary. Quit the Inbox and run the command again to finish. Add `--dry-run` to see what would be removed.
+Both forms remove the `plannotator-inbox` entries `plannotator inbox` added to your agents (an entry you changed to run something else is left, and named). `--purge` also stops a running Inbox first, then deletes `~/.plannotator/inbox/` with the rest of the Plannotator data. If the Inbox does not stop, uninstall still removes the plugins, skills, hooks and config entries, but keeps your Plannotator data (`~/.plannotator`) and the `plannotator` binary. Quit the Inbox and run the command again to finish. Add `--dry-run` to see what would be removed.
 
 ## Troubleshooting
 
 ### The agent has no plannotator_inbox tool
 
-- Run `plannotator inbox` once, then restart Claude Code or OpenCode, or start a new Pi session. A session that started before the Inbox was installed does not get the tool.
+- On Pi and OpenCode, run `plannotator inbox` once, then restart OpenCode or start a new Pi session. A session that started before the Inbox was installed does not get the tool. Claude Code gets the tool without that step, but a Claude Code process that started before you changed the setting needs a restart.
 - On Pi and OpenCode, turn the inbox tool setting on: it is off by default there.
 - On Claude Code, check that the mod is on (see [Turning the mod off](/docs/guides/claude-code/#turning-the-mod-off)). Without it, use `plannotator inbox mcp`.
 - Check `PLANNOTATOR_INBOX_TOOL`: when set, it decides for every host, and the switches in **Settings** are disabled.

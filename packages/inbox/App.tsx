@@ -27,7 +27,7 @@ import {
   type UpdateDetails,
   type WhatsNewModel,
 } from './api';
-import { filterSections, heldNotice, markHeldRowArchived, refreshHeldRows, settleOwn, waitingCount } from './held';
+import { filterSections, heldNotice, markHeldRowArchived, refreshHeldRows, settleOwn, settleThread, waitingCount, type OpenThread } from './held';
 import {
   captureSettle,
   COVERED_LIST_SETTLES,
@@ -42,12 +42,15 @@ import {
 } from './settle';
 import { tildePath } from './format';
 import { inboxImageSrcResolver } from './images';
-import type { ConnectContext } from './harnesses';
+import { shellLine, type ConnectContext } from './harnesses';
 import { Sidebar } from './components/Sidebar';
 import { SidebarShell } from './shell/SidebarShell';
 import { InboxList } from './components/InboxList';
 import { ThreadPane } from './components/Thread';
 import { EmptyState } from './components/EmptyState';
+import { AgentNoteDialog } from './components/AgentNoteDialog';
+import { cardReport, noteQuestionRows } from './agents';
+import type { InboxAgentRow, InboxAgentsModel, InboxConnectReport } from '@plannotator/core/inbox-types';
 import { SettingsPage } from './components/Settings';
 import { ArchivedBlock } from './components/Archived';
 import { NotificationAsk } from './components/NotificationAsk';
@@ -61,10 +64,12 @@ import { unsentReply } from './unsent';
 import { InboxToast, type InboxToastModel } from './components/Toast';
 import { canToggleRead, MARK_READ_UNDO_MS, markReadToast } from './markRead';
 import { lookBoundary } from './folding';
+import { latestAgentSeq } from './seenOnSight';
 import { isPhone, trackKeyboard, usePhone } from './phone';
 import { LIST_MIN_WIDTH, THREAD_BESIDE_FILE_WIDTH, useStack } from './stack';
 import { backTo, pushScreen } from './history';
 import { adoptSavedTheme, inboxThemeSync } from './theme';
+import { parseSettingsHash, settingsHash, type SettingsSection } from './settingsRoute';
 
 // The Inbox has no /api/config and no browser-agent tools: settings stay in
 // the page's own cookies, except the theme, which goes to config.json `theme`
@@ -88,6 +93,9 @@ configurePlannotatorUI({
 });
 
 const SIDEBAR_OPEN_COOKIE = 'plannotator-inbox-sidebar-open';
+/** A look seen on sight that the server did not take is sent again this many times, 1 s, 2 s, 4 s… apart. */
+const SEEN_RETRIES = 5;
+const SEEN_RETRY_MS = 1000;
 
 interface Route {
   page: 'inbox' | 'settings' | 'decisions' | 'whats-new';
@@ -101,11 +109,20 @@ interface Route {
   file?: { id: string; version: 'current' | 'sent'; focus: string | null } | null;
   /** The message whose guided review is open over the window (`#thread=…&guide=msg_…`). */
   guide?: string | null;
+  /** Settings' section (`#settings/<section>`); null is `#settings` alone (settingsRoute.ts). */
+  section?: SettingsSection | null;
+  /** `#settings/devices/pair`: Pair a phone is open. */
+  pair?: boolean;
 }
 
 function readRoute(): Route {
-  const hash = window.location.hash.replace(/^#/, '');
-  if (hash === 'settings') return { page: 'settings', project: null, thread: null };
+  return routeOf(window.location.hash);
+}
+
+function routeOf(fullHash: string): Route {
+  const hash = fullHash.replace(/^#/, '');
+  const settingsAt = parseSettingsHash(hash);
+  if (settingsAt) return { page: 'settings', project: null, thread: null, section: settingsAt.section, pair: settingsAt.pair };
   const params = new URLSearchParams(hash);
   if (params.has('whats-new')) return { page: 'whats-new', project: null, thread: null, version: params.get('whats-new') };
   if (params.has('decisions')) {
@@ -125,7 +142,7 @@ function readRoute(): Route {
 /** The route's hash, `#thread=…` (empty for the list at rest). */
 function hashOf(route: Route): string {
   let hash = '';
-  if (route.page === 'settings') hash = 'settings';
+  if (route.page === 'settings') hash = settingsHash({ section: route.section ?? null, pair: route.pair });
   else if (route.page === 'whats-new') hash = new URLSearchParams({ 'whats-new': route.version ?? '' }).toString();
   else if (route.page === 'decisions') {
     const params = new URLSearchParams();
@@ -289,11 +306,33 @@ function Inbox() {
   const [threadDecisions, setThreadDecisions] = useState<InboxDecision[]>([]);
   /** The open thread's own list row, from its read: an archived thread has none in the list. */
   const [threadRow, setThreadRow] = useState<InboxListRow | null>(null);
-  /** The open thread's "new since you looked" boundary (folding.ts), from before this look. */
-  const [look, setLook] = useState<{ threadId: string; seq: number | null } | null>(null);
+  /**
+   * The open thread's "new since you looked" boundary (folding.ts), from
+   * before this look, and `through`: what the window's looks this visit cover
+   * (the newest agent message of the first read, raised as messages that
+   * arrive while it is open are seen on sight, seenOnSight.ts). Null when the
+   * thread carries no seqs (an older Inbox).
+   */
+  const [look, setLook] = useState<{ threadId: string; seq: number | null; through: number | null } | null>(null);
   const [decisions, setDecisions] = useState<DecisionsModel | null>(null);
   const [decisionsError, setDecisionsError] = useState<string | null>(null);
   const [settings, setSettings] = useState<SettingsModel | null>(null);
+  /** The agents on this computer (GET /api/inbox/agents): the agent-note dialog and Settings → Agents. Null on an older Inbox. */
+  const [agents, setAgents] = useState<InboxAgentsModel | null>(null);
+  const agentsRef = useRef(agents);
+  agentsRef.current = agents;
+  /** The first read of the agents is done (a run that opened the window has finished connecting): the agent-note dialog may decide. */
+  const [agentsSettled, setAgentsSettled] = useState(false);
+  /**
+   * The one-time agent-note dialog: open on this load (with the agents it
+   * asks about and the band's news, fixed when it opens), or shown on it.
+   * Decided once per load, after the sound dialog and never on a load that
+   * showed it.
+   */
+  const [agentNote, setAgentNote] = useState<'none' | 'shown' | { rows: InboxAgentRow[]; report: InboxConnectReport | null }>('none');
+  const agentNoteDecided = useRef(false);
+  /** The sound dialog's claim has answered on this load (or it was never due). */
+  const [soundClaimed, setSoundClaimed] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [update, setUpdate] = useState<InboxHealth['update']>(null);
   const [restarting, setRestarting] = useState(false);
@@ -376,6 +415,22 @@ function Inbox() {
   }, []);
   /** The settle waiting out its beat after a thread closed (settle.ts). */
   const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * The thread just closed, until the list settles: like the open thread, it
+   * is never held (held.ts): never in "N new", its row kept as it now is, and
+   * it settles where its state puts it (design record "inbox-new-in-open-thread").
+   */
+  const closing = useRef<OpenThread | null>(null);
+  /**
+   * The thread the held list treats as open: the route's, else the one
+   * closing (with its row as it stood at the close, so an agent message after
+   * the close waits behind "N new" like any other); the close's own render
+   * reads the route it leaves.
+   */
+  const heldOpen = (): OpenThread | null => {
+    const open = routeRef.current.thread ?? (closing.current ? null : lastRoute.current.thread);
+    return open ? { threadId: open } : closing.current;
+  };
   const cancelSettle = useCallback(() => {
     if (settleTimer.current) clearTimeout(settleTimer.current);
     settleTimer.current = null;
@@ -388,10 +443,13 @@ function Inbox() {
   const settleList = useCallback(
     (what: 'own' | 'all', slide: boolean) => {
       cancelSettle();
+      // The thread just closed settles as it now is, an arrival there included (held.ts settleOwn).
+      const closed = closing.current;
+      closing.current = null;
       const next = latestRef.current;
       if (!next) return;
       if (slide) armSlide();
-      setShown((current) => (what === 'all' || current === null || !hasRows(current) ? next.sections : settleOwn(current, next.sections, openedHere.current)));
+      setShown((current) => (what === 'all' || current === null || !hasRows(current) ? next.sections : settleOwn(current, next.sections, openedHere.current, closed)));
     },
     [armSlide, cancelSettle],
   );
@@ -410,7 +468,7 @@ function Inbox() {
       setUpdate(next.update);
       setUpdated(next.updated ?? null);
       // Held: the order waits for an action, but each row's own state (a delivery, an agent's read) follows at once.
-      setShown((current) => (adopt || current === null || !hasRows(current) ? next.sections : refreshHeldRows(current, next.sections)));
+      setShown((current) => (adopt || current === null || !hasRows(current) ? next.sections : refreshHeldRows(current, next.sections, heldOpen())));
       setLoadError(null);
       return next;
     } catch (cause) {
@@ -418,6 +476,63 @@ function Inbox() {
       return null;
     }
   }, [armSlide]);
+
+  /**
+   * Seen on sight (seenOnSight.ts): messages that arrived in the open thread
+   * have been on screen; record the look up to `through` (never past it) and
+   * let the row unbold in place. `look.through` rises only once the server
+   * took the look; a look that failed is sent again (a few times, waiting
+   * longer each time) unless a later one covers it.
+   */
+  const lookRef = useRef(look);
+  lookRef.current = look;
+  /** Per thread, the furthest look on its way to the server. */
+  const seenPosting = useRef(new Map<string, number>());
+  const seenRetries = useRef(new Set<ReturnType<typeof setTimeout>>());
+  useEffect(() => {
+    const retries = seenRetries.current;
+    return () => {
+      for (const timer of retries) clearTimeout(timer);
+      retries.clear();
+    };
+  }, []);
+  const seenOnSight = useCallback(
+    (threadId: string, through: number) => {
+      const current = lookRef.current;
+      if (!current || current.threadId !== threadId || (current.through !== null && current.through >= through)) return;
+      if ((seenPosting.current.get(threadId) ?? -1) >= through) return;
+      seenPosting.current.set(threadId, through);
+      const attempt = (tries: number) => {
+        void inboxApi
+          .seen(threadId, through)
+          .then(() => {
+            if (seenPosting.current.get(threadId) === through) seenPosting.current.delete(threadId);
+            const now = lookRef.current;
+            if (now && now.threadId === threadId && (now.through === null || now.through < through)) {
+              const next = { ...now, through };
+              lookRef.current = next;
+              setLook(next);
+            }
+            return refreshList(false);
+          })
+          .catch(() => {
+            // A later look on its way covers this one.
+            if (seenPosting.current.get(threadId) !== through) return;
+            if (tries >= SEEN_RETRIES) {
+              seenPosting.current.delete(threadId);
+              return;
+            }
+            const timer = setTimeout(() => {
+              seenRetries.current.delete(timer);
+              attempt(tries + 1);
+            }, SEEN_RETRY_MS * 2 ** tries);
+            seenRetries.current.add(timer);
+          });
+      };
+      attempt(0);
+    },
+    [refreshList],
+  );
 
   const refreshThread = useCallback(async (threadId: string) => {
     try {
@@ -428,7 +543,7 @@ function Inbox() {
         setThreadRow(next.row ?? null);
         // What is new since the last look, from the first read of this thread:
         // it lands before the window records the look, and is kept until the person leaves the thread.
-        setLook((current) => (current?.threadId === threadId ? current : { threadId, seq: lookBoundary(next.thread) }));
+        setLook((current) => (current?.threadId === threadId ? current : { threadId, seq: lookBoundary(next.thread), through: latestAgentSeq(next.thread) }));
       }
       return next.thread;
     } catch (cause) {
@@ -464,6 +579,39 @@ function Inbox() {
       setSettingsError(cause instanceof Error ? cause.message : String(cause));
     }
   }, []);
+
+  /** Read the agents; while `plannotator inbox` is still connecting them, read again until it is done. */
+  const refreshAgents = useCallback(async () => {
+    try {
+      const next = await inboxApi.agents();
+      setAgents(next);
+      return next;
+    } catch {
+      return null;
+    }
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // The page can load before the run that opened it starts connecting, so read once more a moment later.
+    let extra = 1;
+    const read = async () => {
+      const next = await refreshAgents();
+      if (cancelled) return;
+      if (next?.connecting || extra-- > 0) timer = setTimeout(() => void read(), next?.connecting ? 1500 : 2500);
+      else setAgentsSettled(true);
+    };
+    void read();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [refreshAgents]);
+  // Settings → Agents reads them again each time it opens: an agent installed meanwhile shows at once.
+  const agentsSection = route.page === 'settings' && route.section === 'agents';
+  useEffect(() => {
+    if (agentsSection) void refreshAgents();
+  }, [agentsSection, refreshAgents]);
 
   const loadUpdateDetails = useCallback(async () => {
     try {
@@ -522,8 +670,10 @@ function Inbox() {
     void (async () => {
       const opened = await refreshThread(threadId);
       if (cancelled || !opened) return;
+      closing.current = null;
       if (listCovered() && COVERED_LIST_SETTLES === 'while-covered') settleList('own', false);
-      await inboxApi.seen(threadId).catch(() => {});
+      // The look covers what this read showed, not a message that lands before the server takes it.
+      await inboxApi.seen(threadId, latestAgentSeq(opened)).catch(() => {});
       if (!cancelled) await refreshList(false);
     })();
     return () => {
@@ -561,9 +711,18 @@ function Inbox() {
     }
     const closed = before.thread;
     if (!closed) return;
+    closing.current = { threadId: closed, asOf: latestRef.current?.sections.flatMap((section) => section.threads).find((row) => row.thread_id === closed) ?? null };
     const active = document.activeElement;
     if (body && lastInput === 'keyboard' && (!active || active === document.body)) rowElement(body, closed)?.focus({ preventScroll: true });
-    if (listCovered() && COVERED_LIST_SETTLES === 'while-covered') return;
+    if (listCovered() && COVERED_LIST_SETTLES === 'while-covered') {
+      // The list as the person left it, except the thread they just closed
+      // when a message arrived there that they did not see: it comes back
+      // unread, in the section its state gives it (held.ts settleThread).
+      closing.current = null;
+      const next = latestRef.current?.sections.flatMap((section) => section.threads).find((row) => row.thread_id === closed);
+      if (next && next.unseen > 0) setShown((current) => (current ? settleThread(current, latestRef.current!.sections, closed) : current));
+      return;
+    }
     if (prefersReducedMotion()) settleList('own', false);
     else settleTimer.current = setTimeout(() => settleList('own', true), sidebarHeldNow.current ? SETTLE_AFTER_SIDEBAR_MS : SETTLE_BEAT_MS);
   }, [route.page, route.project, route.thread, settleList, cancelSettle]);
@@ -574,6 +733,34 @@ function Inbox() {
       void loadUpdateDetails();
     }
   }, [route.page, refreshSettings, loadUpdateDetails]);
+
+  // Settings' Archived count in its nav: read while Settings is open, again whenever the store moves.
+  const [archivedTotal, setArchivedTotal] = useState<number | null>(null);
+  const storeCursor = latest?.cursor ?? null;
+  useEffect(() => {
+    if (route.page !== 'settings') return;
+    let cancelled = false;
+    inboxApi
+      .archived({ limit: 1 })
+      .then((model) => !cancelled && setArchivedTotal(model.total))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [route.page, storeCursor]);
+
+  // "← Inbox" returns to where the person was before Settings: the last hash that was not a Settings page,
+  // so moving between sections never changes where Back goes (Workspaces' BackLink).
+  const settingsReturn = useRef('');
+  if (route.page !== 'settings') settingsReturn.current = hashOf(route);
+
+  // Settings is a focused page (design of record inbox-settings-tabs): the sidebar slides away while it
+  // is open and comes back on leaving, without writing the person's stored choice. ⌘B there opens it
+  // for this visit only.
+  const [settingsSidebar, setSettingsSidebar] = useState(false);
+  useEffect(() => {
+    if (route.page !== 'settings') setSettingsSidebar(false);
+  }, [route.page]);
 
   const decisionsProject = route.page === 'decisions' ? decisionsProjectOf(route, latest) : null;
   useEffect(() => {
@@ -616,13 +803,47 @@ function Inbox() {
           setSettings((current) => (current ? { ...current, sound: answer.sound } : current));
           if (answer.show && !cancelled) setSoundDialog('open');
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => setSoundClaimed(true));
     }, 700);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
   }, [soundDialogDue, soundDialogBlocked]);
+
+  // The one-time agent-note dialog (the approved "inbox-agent-note-dialog"
+  // design): asks about each agent that can take a note and was never asked.
+  // Decided once per load, once the agents are read (the run that opened the
+  // window has finished connecting) and the list has loaded; after the sound
+  // dialog, and never on a load that showed it. Never through the tailnet
+  // (the agents are local only, so `agents` stays null there), never while an
+  // update dialog is open or a reply is being typed, and it waits while
+  // Settings is open (Settings → Agents asks the same thing).
+  const soundSettled = settings !== null && (!(settings.sound?.dialog_due === true && (settings.via ?? 'local') === 'local') || soundClaimed);
+  const agentNoteReady =
+    agentsSettled && latest !== null && soundSettled && soundDialog === 'none' && updateDialog === null && !restarting && route.page !== 'settings';
+  useEffect(() => {
+    if (!agentNoteReady || agentNoteDecided.current) return;
+    let cancelled = false;
+    const decide = () => {
+      if (cancelled || agentNoteDecided.current || replyInProgress()) return false;
+      agentNoteDecided.current = true;
+      const model = agentsRef.current;
+      const rows = model ? noteQuestionRows(model) : [];
+      if (rows.length > 0 && model) setAgentNote({ rows, report: cardReport(model) });
+      return true;
+    };
+    if (decide()) return;
+    const timer = setInterval(() => {
+      if (decide()) clearInterval(timer);
+    }, 700);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [agentNoteReady]);
+  const agentNoteOpen = typeof agentNote === 'object';
 
 
   // The list on screen catches up as the route changes (the layout effect above), not here.
@@ -807,14 +1028,14 @@ function Inbox() {
   // An open file (its viewer, the stepping bar, the guard row) and a guided
   // review own the keyboard: E and Z stand down there, and while the sound
   // dialog is up.
-  const keysRef = useRef({ markRead, toast, thread, soundDialog });
-  keysRef.current = { markRead, toast, thread, soundDialog };
+  const keysRef = useRef({ markRead, toast, thread, soundDialog, agentNoteOpen: false });
+  keysRef.current = { markRead, toast, thread, soundDialog, agentNoteOpen: typeof agentNote === 'object' };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented || event.repeat) return;
       const key = event.key.toLowerCase();
       if (key !== 'e' && key !== 'z') return;
-      if (keysRef.current.soundDialog === 'open' || routeRef.current.guide) return;
+      if (keysRef.current.soundDialog === 'open' || keysRef.current.agentNoteOpen || routeRef.current.guide) return;
       const target = event.target instanceof HTMLElement ? event.target : null;
       if (target) {
         if (target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') return;
@@ -1066,7 +1287,7 @@ function Inbox() {
   };
 
   const filterProject = route.page === 'inbox' && route.project ? projects.find((p) => p.id === route.project) ?? null : null;
-  const notice = shown && latest ? heldNotice(filterSections(shown, route.project), filterSections(latest.sections, route.project), openedHere.current).text : null;
+  const notice = shown && latest ? heldNotice(filterSections(shown, route.project), filterSections(latest.sections, route.project), openedHere.current, heldOpen()).text : null;
   const firstRun = latest !== null && projects.length === 0;
   // A file beside the thread takes the list's and the sidebar's room (record 2.2).
   const fileOpen = route.page === 'inbox' && !!route.thread && !!route.file;
@@ -1230,6 +1451,8 @@ function Inbox() {
         context={context}
         error={settingsError}
         onToggleTool={toggleTool}
+        agents={agents}
+        onAgents={setAgents}
         onToggleTailscale={(next, replaceExposed) => void toggleTailscale(next, replaceExposed)}
         tailscaleBusy={tailscaleBusy}
         permission={notifications.permission}
@@ -1238,6 +1461,8 @@ function Inbox() {
         onDeleteProject={deleteProject}
         sound={settings?.sound ? sound : undefined}
         archived={<ArchivedBlock refreshKey={latest?.cursor ?? null} onUnarchive={unarchiveFromSettings} />}
+        archivedTotal={archivedTotal}
+        aboutDot={!!update}
         about={
           <AboutBlock
             version={latest?.version ?? settings?.version ?? 'dev'}
@@ -1247,8 +1472,32 @@ function Inbox() {
             error={null}
             onCheckNow={() => void checkNow()}
             onToggle={(change) => void saveUpdateSwitches(change)}
+            update={update}
+            onUpdate={pressUpdate}
+            onWhatsNew={openWhatsNew}
+            where={
+              settings
+                ? { data: tildePath(settings.data_dir, settings.home), mcpUrl: settings.mcp_url, mcpCommand: shellLine(settings.mcp_command) }
+                : null
+            }
           />
         }
+        section={route.section ?? null}
+        pairing={route.pair === true}
+        phone={phone}
+        onSection={(section) =>
+          section === null && phone ? close({ page: 'settings', project: null, thread: null, section: null }) : go({ page: 'settings', project: null, thread: null, section })
+        }
+        onPairing={(open) =>
+          open
+            ? go({ page: 'settings', project: null, thread: null, section: 'devices', pair: true })
+            : close({ page: 'settings', project: null, thread: null, section: 'devices' })
+        }
+        onBack={() => go(routeOf(settingsReturn.current))}
+        onRetry={() => {
+          setSettingsError(null);
+          void refreshSettings();
+        }}
       />
     );
   } else if (route.page === 'whats-new') {
@@ -1285,7 +1534,9 @@ function Inbox() {
   } else if (!latest || !shown) {
     main = <div className="ib-listcol">{loadError && <div className="ib-error" style={{ padding: 22 }}>{loadError}</div>}</div>;
   } else if (firstRun) {
-    main = <EmptyState context={context} />;
+    main = (
+      <EmptyState context={context} />
+    );
   } else {
     main = (
       <>
@@ -1301,15 +1552,14 @@ function Inbox() {
           selectedThreadId={route.thread}
           notice={notice}
           ask={
-            notifications.ask &&
-            soundDialog === 'none' && (
+            notifications.ask && soundDialog === 'none' && agentNote === 'none' ? (
               <NotificationAsk
                 kind={notifications.ask}
                 soundOn={sound.settings.enabled}
                 onTurnOn={() => void notifications.turnOn()}
                 onNotNow={notifications.notNow}
               />
-            )
+            ) : null
           }
           onShowNew={() => {
             // Show's line goes away with the press: after a key, focus goes to the first row it brought in.
@@ -1340,6 +1590,9 @@ function Inbox() {
             onOpenFile={(file, options) => (file ? writeRoute({ ...routeRef.current, file }, options) : closeTo({ ...routeRef.current, file }))}
             onOpenGuide={(messageId) => go({ ...route, guide: messageId })}
             lookSeq={look?.threadId === thread.thread_id ? look.seq : undefined}
+            seenThrough={look?.threadId === thread.thread_id ? look.through : null}
+            onSeen={(through) => seenOnSight(thread.thread_id, through)}
+            covered={!!route.guide || updateDialog !== null || soundDialog === 'open' || agentNoteOpen}
             backLabel={filterProject?.name ?? 'Inbox'}
             phone={phone}
             stacked={stack.thread}
@@ -1373,8 +1626,12 @@ function Inbox() {
       {/* A file beside the thread takes the sidebar's room (record 2.2): it closes on the same spring, and the person's choice stays as it was. */}
       <SidebarShell
         className="ib-shell"
-        open={sidebarOpen && !fileOpen && !sidebarHeld}
+        open={route.page === 'settings' ? settingsSidebar : sidebarOpen && !fileOpen && !sidebarHeld}
         onOpenChange={(next) => {
+          if (routeRef.current.page === 'settings') {
+            setSettingsSidebar(next);
+            return;
+          }
           setSidebarHeld(false);
           changeSidebar(next);
         }}
@@ -1396,6 +1653,7 @@ function Inbox() {
             onUpdate={pressUpdate}
             onWhatsNew={openWhatsNew}
             soundNeedsClick={!!settings?.sound && sound.settings.enabled && !sound.armed}
+            mcpCommand={settings?.mcp_command ?? null}
           />
         }
       >
@@ -1447,7 +1705,17 @@ function Inbox() {
           }}
         />
       )}
-      {toast && soundDialog !== 'open' && <InboxToast toast={toast} onDismiss={dismissToast} phone={phone} />}
+      {typeof agentNote === 'object' && agents && (
+        <AgentNoteDialog
+          rows={agentNote.rows}
+          report={agentNote.report}
+          noteText={agents.note_text}
+          onModel={setAgents}
+          onSettings={() => go({ page: 'settings', project: null, thread: null, section: 'agents' })}
+          onClosed={() => setAgentNote('shown')}
+        />
+      )}
+      {toast && soundDialog !== 'open' && !agentNoteOpen && <InboxToast toast={toast} onDismiss={dismissToast} phone={phone} />}
       <div className="ib-sr" aria-live="polite" data-inbox-live="">
         {said}
       </div>

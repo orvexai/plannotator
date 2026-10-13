@@ -28,9 +28,14 @@ import {
   resolve,
 } from "node:path";
 import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
+import { parseT3HookCommand, T3_SETTINGS_BACKUP_SUFFIX } from "@plannotator/shared/t3-hook-command";
+import { runningT3Workers, stopT3Workers } from "@plannotator/shared/t3-workers";
 import { inboxStatus, readInboxRegistry, stopInbox } from "@plannotator/shared/inbox/registry";
 import { INBOX_TAILNET_HTTPS_PORT, takeDownInboxTailnet } from "./inbox-devices";
 import { takeDownInboxTailscale } from "./inbox-tailscale";
+import { forgetInboxAgents, planInboxAgentRemoval, type AgentEnvironment } from "./inbox-agents";
+import { planInboxNoteRemoval } from "./inbox-agent-notes";
+import { INBOX_AGENT_LABELS, type InboxAgentId } from "@plannotator/core/inbox-types";
 import {
   applyEdits,
   createScanner,
@@ -104,6 +109,7 @@ const PURGE_OWNED_TOP_LEVEL = [
   "history",
   "feedback",
   "inbox",
+  "t3-code",
   "drafts",
   "review-progress",
   "active",
@@ -291,7 +297,7 @@ type MutableUninstallResult = {
 type HookCleanupSpec = {
   readonly event: string;
   readonly matcher?: string;
-  readonly suffix: "" | "improve-context";
+  readonly suffix: "" | "improve-context" | "t3-hook";
 };
 
 type HookCleanupPolicy = {
@@ -427,10 +433,27 @@ export async function runPlannotatorUninstall(
     }
   }
 
+  // The opt-in T3 Code connection's workers run from the binary being removed
+  // and write into t3-code/: stop them (reviews stay open). Nothing to do for
+  // anyone who never connected T3.
+  if (request.dryRun) {
+    for (const worker of await runningT3Workers(state.dataDir)) {
+      state.planned.push(`Stop the T3 Code companion for thread ${worker.thread} (pid ${worker.pid})`);
+    }
+  } else {
+    for (const worker of await stopT3Workers(state.dataDir)) {
+      if (worker.state === "stopped") state.removed.push(`Stopped the T3 Code companion for thread ${worker.entry.thread} (pid ${worker.entry.pid})`);
+      if (worker.state === "still_running") state.warnings.push(`The T3 Code companion for thread ${worker.entry.thread} (pid ${worker.entry.pid}) did not stop; quit it before deleting ${join(state.dataDir, "t3-code")}.`);
+    }
+  }
+
   const paths = resolveOwnedPaths(environment);
 
   await removeHostPlugins(request, environment, paths, state);
   removeHostConfigEntries(request, environment, paths, state);
+  // Plain uninstall too: with the binary gone, an agent's plannotator-inbox
+  // entry would fail to start at every launch.
+  await removeInboxAgentConnections(request, environment, state);
   removeInstalledFiles(request, environment, paths, state);
   if (dataDirSafetyIssue) {
     state.warnings.push(
@@ -505,6 +528,63 @@ export function formatUninstallResult(result: UninstallResult): string {
   }
 
   return lines.join("\n");
+}
+
+/** The agents' boundary (inbox-agents.ts) over uninstall's own. */
+function agentEnvironmentOf(environment: UninstallEnvironment): AgentEnvironment {
+  return {
+    platform: environment.platform,
+    homeDir: environment.homeDir,
+    env: environment.env,
+    which: (command) => environment.which(command),
+    run: async (argv) => {
+      const result = await environment.runCommand(argv[0]!, argv.slice(1));
+      return { exitCode: result.exitCode, timedOut: result.timedOut, stdout: result.stdout ?? "", stderr: "" };
+    },
+  };
+}
+
+/**
+ * The `plannotator-inbox` MCP entries `plannotator inbox` added to the
+ * agents on this computer (inbox-agents.ts): only the recorded ones that still
+ * run Plannotator. An entry the person changed to run something else is theirs
+ * and is named; so is one that runs this binary but has no record (agents.json
+ * lost), which the person may have added by hand. A failure is a warning,
+ * never a reason to keep the CLI.
+ */
+async function removeInboxAgentConnections(
+  request: UninstallRequest,
+  environment: UninstallEnvironment,
+  state: MutableUninstallResult,
+): Promise<void> {
+  const agents = agentEnvironmentOf(environment);
+  // With no record (agents.json lost), an entry that runs exactly this binary is named, never removed.
+  const plan = planInboxAgentRemoval(state.dataDir, agents, [environment.execPath, "inbox", "mcp"]);
+  // The notes (inbox-agent-notes.ts): only the marked section, as the person left it.
+  const notes = planInboxNoteRemoval(state.dataDir, agents, INBOX_AGENT_LABELS);
+  for (const skipped of [...plan.skipped, ...notes.skipped]) state.warnings.push(`Skipped: ${skipped}.`);
+  if (request.dryRun) {
+    for (const item of plan.items) state.planned.push(item.describe);
+    for (const note of notes.items) state.planned.push(note.describe);
+    return;
+  }
+  for (const note of notes.items) {
+    const result = note.apply();
+    if (result.ok) state.removed.push(note.describe);
+    else state.warnings.push(`Could not remove the note in ${note.path}: ${result.reason}.`);
+  }
+  const removed: InboxAgentId[] = [];
+  for (const item of plan.items) {
+    const problem = await item.apply();
+    if (problem) {
+      state.warnings.push(`Could not remove ${item.describe}: ${problem}.`);
+      continue;
+    }
+    state.removed.push(item.describe);
+    removed.push(item.agent);
+  }
+  // A plain uninstall keeps the data: forget these records so a reinstall connects them again.
+  if (!request.purge) forgetInboxAgents(state.dataDir, removed);
 }
 
 function formatUninstallRetryCommand(request: UninstallRequest): string {
@@ -685,6 +765,7 @@ function removeHostConfigEntries(
     [
       { event: "PermissionRequest", matcher: "ExitPlanMode", suffix: "" },
       { event: "PreToolUse", matcher: "EnterPlanMode", suffix: "improve-context" },
+      { event: "PreToolUse", matcher: "Bash", suffix: "t3-hook" },
     ],
     paths.binaryPaths,
     environment.platform,
@@ -693,10 +774,13 @@ function removeHostConfigEntries(
       removeFileWhenEmpty: false,
     },
     "managed Claude Code hooks",
-    `Make ${join(paths.claudeDir, "settings.json")} a readable, writable strict JSON object. Remove only Plannotator command hooks from hooks.PermissionRequest entries whose matcher is "ExitPlanMode" and hooks.PreToolUse entries whose matcher is "EnterPlanMode", then save the file.`,
+    `Make ${join(paths.claudeDir, "settings.json")} a readable, writable strict JSON object. Remove only Plannotator command hooks from hooks.PermissionRequest entries whose matcher is "ExitPlanMode", hooks.PreToolUse entries whose matcher is "EnterPlanMode", and Plannotator t3-hook commands in Bash entries, then save the file.`,
     request,
     state,
   );
+  // The backup `t3-hook install` (install.sh --with-t3) made before its first
+  // change to settings.json. The name is Plannotator's own; nothing else writes it.
+  removePath(join(paths.claudeDir, `settings.json${T3_SETTINGS_BACKUP_SUFFIX}`), request, state);
 
   cleanupHooksJson(
     join(paths.codexDir, "hooks.json"),
@@ -1974,7 +2058,7 @@ function removePath(
 function isManagedHook(
   value: unknown,
   binaryPaths: readonly string[],
-  suffix: "" | "improve-context",
+  suffix: "" | "improve-context" | "t3-hook",
   platform: NodeJS.Platform,
   allowRelocatedBinary = false,
 ): boolean {
@@ -1984,6 +2068,10 @@ function isManagedHook(
   }
 
   const command = hook.command.trim();
+  if (suffix === "t3-hook") {
+    const parsed = parseT3HookCommand(command);
+    return parsed !== undefined && (parsed.executable === "plannotator" || binaryPaths.some((path) => sameCommand(parsed.executable, path, platform)));
+  }
   const expectedBare = suffix ? `plannotator ${suffix}` : "plannotator";
   if (command === expectedBare) return true;
 
