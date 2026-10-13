@@ -11,6 +11,7 @@ import { SingleFlight } from "../generated/single-flight.ts";
 import { contentHash } from "../generated/draft.ts";
 import { countUnsentDraftComments, hostSessionClosedEvent } from "../generated/host-control.ts";
 import { checkServerSession, createServerSessionNonce, serverSessionMismatchBody } from "../generated/server-session.ts";
+import { publishToArtifactServer, readArtifactServerComments, DEFAULT_ARTIFACT_SERVER_URL } from "../generated/artifact-server.ts";
 import { handleHostControl, resolveHostControlToken, type HostControl } from "./host-control.ts";
 import { createRequestHostGuard } from "./request-host-guard.ts";
 import { createReviewDraftSession, prDraftTargetKey, type ReviewDraftKeys } from "../generated/review-draft.ts";
@@ -372,6 +373,7 @@ export async function startReviewServer(options: {
 	initialFileIdentities?: Record<string, string>;
 	error?: string;
 	sharingEnabled?: boolean;
+	artifactServerUrl?: string;
 	/**
 	 * Whether this session's decision consumer delivers approve-time feedback
 	 * (decision-control spec §6.4). Mirrors the Bun server: echoed as
@@ -1882,10 +1884,7 @@ export async function startReviewServer(options: {
 	const sourceKindAdvert = isStaticPatchMode
 		? ({ sourceKind: "patch" } as const)
 		: ({} as Record<string, never>);
-	const shareBaseUrl =
-		(options.shareBaseUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
-	const pasteApiUrl =
-		(options.pasteApiUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
+	const artifactServerUrl = options.artifactServerUrl || process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || DEFAULT_ARTIFACT_SERVER_URL;
 	let reviewDecided = false;
 	let resolveDecision!: (result: {
 		approved: boolean;
@@ -1972,6 +1971,44 @@ export async function startReviewServer(options: {
 		const url = requestUrl(req);
 
 		if (handleHostControl(req, res, url, { token: hostControlToken, getServerPort: () => boundPort, control: hostControl })) return;
+		if (url.pathname === "/api/artifact-share" && req.method === "POST") {
+			if (!isSameOriginOrNoOrigin(req.headers.origin ?? null, req.headers.host ?? "", req.headers["sec-fetch-site"])) {
+				json(res, { error: "Cross-origin request refused" }, 403);
+				return;
+			}
+			if (!sharingEnabled) {
+				json(res, { error: "Sharing is disabled" }, 403);
+				return;
+			}
+			try {
+				const body = await parseBody(req) as { content?: unknown; title?: unknown };
+				if (typeof body.content !== "string" || typeof body.title !== "string") {
+					json(res, { error: "content and title are required" }, 400);
+					return;
+				}
+				json(res, await publishToArtifactServer(body.content, body.title, artifactServerUrl));
+			} catch (error) {
+				json(res, { error: error instanceof Error ? error.message : "Artifact Server publish failed" }, 502);
+			}
+			return;
+		}
+		if (url.pathname === "/api/artifact-comments" && req.method === "POST") {
+			if (!isSameOriginOrNoOrigin(req.headers.origin ?? null, req.headers.host ?? "", req.headers["sec-fetch-site"])) {
+				json(res, { error: "Cross-origin request refused" }, 403);
+				return;
+			}
+			try {
+				const body = await parseBody(req) as { reviewUrl?: unknown };
+				if (typeof body.reviewUrl !== "string") {
+					json(res, { error: "reviewUrl is required" }, 400);
+					return;
+				}
+				json(res, await readArtifactServerComments(body.reviewUrl, artifactServerUrl));
+			} catch (error) {
+				json(res, { error: error instanceof Error ? error.message : "Artifact Server comments could not be read" }, 502);
+			}
+			return;
+		}
 
 		// API: Get tour result
 		if (url.pathname.match(/^\/api\/tour\/[^/]+$/) && req.method === "GET") {
@@ -2324,8 +2361,8 @@ export async function startReviewServer(options: {
 				// Mount is the only place the pin matters, so it rides /api/diff
 				// alone (not the switch endpoints).
 				...(options.openStatePinned && { openStatePinned: true }),
-				shareBaseUrl,
-				pasteApiUrl,
+				shareBaseUrl: artifactServerUrl,
+				artifactServerUrl,
 				repoInfo,
 				isWSL: wslFlag,
 				// PR mode advertises the ready PR checkout (null while warming), so

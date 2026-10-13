@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import { contentHash, deleteDraft, loadDraft } from "../generated/draft.ts";
 import { countUnsentDraftComments, hostSessionClosedEvent, type HostCloseOutcome } from "../generated/host-control.ts";
 import { checkServerSession, createServerSessionNonce, serverSessionMismatchBody } from "../generated/server-session.ts";
+import { publishToArtifactServer, readArtifactServerComments, DEFAULT_ARTIFACT_SERVER_URL } from "../generated/artifact-server.ts";
 import { handleHostControl, resolveHostControlToken, type HostControl } from "./host-control.ts";
 import { createRequestHostGuard } from "./request-host-guard.ts";
 import {
@@ -131,6 +132,7 @@ export async function startPlanReviewServer(options: {
 	origin?: string;
 	permissionMode?: string;
 	sharingEnabled?: boolean;
+	artifactServerUrl?: string;
 	shareBaseUrl?: string;
 	pasteApiUrl?: string;
 	mode?: "archive";
@@ -147,10 +149,7 @@ export async function startPlanReviewServer(options: {
 	const gitUser = detectGitUser();
 	const sharingEnabled =
 		options.sharingEnabled ?? resolveSharingEnabled(loadConfig());
-	const shareBaseUrl =
-		(options.shareBaseUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
-	const pasteApiUrl =
-		(options.pasteApiUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
+	const artifactServerUrl = options.artifactServerUrl || process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || DEFAULT_ARTIFACT_SERVER_URL;
 
 	// --- Archive mode setup ---
 	let archivePlans: ArchivedPlan[] = [];
@@ -322,6 +321,44 @@ export async function startPlanReviewServer(options: {
 		const url = requestUrl(req);
 
 		if (handleHostControl(req, res, url, { token: hostControlToken, getServerPort: () => boundPort, control: hostControl })) return;
+		if (url.pathname === "/api/artifact-share" && req.method === "POST") {
+			if (!isSameOriginOrNoOrigin(req.headers.origin ?? null, req.headers.host ?? "", req.headers["sec-fetch-site"])) {
+				json(res, { error: "Cross-origin request refused" }, 403);
+				return;
+			}
+			if (!sharingEnabled || options.mode === "archive") {
+				json(res, { error: "Sharing is disabled" }, 403);
+				return;
+			}
+			try {
+				const body = await parseBody(req) as { content?: unknown; title?: unknown };
+				if (typeof body.content !== "string" || typeof body.title !== "string") {
+					json(res, { error: "content and title are required" }, 400);
+					return;
+				}
+				json(res, await publishToArtifactServer(body.content, body.title, artifactServerUrl));
+			} catch (error) {
+				json(res, { error: error instanceof Error ? error.message : "Artifact Server publish failed" }, 502);
+			}
+			return;
+		}
+		if (url.pathname === "/api/artifact-comments" && req.method === "POST") {
+			if (!isSameOriginOrNoOrigin(req.headers.origin ?? null, req.headers.host ?? "", req.headers["sec-fetch-site"])) {
+				json(res, { error: "Cross-origin request refused" }, 403);
+				return;
+			}
+			try {
+				const body = await parseBody(req) as { reviewUrl?: unknown };
+				if (typeof body.reviewUrl !== "string") {
+					json(res, { error: "reviewUrl is required" }, 400);
+					return;
+				}
+				json(res, await readArtifactServerComments(body.reviewUrl, artifactServerUrl));
+			} catch (error) {
+				json(res, { error: error instanceof Error ? error.message : "Artifact Server comments could not be read" }, 502);
+			}
+			return;
+		}
 
 		if (url.pathname === "/api/done" && req.method === "POST") {
 			resolveDone?.();
@@ -378,7 +415,8 @@ export async function startPlanReviewServer(options: {
 					mode: "archive",
 					archivePlans,
 					sharingEnabled,
-					shareBaseUrl,
+					shareBaseUrl: artifactServerUrl,
+					artifactServerUrl,
 					serverConfig: getServerConfig(gitUser, currentPiHost()),
 				});
 			} else {
@@ -393,8 +431,8 @@ export async function startPlanReviewServer(options: {
 					previousPlan,
 					versionInfo,
 					sharingEnabled,
-					shareBaseUrl,
-					pasteApiUrl,
+					shareBaseUrl: artifactServerUrl,
+					artifactServerUrl,
 					repoInfo,
 					projectRoot: process.cwd(),
 					serverConfig: getServerConfig(gitUser, currentPiHost()),
