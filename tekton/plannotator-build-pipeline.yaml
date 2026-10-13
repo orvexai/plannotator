@@ -44,8 +44,11 @@ spec:
             image: oven/bun:1.4.2
             workingDir: $(workspaces.source.path)
             script: |
+              #!/bin/sh
+              set -eu
               bun install --frozen-lockfile
-              bun run build
+              bun run build:pi
+              bun run build:opencode
               bun test
       workspaces:
         - name: source
