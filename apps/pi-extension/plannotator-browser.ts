@@ -388,8 +388,8 @@ export async function startPlanReviewBrowserSession(
 		htmlContent: planHtmlContent,
 		origin: "pi",
 		sharingEnabled: resolveSharingEnabled(loadConfig()),
-		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+		shareBaseUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
 		sessionBridge: options.sessionBridge,
 		planRevisions: options.planRevisions,
 	}));
@@ -805,8 +805,8 @@ async function createCodeReviewBrowserSession(
 		// approved prompt, so the advert is unconditional — same shape as the
 		// annotate session's advert below (spec §6.4).
 		approvalNotesSupported: true,
-		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+		shareBaseUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
 		onCleanup: worktreeCleanup,
 	}));
 
@@ -914,8 +914,8 @@ export async function startMarkdownAnnotationSession(
 		convertHtml,
 		htmlContent: planHtmlContent,
 		sharingEnabled: resolveSharingEnabled(loadConfig()),
-		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+		shareBaseUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
 		agentCwd: ctx.cwd,
 		project: detectProjectName(),
 	}));
@@ -977,8 +977,8 @@ export async function openArchiveBrowserAction(
 		mode: "archive",
 		customPlanPath,
 		sharingEnabled: resolveSharingEnabled(loadConfig()),
-		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+		shareBaseUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
 	}));
 
 	return openBrowserAndWait(server, ctx, async () => {

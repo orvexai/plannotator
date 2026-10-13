@@ -41,13 +41,13 @@ interface ExportModalProps {
   onClose: () => void;
   shareUrl: string;
   shareUrlSize: string;
-  /** Short share URL from the paste service (empty string when unavailable) */
+  /** Artifact Server Review link (empty string until published) */
   shortShareUrl?: string;
   /** Whether the short URL is currently being generated */
   isGeneratingShortUrl?: boolean;
   /** Error from the last short URL generation attempt (empty string = no error) */
   shortUrlError?: string;
-  /** Generate a short URL on demand (user clicks "Create short link") */
+  /** Generate a short URL on demand (user clicks "Share to Artifact Server") */
   onGenerateShortUrl?: () => void | Promise<unknown>;
   annotationsOutput: string;
   annotationCount: number;
@@ -286,7 +286,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               {shortShareUrl ? (
                 <div>
                   <label className="block text-xs font-medium text-muted-foreground mb-2">
-                    Share Link
+                    Artifact Server Review link
                   </label>
                   <div className="relative group">
                     <input
@@ -317,7 +317,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     </button>
                   </div>
                   <p className="text-[10px] text-muted-foreground mt-1">
-                    Encrypted short link. The browser uploads AES-256-GCM ciphertext; the decryption key stays in the URL fragment.
+                    Saved to Artifact Server. Teammates can sign in and add comments.
                   </p>
                 </div>
               ) : isGeneratingShortUrl ? (
@@ -325,7 +325,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
                     <path d="M12 2v4m0 12v4m-7.07-3.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4m-3.93 7.07l-2.83-2.83M7.76 7.76L4.93 4.93" />
                   </svg>
-                  Generating short link...
+                  Publishing to Artifact Server...
                 </div>
               ) : onGenerateShortUrl ? (
                 <div className={`p-3 rounded-lg border ${
@@ -342,7 +342,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     onClick={onGenerateShortUrl}
                     className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 transition-opacity"
                   >
-                    Create short link
+                    Share to Artifact Server
                   </button>
                   {shortUrlError && (
                     <p className="text-[10px] text-amber-500 mt-1">({shortUrlError})</p>
@@ -353,17 +353,17 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               {/* Full hash URL — hidden when hash-based sharing is unavailable (HTML mode) */}
               {!hashUnavailable && <div>
                 <label className="block text-xs font-medium text-muted-foreground mb-2">
-                  {shortShareUrl ? 'Full URL (backup)' : 'Shareable URL'}
+                  Artifact Server Review link
                 </label>
                 <div className="relative group">
                   <textarea
                     readOnly
-                    value={shareUrl}
+                    value={shortShareUrl || shareUrl}
                     className="w-full h-24 bg-muted rounded-lg p-3 pr-20 text-xs font-mono resize-none focus:outline-none focus:ring-2 focus:ring-accent/50"
                     onClick={e => (e.target as HTMLTextAreaElement).select()}
                   />
                   <button
-                    onClick={() => handleCopy(shareUrl, 'full')}
+                    onClick={() => handleCopy(shortShareUrl || shareUrl, 'full')}
                     className="absolute top-2 right-2 px-2 py-1 rounded text-xs font-medium bg-background/80 hover:bg-background border border-border/50 transition-colors flex items-center gap-1"
                   >
                     {copied === 'full' ? (
@@ -388,13 +388,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 </div>
                 {!shortShareUrl && !isGeneratingShortUrl && !urlIsLarge && (
                   <p className="text-[10px] text-muted-foreground mt-1">
-                    Shared content is compressed, not encrypted, in the URL fragment. The portal request does not include that fragment.
+                    Publish to Artifact Server to share this review with teammates.
                   </p>
                 )}
               </div>}
 
               <p className="text-xs text-muted-foreground">
-                Anyone with the full link can view the shared content, including services used to send the link. Hosted short-link ciphertext expires after 7 days.
+                Artifact Server applies its access controls to shared reviews. Teammates sign in to view and comment.
               </p>
             </div>
           ) : activeTab === 'notes' && showNotesTab ? (

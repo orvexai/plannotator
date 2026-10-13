@@ -492,9 +492,9 @@ implementation architecture.
 | `PLANNOTATOR_PORT` | Fixed port (default: random locally, `19432` remote) |
 | `PLANNOTATOR_BROWSER` | Custom browser to open plans in |
 | `PLANNOTATOR_AI` | `disabled` to disable Ask AI, Review Agents, and Guided Review; the annotate agent terminal is separate |
-| `PLANNOTATOR_SHARE` | `disabled` to turn off URL sharing |
-| `PLANNOTATOR_SHARE_URL` | Custom base URL for share links (self-hosted portal) |
-| `PLANNOTATOR_PASTE_URL` | Base URL of the paste service API |
+| `PLANNOTATOR_SHARE` | `disabled` to turn off Artifact Server sharing |
+| `PLANNOTATOR_ARTIFACT_SERVER_URL` | Artifact Server origin. Default: `https://artifacts.orvex.ai` |
+| `PLANNOTATOR_ARTIFACT_SERVER_PROFILE` | Optional saved `artifactserver` CLI profile name |
 | `PLANNOTATOR_ORIGIN` | Override agent detection: `claude-code`, `amp`, `droid`, `opencode`, `codex`, `copilot-cli`, `gemini-cli`, `kiro-cli`, `pi` |
 | `PLANNOTATOR_JINA` | `0`/`false` to disable Jina Reader for URL annotation |
 | `JINA_API_KEY` | Jina Reader API key for higher rate limits |

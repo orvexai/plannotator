@@ -3,7 +3,6 @@
  *
  * Handles:
  * - Loading shared state from URL hash on mount
- * - Loading from paste-service short URLs (/p/<id>)
  * - Generating shareable URLs (hash-based and short)
  * - Tracking whether current session is from a shared link
  */
@@ -13,13 +12,11 @@ import { Annotation, type ImageAttachment } from '../types';
 import {
   type SharePayload,
   parseShareHash,
-  generateShareUrl,
   decompress,
   fromShareable,
   parseShareableImages,
-  formatUrlSize,
-  createShortShareUrl,
-  loadFromPasteId,
+  artifactCommentsToAnnotations,
+  composeArtifactShareDocument,
 } from '../utils/sharing';
 
 export interface ImportResult {
@@ -103,8 +100,8 @@ export function useSharing(
   setAnnotations: React.Dispatch<React.SetStateAction<Annotation[]>>,
   setGlobalAttachments: React.Dispatch<React.SetStateAction<ImageAttachment[]>>,
   onSharedLoad?: () => void,
-  shareBaseUrl?: string,
-  pasteApiUrl?: string,
+  _shareBaseUrl?: string,
+  _pasteApiUrl?: string,
   rawHtml?: string,
   resolveRawHtmlForShare?: () => Promise<string | null>,
   setRawHtml?: (h: string) => void,
@@ -132,8 +129,6 @@ export function useSharing(
     markdown,
     annotations,
     globalAttachments,
-    shareBaseUrl,
-    pasteApiUrl,
     rawHtml,
     contentRevision,
   ]);
@@ -148,67 +143,9 @@ export function useSharing(
 
   const clearShareLoadError = useCallback(() => setShareLoadError(''), []);
 
-  // Load shared state from URL hash (or paste-service short URL)
+  // Load a previously shared local hash payload. Artifact Server links open in Artifact Server.
   const loadFromHash = useCallback(async () => {
     try {
-      // Check for short URL path pattern: /p/<id>
-      const pathMatch = window.location.pathname.match(/^\/p\/([A-Za-z0-9]{6,16})$/);
-      if (pathMatch) {
-        const pasteId = pathMatch[1];
-        // Capture before the async fetch. Concurrent loads (including the
-        // development Strict Mode replay) can complete after an earlier load
-        // removes /p/<id> from history; every completion must preserve the
-        // original short URL.
-        const incomingShortUrl = window.location.href;
-
-        // Extract key and optional paste origin from fragment: #key=<k>&paste=<base64url>
-        const fragment = window.location.hash.slice(1);
-        const params = new URLSearchParams(fragment);
-        const encryptionKey = params.get('key') ?? undefined;
-        const pasteFromFragment = params.get('paste')
-          ? atob(params.get('paste')!.replace(/-/g, '+').replace(/_/g, '/'))
-          : undefined;
-
-        const payload = await loadFromPasteId(pasteId, pasteFromFragment ?? pasteApiUrl, encryptionKey);
-        if (payload) {
-          if (payload.h && payload.r === 'html') {
-            setRawHtml?.(payload.h);
-            setShareHtml?.(payload.h);
-            setRenderAs?.('html');
-            setMarkdown('');
-          } else {
-            setMarkdown(payload.p);
-            setRenderAs?.('markdown');
-            setRawHtml?.('');
-            setShareHtml?.('');
-          }
-
-          const restoredAnnotations = fromShareable(payload.a, payload.d, payload.s);
-          setAnnotations(restoredAnnotations);
-
-          const parsedGlobalAttachments = parseShareableImages(payload.g) ?? [];
-          setGlobalAttachments(parsedGlobalAttachments);
-          setSharedGlobalAttachments(parsedGlobalAttachments.length ? parsedGlobalAttachments : null);
-
-          setPendingSharedAnnotations(restoredAnnotations);
-          setIsSharedSession(true);
-          shortShareUrlLifecycleRef.current = { _tag: 'incoming-hydration' };
-          setShortShareUrl(incomingShortUrl);
-          onSharedLoad?.();
-
-          // Remove the /p/<id> path from browser history so a refresh doesn't
-          // attempt a network fetch. The plan is now held in memory.
-          const basePath = window.location.pathname.replace(/\/p\/[A-Za-z0-9]+$/, '') || '/';
-          window.history.replaceState({}, '', basePath);
-
-          return true;
-        }
-        // Paste fetch failed — short URL path can't fall back to hash parsing
-        // (the hash contains #key=, not plan data).
-        setShareLoadError('Failed to load shared plan — the link may be expired or incomplete.');
-        return false;
-      }
-
       const hash = window.location.hash.slice(1);
 
       // Not a share payload — leave it for Viewer to scroll to (or ignore).
@@ -268,7 +205,7 @@ export function useSharing(
       setShareLoadError('Failed to load shared plan — an unexpected error occurred.');
       return false;
     }
-  }, [setMarkdown, setAnnotations, setGlobalAttachments, onSharedLoad, pasteApiUrl, setRawHtml, setShareHtml, setRenderAs]);
+  }, [setMarkdown, setAnnotations, setGlobalAttachments, onSharedLoad, setRawHtml, setShareHtml, setRenderAs]);
 
   // Load from hash on mount
   useEffect(() => {
@@ -288,19 +225,9 @@ export function useSharing(
 
   // Generate share URL when markdown or annotations change
   const refreshShareUrl = useCallback(async () => {
-    const requestContext = shareRequestContext;
-    try {
-      const url = await generateShareUrl(markdown, annotations, globalAttachments, shareBaseUrl, rawHtml);
-      if (latestShareRequestContextRef.current !== requestContext) return;
-      setShareUrl(url ?? '');
-      setShareUrlSize(url ? formatUrlSize(url) : '');
-    } catch (e) {
-      if (latestShareRequestContextRef.current !== requestContext) return;
-      console.error('Failed to generate share URL:', e);
-      setShareUrl('');
-      setShareUrlSize('');
-    }
-  }, [markdown, annotations, globalAttachments, shareBaseUrl, rawHtml, shareRequestContext]);
+    setShareUrl('');
+    setShareUrlSize('');
+  }, []);
 
   // Auto-refresh share URL when dependencies change
   useEffect(() => {
@@ -345,93 +272,61 @@ export function useSharing(
     setShortUrlError('');
   }, [shareRequestContext, shortShareUrl]);
 
-  /**
-   * Generate a short URL via the paste service.
-   * Only called when the user explicitly clicks "Create short link".
-   * Clears the short URL if the service is unavailable — the full
-   * hash-based URL remains usable as a fallback.
-   */
+  /** Publish the current plan and feedback through the local Artifact Server CLI endpoint. */
   const generateShortUrl = useCallback(async (): Promise<string | null> => {
     if (!markdown && !rawHtml) return null;
-
     setIsGeneratingShortUrl(true);
     setShortUrlError('');
     const requestContext = shareRequestContext;
-    shortShareUrlLifecycleRef.current = {
-      _tag: 'generating',
-      requestContext,
-    };
-
+    shortShareUrlLifecycleRef.current = { _tag: 'generating', requestContext };
     try {
-      const htmlForShare = rawHtml
-        ? (await resolveRawHtmlForShare?.()) ?? rawHtml
-        : undefined;
-      const result = await createShortShareUrl(
-        markdown,
-        annotations,
-        globalAttachments,
-        { pasteApiUrl, shareBaseUrl },
-        htmlForShare,
-      );
-
+      const htmlForShare = rawHtml ? (await resolveRawHtmlForShare?.()) ?? rawHtml : undefined;
+      const content = composeArtifactShareDocument(markdown, annotations, htmlForShare);
+      const title = markdown.trim().split('\n').find(line => line.startsWith('#'))?.replace(/^#+\s*/, '').trim() || 'Plannotator review';
+      const response = await fetch('/api/artifact-share', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content, title }), signal: AbortSignal.timeout(120_000),
+      });
+      const result = await response.json() as { reviewUrl?: string; error?: string };
+      if (!response.ok || typeof result.reviewUrl !== 'string') throw new Error(result.error || 'Artifact Server publish failed');
       if (latestShareRequestContextRef.current !== requestContext) return null;
-
-      if (result) {
-        shortShareUrlLifecycleRef.current = {
-          _tag: 'associated',
-          requestContext,
-        };
-        setShortShareUrl(result.shortUrl);
-        return result.shortUrl;
-      } else {
-        shortShareUrlLifecycleRef.current = { _tag: 'failed', requestContext };
-        setShortShareUrl('');
-        setShortUrlError('Short URL service unavailable');
-        return null;
-      }
+      shortShareUrlLifecycleRef.current = { _tag: 'associated', requestContext };
+      setShortShareUrl(result.reviewUrl);
+      return result.reviewUrl;
     } catch (e) {
       if (latestShareRequestContextRef.current !== requestContext) return null;
       shortShareUrlLifecycleRef.current = { _tag: 'failed', requestContext };
       setShortShareUrl('');
-      setShortUrlError(e instanceof Error ? e.message : 'Failed to generate short URL');
+      setShortUrlError(e instanceof Error ? e.message : 'Artifact Server publish failed');
       return null;
     } finally {
       if (latestShareRequestContextRef.current === requestContext) setIsGeneratingShortUrl(false);
     }
-  }, [markdown, annotations, globalAttachments, shareBaseUrl, pasteApiUrl, rawHtml, resolveRawHtmlForShare, shareRequestContext]);
+  }, [markdown, annotations, rawHtml, resolveRawHtmlForShare, shareRequestContext]);
 
-  // Import annotations from a teammate's share URL (supports both hash-based and short /p/<id> URLs)
+  // Import comments from Artifact Server or local hash payloads.
   const importFromShareUrl = useCallback(async (url: string): Promise<ImportResult> => {
     try {
+      const reviewUrl = new URL(url);
+      if (reviewUrl.pathname === '/review' && reviewUrl.searchParams.has('artifact')) {
+        const response = await fetch('/api/artifact-comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reviewUrl: reviewUrl.toString() }), signal: AbortSignal.timeout(120_000) });
+        const result = await response.json() as { title?: string; comments?: Array<{ id: string; body: string; path: string | null; author: { displayName: string }; createdAt: string; replies?: Array<{ id: string; body: string; author: { displayName: string }; createdAt: string }> }>; error?: string };
+        if (!response.ok || !Array.isArray(result.comments)) throw new Error(result.error || 'Could not import Artifact Server comments');
+        const imported = artifactCommentsToAnnotations(result.comments);
+        const newItems = imported.filter(item => !annotations.some(existing => existing.id === item.id));
+        if (newItems.length) setAnnotations(previous => {
+          const merged = [...previous, ...newItems.filter(item => !previous.some(existing => existing.id === item.id))];
+          setPendingSharedAnnotations(merged);
+          return merged;
+        });
+        return { success: true, count: newItems.length, planTitle: result.title || 'Artifact Server review', ...(newItems.length ? {} : { error: 'No new comments to import' }) };
+      }
       let payload: SharePayload | undefined;
 
-      // Check for short URL pattern: /p/<id> with optional #key=<key> fragment
-      const shortMatch = url.match(/\/p\/([A-Za-z0-9]{6,16})(?:#(.*))?(?:\?|$)/);
-      if (shortMatch) {
-        const pasteId = shortMatch[1];
-        const fragParams = new URLSearchParams(shortMatch[2] ?? '');
-        const encryptionKey = fragParams.get('key') ?? undefined;
-        const pasteFromFragment = fragParams.get('paste')
-          ? atob(fragParams.get('paste')!.replace(/-/g, '+').replace(/_/g, '/'))
-          : undefined;
-        const loaded = await loadFromPasteId(pasteId, pasteFromFragment ?? pasteApiUrl, encryptionKey);
-        if (!loaded) {
-          return { success: false, count: 0, planTitle: '', error: 'Failed to load from short URL — paste may have expired' };
-        }
-        payload = loaded;
-      } else {
-        // Fall back to hash-based URL
-        const hashIndex = url.indexOf('#');
-        if (hashIndex === -1) {
-          return { success: false, count: 0, planTitle: '', error: 'Invalid share URL: no hash fragment or short link found' };
-        }
-        const hash = url.slice(hashIndex + 1);
-        if (!hash) {
-          return { success: false, count: 0, planTitle: '', error: 'Invalid share URL: empty hash' };
-        }
-
-        payload = (await decompress(hash)) as SharePayload;
-      }
+      const hashIndex = url.indexOf('#');
+      if (hashIndex === -1) return { success: false, count: 0, planTitle: '', error: 'Paste an Artifact Server Review link.' };
+      const hash = url.slice(hashIndex + 1);
+      if (!hash) return { success: false, count: 0, planTitle: '', error: 'Paste an Artifact Server Review link.' };
+      payload = (await decompress(hash)) as SharePayload;
 
       // Extract plan title from embedded plan text (or HTML <title>)
       let planTitle = 'Unknown Plan';
@@ -494,7 +389,7 @@ export function useSharing(
       const errorMessage = e instanceof Error ? e.message : 'Failed to decompress share URL';
       return { success: false, count: 0, planTitle: '', error: errorMessage };
     }
-  }, [annotations, globalAttachments, setAnnotations, setGlobalAttachments, pasteApiUrl]);
+  }, [annotations, setAnnotations]);
 
   return {
     isSharedSession,

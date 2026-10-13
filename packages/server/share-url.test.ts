@@ -1,65 +1,50 @@
-import { describe, expect, mock, test } from "bun:test";
-import { decompress } from "@plannotator/shared/compress";
-import { generateRemoteShareUrl, writeRemoteShareLink } from "./share-url";
+import { describe, expect, it, mock } from 'bun:test';
+import { generateRemoteShareUrl, writeRemoteShareLink } from './share-url';
 
-describe("generateRemoteShareUrl", () => {
-  test("keeps markdown remote shares hash-based", async () => {
-    const url = await generateRemoteShareUrl("# Plan", "https://share.example.test");
-    expect(url.startsWith("https://share.example.test/#")).toBe(true);
-
-    const payload = await decompress(url.split("#")[1]) as { p: string; a: unknown[] };
-    expect(payload).toEqual({ p: "# Plan", a: [] });
-  });
-
-  test("uses encrypted paste links for raw HTML remote shares", async () => {
-    const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
-      expect(String(url)).toBe("https://paste.example.test/api/paste");
-      expect(init?.method).toBe("POST");
-      expect(init?.headers).toEqual({ "Content-Type": "application/json" });
-      const body = JSON.parse(String(init?.body)) as { data?: unknown };
-      expect(typeof body.data).toBe("string");
-      return new Response(JSON.stringify({ id: "abc123" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }) as typeof fetch;
-
-    const url = await generateRemoteShareUrl("", "https://share.example.test", {
-      rawHtml: "<!doctype html><h1>Hello</h1>",
-      pasteApiUrl: "https://paste.example.test",
-      fetchImpl,
+describe('Artifact Server share links', () => {
+  it('publishes through the CLI and returns its Review link', async () => {
+    const url = await generateRemoteShareUrl('# Plan', 'https://artifacts.example.test', {
+      runCli: async () => ({ stdout: JSON.stringify({
+        artifact: { id: 'art-1', projectId: 'proj-1' },
+        version: { id: 'ver-1' },
+        links: { review: 'https://artifacts.example.test/review?artifact=art-1&project=proj-1&version=ver-1' },
+      }), stderr: '' }),
     });
-
-    expect(url).toMatch(/^https:\/\/share\.example\.test\/p\/abc123#key=[A-Za-z0-9_-]+&paste=/);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(url).toContain('https://artifacts.example.test/review?');
   });
 
-  test("warns instead of silently dropping raw HTML remote share failures", async () => {
-    const fetchImpl = mock(async () =>
-      new Response(JSON.stringify({ error: "Payload too large (max 5 MB encrypted)" }), {
-        status: 413,
-        headers: { "Content-Type": "application/json" },
-      })
-    ) as typeof fetch;
-    const originalWrite = process.stderr.write;
-    let stderr = "";
-    process.stderr.write = ((chunk: string | Uint8Array) => {
-      stderr += String(chunk);
-      return true;
-    }) as typeof process.stderr.write;
+  it('includes standalone HTML content in the published artifact', async () => {
+    let args: string[] = [];
+    await generateRemoteShareUrl('', 'https://artifacts.example.test', {
+      rawHtml: '<h1>Review</h1>',
+      runCli: async (received) => {
+        args = received;
+        const file = Bun.file(received[1]!);
+        expect(await file.text()).toContain('<h1>Review</h1>');
+        return { stdout: JSON.stringify({
+          artifact: { id: 'art-1', projectId: 'proj-1' }, version: { id: 'ver-1' },
+          links: { review: 'https://artifacts.example.test/review?artifact=art-1&project=proj-1&version=ver-1' },
+        }), stderr: '' };
+      },
+    });
+    expect(args[0]).toBe('publish');
+  });
 
+  it('reports the Artifact Server Review URL to stderr', async () => {
+    const originalWrite = process.stderr.write;
+    let output = '';
+    process.stderr.write = ((chunk: string | Uint8Array) => { output += String(chunk); return true; }) as typeof process.stderr.write;
     try {
-      await writeRemoteShareLink("", "https://share.example.test", "annotate", "HTML document only", {
-        rawHtml: "<!doctype html><h1>Hello</h1>",
-        pasteApiUrl: "https://paste.example.test",
-        fetchImpl,
+      await writeRemoteShareLink('# Plan', 'https://artifacts.example.test', 'review the plan', 'plan only', {
+        runCli: async () => ({ stdout: JSON.stringify({
+          artifact: { id: 'art-1', projectId: 'proj-1' }, version: { id: 'ver-1' },
+          links: { review: 'https://artifacts.example.test/review?artifact=art-1&project=proj-1&version=ver-1' },
+        }), stderr: '' }),
       });
     } finally {
       process.stderr.write = originalWrite;
     }
-
-    expect(stderr).toContain("Warning: could not create remote share link for HTML document only.");
-    expect(stderr).toContain("Payload too large (max 5 MB encrypted)");
-    expect(stderr).toContain("HTML sharing uses the paste service");
+    expect(output).toContain('Saved to Artifact Server');
+    expect(output).toContain('/review?');
   });
 });

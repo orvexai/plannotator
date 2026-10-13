@@ -461,6 +461,9 @@ const ReviewApp: React.FC = () => {
     useState<LineAnnotationComposeRequest | null>(null);
   const nextLineAnnotationComposeRequestId = useRef(0);
   const [showExportModal, setShowExportModal] = useState(false);
+  const [artifactReviewUrl, setArtifactReviewUrl] = useState('');
+  const [artifactSharePending, setArtifactSharePending] = useState(false);
+  const [artifactShareError, setArtifactShareError] = useState('');
   const [showWorktreeDialog, setShowWorktreeDialog] = useState(false);
   const [openSettingsMenu, setOpenSettingsMenu] = useState(false);
   const [showNoAnnotationsDialog, setShowNoAnnotationsDialog] = useState(false);
@@ -5830,6 +5833,39 @@ const ReviewApp: React.FC = () => {
                 </pre>
               </div>
               <div className="p-4 border-t border-border flex justify-end gap-2">
+                {artifactReviewUrl && (
+                  <button
+                    onClick={() => void copyTextToClipboard(artifactReviewUrl)}
+                    className="px-3 py-1.5 rounded-md text-xs font-medium bg-muted hover:bg-muted/80 transition-colors"
+                  >
+                    Copy Review link
+                  </button>
+                )}
+                <button
+                  disabled={artifactSharePending}
+                  onClick={async () => {
+                    setArtifactSharePending(true);
+                    setArtifactShareError('');
+                    try {
+                      const response = await fetch('/api/artifact-share', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content: feedbackMarkdown || 'Code review feedback', title: 'Code review feedback' }),
+                        signal: AbortSignal.timeout(120_000),
+                      });
+                      const result = await response.json() as { reviewUrl?: string; error?: string };
+                      if (!response.ok || !result.reviewUrl) throw new Error(result.error || 'Artifact Server publish failed');
+                      setArtifactReviewUrl(result.reviewUrl);
+                    } catch (error) {
+                      setArtifactShareError(error instanceof Error ? error.message : 'Artifact Server publish failed');
+                    } finally {
+                      setArtifactSharePending(false);
+                    }
+                  }}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-muted hover:bg-muted/80 transition-colors disabled:opacity-50"
+                >
+                  {artifactSharePending ? 'Saving…' : 'Share to Artifact Server'}
+                </button>
                 <button
                   onClick={() => {
                     void copyTextToClipboard(feedbackMarkdown);
@@ -5838,6 +5874,7 @@ const ReviewApp: React.FC = () => {
                 >
                   Copy to Clipboard
                 </button>
+                {artifactShareError && <span className="self-center text-xs text-destructive">{artifactShareError}</span>}
               </div>
             </div>
           </div>

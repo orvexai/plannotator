@@ -340,11 +340,11 @@ const PlannotatorPlugin: Plugin = async (ctx, rawOptions?: PlannotatorOpenCodeOp
   }
 
   function getShareBaseUrl(): string | undefined {
-    return process.env.PLANNOTATOR_SHARE_URL || undefined;
+    return process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined;
   }
 
   function getPasteApiUrl(): string | undefined {
-    return process.env.PLANNOTATOR_PASTE_URL || undefined;
+    return process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined;
   }
 
   async function getOpenCodeAgents(): Promise<any[] | undefined> {

@@ -156,6 +156,7 @@ import { agentToolHostForServer, createAIRuntime } from "./ai-runtime";
 import { handleHostControl, resolveHostControlToken, type HostControl } from "./host-control";
 import { countUnsentDraftComments, hostSessionClosedEvent } from "@plannotator/shared/host-control";
 import { checkServerSession, createServerSessionNonce, serverSessionMismatchBody } from "@plannotator/shared/server-session";
+import { publishToArtifactServer, readArtifactServerComments, DEFAULT_ARTIFACT_SERVER_URL } from "./artifact-server";
 import { isAIEndpointPath, isLongLivedAIEndpointPath, type AIEndpoints, type SessionBridge } from "@plannotator/ai";
 import { isWSL } from "./browser";
 import { handleOpenInApps, handleOpenIn } from "./open-in";
@@ -252,7 +253,9 @@ export interface ReviewServerOptions {
    * approve-carrying items, exactly the pre-PR5 behavior.
    */
   approvalNotesSupported?: boolean;
-  /** Custom base URL for share links (default: https://share.plannotator.ai) */
+  /** Artifact Server origin (default: https://artifacts.orvex.ai) */
+  artifactServerUrl?: string;
+  /** @deprecated Use artifactServerUrl. */
   shareBaseUrl?: string;
   /** Called when server starts with the URL, remote status, and port */
   onReady?: (url: string, isRemote: boolean, port: number) => void | Promise<void>;
@@ -344,6 +347,7 @@ export async function startReviewServer(
   options: ReviewServerOptions
 ): Promise<ReviewServerResult> {
   const { htmlContent, origin, gitContext, sharingEnabled = true, shareBaseUrl, onReady } = options;
+  const artifactServerUrl = options.artifactServerUrl || process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || DEFAULT_ARTIFACT_SERVER_URL;
   // Session-constant capability advert; rides every diff payload (see the
   // option's doc). Absent option = false, so old callers advertise honestly.
   const approvalNotesSupported = options.approvalNotesSupported === true;
@@ -2033,6 +2037,28 @@ export async function startReviewServer(
           });
           if (hostControlResponse) return hostControlResponse;
 
+          if (url.pathname === "/api/artifact-share" && req.method === "POST") {
+            if (!isSameOriginOrNoOrigin(req.headers.get("origin"), url.host, req.headers.get("sec-fetch-site"))) return Response.json({ error: "Cross-origin request refused" }, { status: 403 });
+            if (!sharingEnabled) return Response.json({ error: "Sharing is disabled" }, { status: 403 });
+            try {
+              const body = await req.json() as { content?: unknown; title?: unknown };
+              if (typeof body.content !== "string" || typeof body.title !== "string") return Response.json({ error: "content and title are required" }, { status: 400 });
+              return Response.json(await publishToArtifactServer(body.content, body.title, artifactServerUrl));
+            } catch (error) {
+              return Response.json({ error: error instanceof Error ? error.message : "Artifact Server publish failed" }, { status: 502 });
+            }
+          }
+          if (url.pathname === "/api/artifact-comments" && req.method === "POST") {
+            if (!isSameOriginOrNoOrigin(req.headers.get("origin"), url.host, req.headers.get("sec-fetch-site"))) return Response.json({ error: "Cross-origin request refused" }, { status: 403 });
+            try {
+              const body = await req.json() as { reviewUrl?: unknown };
+              if (typeof body.reviewUrl !== "string") return Response.json({ error: "reviewUrl is required" }, { status: 400 });
+              return Response.json(await readArtifactServerComments(body.reviewUrl, artifactServerUrl));
+            } catch (error) {
+              return Response.json({ error: error instanceof Error ? error.message : "Artifact Server comments could not be read" }, { status: 502 });
+            }
+          }
+
           // API: Get tour result
           if (url.pathname.match(/^\/api\/tour\/[^/]+$/) && req.method === "GET") {
             const jobId = url.pathname.slice("/api/tour/".length);
@@ -2329,7 +2355,8 @@ export async function startReviewServer(
               // Mount is the only place the pin matters, so it rides /api/diff
               // alone (not the switch endpoints).
               ...(options.openStatePinned && { openStatePinned: true }),
-              shareBaseUrl,
+              shareBaseUrl: artifactServerUrl,
+              artifactServerUrl,
               repoInfo,
               isWSL: wslFlag,
               // PR mode advertises the ready PR checkout (null while warming), so

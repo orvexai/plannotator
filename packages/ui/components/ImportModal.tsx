@@ -84,14 +84,14 @@ export const ImportModal: React.FC<ImportModalProps> = ({
         <div className="p-4 space-y-4">
           <div>
             <label className="block text-xs font-medium text-muted-foreground mb-2">
-              Plannotator Share Link
+              Artifact Server Review link
             </label>
             <input
               type="text"
               value={url}
               onChange={e => setUrl(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={`${shareBaseUrl || 'https://share.plannotator.ai'}/#...`}
+              placeholder={`${shareBaseUrl || 'https://artifacts.orvex.ai'}/review?artifact=…&project=…&version=…`}
               className="w-full bg-muted rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-accent/50"
               disabled={loading}
               autoFocus
@@ -99,7 +99,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
           </div>
 
           <p className="text-xs text-muted-foreground">
-            Paste a share link from a teammate to import their annotations into the current plan review.
+            Paste a teammate’s Artifact Server Review link to import its comments into this review.
           </p>
 
           {/* Result feedback */}
@@ -112,10 +112,10 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                 : 'bg-destructive/10 text-destructive'
             }`}>
               {result.success && result.count > 0 && (
-                <span>Imported {result.count} annotation{result.count !== 1 ? 's' : ''} from "{result.planTitle}"</span>
+                <span>Imported {result.count} comment{result.count !== 1 ? 's' : ''} from "{result.planTitle}"</span>
               )}
               {result.success && result.count === 0 && (
-                <span>{result.error || 'No new annotations to import (all already exist)'}</span>
+                <span>{result.error || 'No new comments to import (all already exist)'}</span>
               )}
               {!result.success && (
                 <span>{result.error || 'Failed to import'}</span>
@@ -137,7 +137,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             disabled={!url.trim() || loading}
             className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {loading ? 'Importing...' : 'Import'}
+            {loading ? 'Importing...' : 'Import comments'}
           </button>
         </div>
       </div>
