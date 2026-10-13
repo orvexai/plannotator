@@ -8,7 +8,7 @@
  * Inspired by textarea.my's approach.
  */
 
-import { AnnotationType, type Annotation, type DocumentRenderAs, type ImageAttachment } from '../types';
+import { AnnotationType, type Annotation, type ArtifactServerAuthor, type DocumentRenderAs, type ImageAttachment } from '../types';
 import { isDiagramRenderKind } from '@plannotator/core/annotatable';
 import { compress, decompress } from '@plannotator/core/compress';
 
@@ -25,21 +25,15 @@ export interface ArtifactServerComment {
   id: string;
   body: string;
   path: string | null;
-  author: {
-    displayName: string;
-    principalId?: string;
-    principalKind?: 'human' | 'service';
-    authorizedByPrincipalId?: string | null;
-    actor?: { kind: 'mcp-client'; clientId: string } | null;
-  };
+  author: ArtifactServerAuthor;
   createdAt: string;
   replies?: Array<{ id: string; body: string; author: ArtifactServerComment['author']; createdAt: string }>;
 }
 
 export function artifactCommentsToAnnotations(comments: ArtifactServerComment[]): Annotation[] {
   return comments.flatMap(comment => [
-    { id: `artifact-${comment.id}`, blockId: '', startOffset: 0, endOffset: 0, type: comment.path ? AnnotationType.COMMENT : AnnotationType.GLOBAL_COMMENT, text: comment.body, originalText: comment.path || '', createdA: Date.parse(comment.createdAt) || Date.now(), author: comment.author.displayName },
-    ...(comment.replies || []).map(reply => ({ id: `artifact-${reply.id}`, blockId: '', startOffset: 0, endOffset: 0, type: AnnotationType.GLOBAL_COMMENT, text: reply.body, originalText: '', createdA: Date.parse(reply.createdAt) || Date.now(), author: reply.author.displayName, inReplyTo: `artifact-${comment.id}` })),
+    { id: `artifact-${comment.id}`, blockId: '', startOffset: 0, endOffset: 0, type: comment.path ? AnnotationType.COMMENT : AnnotationType.GLOBAL_COMMENT, text: comment.body, originalText: comment.path || '', createdA: Date.parse(comment.createdAt) || Date.now(), author: comment.author.displayName, artifactServerAuthor: comment.author },
+    ...(comment.replies || []).map(reply => ({ id: `artifact-${reply.id}`, blockId: '', startOffset: 0, endOffset: 0, type: AnnotationType.GLOBAL_COMMENT, text: reply.body, originalText: '', createdA: Date.parse(reply.createdAt) || Date.now(), author: reply.author.displayName, artifactServerAuthor: reply.author, inReplyTo: `artifact-${comment.id}` })),
   ] as Annotation[]);
 }
 

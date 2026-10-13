@@ -35,7 +35,12 @@ describe('Artifact Server sharing payloads', () => {
       }],
     }]);
     expect(items).toHaveLength(2);
-    expect(items[0]).toMatchObject({ id: 'artifact-thread-1', type: AnnotationType.GLOBAL_COMMENT, text: 'Please revise', author: 'MCP client artifact-server for Daniel' });
-    expect(items[1]).toMatchObject({ id: 'artifact-reply-1', text: 'Updated', author: 'MCP client artifact-server for Daniel', inReplyTo: 'artifact-thread-1' });
+    const expectedAuthor = {
+      displayName: 'MCP client artifact-server for Daniel',
+      principalId: 'human-1', principalKind: 'human', authorizedByPrincipalId: null,
+      actor: { kind: 'mcp-client', clientId: 'artifact-server' },
+    };
+    expect(items[0]).toMatchObject({ id: 'artifact-thread-1', type: AnnotationType.GLOBAL_COMMENT, text: 'Please revise', author: 'MCP client artifact-server for Daniel', artifactServerAuthor: expectedAuthor });
+    expect(items[1]).toMatchObject({ id: 'artifact-reply-1', text: 'Updated', author: 'MCP client artifact-server for Daniel', artifactServerAuthor: expectedAuthor, inReplyTo: 'artifact-thread-1' });
   });
 });
