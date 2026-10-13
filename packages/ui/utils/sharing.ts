@@ -25,9 +25,15 @@ export interface ArtifactServerComment {
   id: string;
   body: string;
   path: string | null;
-  author: { displayName: string };
+  author: {
+    displayName: string;
+    principalId?: string;
+    principalKind?: 'human' | 'service';
+    authorizedByPrincipalId?: string | null;
+    actor?: { kind: 'mcp-client'; clientId: string } | null;
+  };
   createdAt: string;
-  replies?: Array<{ id: string; body: string; author: { displayName: string }; createdAt: string }>;
+  replies?: Array<{ id: string; body: string; author: ArtifactServerComment['author']; createdAt: string }>;
 }
 
 export function artifactCommentsToAnnotations(comments: ArtifactServerComment[]): Annotation[] {
