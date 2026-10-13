@@ -1,5 +1,40 @@
-import { describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it } from 'bun:test';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { publishToArtifactServer, readArtifactServerComments } from './artifact-server';
+import { writeRemoteShareLink } from './share-url';
+import { startPlannotatorServer } from './index';
+import { startReviewServer } from './review';
+
+const originalCli = process.env.PLANNOTATOR_ARTIFACTSERVER_CLI;
+const originalDataDir = process.env.PLANNOTATOR_DATA_DIR;
+const originalRemote = process.env.PLANNOTATOR_REMOTE;
+const tempDirs: string[] = [];
+
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'plannotator-artifact-cli-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function fakeCli(stderr: string, exitCode: number): string {
+  const path = join(tempDir(), 'artifactserver');
+  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(stderr)} >&2\nexit ${exitCode}\n`);
+  chmodSync(path, 0o755);
+  process.env.PLANNOTATOR_ARTIFACTSERVER_CLI = path;
+  return path;
+}
+
+afterEach(() => {
+  if (originalCli === undefined) delete process.env.PLANNOTATOR_ARTIFACTSERVER_CLI;
+  else process.env.PLANNOTATOR_ARTIFACTSERVER_CLI = originalCli;
+  if (originalDataDir === undefined) delete process.env.PLANNOTATOR_DATA_DIR;
+  else process.env.PLANNOTATOR_DATA_DIR = originalDataDir;
+  if (originalRemote === undefined) delete process.env.PLANNOTATOR_REMOTE;
+  else process.env.PLANNOTATOR_REMOTE = originalRemote;
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 describe('Artifact Server CLI sharing', () => {
   it('publishes content through the CLI and returns its exact review link', async () => {
@@ -54,5 +89,66 @@ describe('Artifact Server CLI sharing', () => {
     expect(calls[0]).toContain('team');
     expect(calls[1]).toContain('--profile');
     expect(calls[1]).toContain('team');
+  });
+
+  it('maps a missing CLI to a fixed safe error', async () => {
+    process.env.PLANNOTATOR_ARTIFACTSERVER_CLI = join(tempDir(), 'missing-artifactserver');
+    await expect(publishToArtifactServer('# Plan', 'Plan')).rejects.toThrow('Artifact Server CLI not found.');
+  });
+
+  it('maps logged-out CLI diagnostics to a safe login hint', async () => {
+    fakeCli('not logged in; Bearer fake-secret-token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fake-signature', 1);
+    let message = '';
+    try {
+      await publishToArtifactServer('# Plan', 'Plan');
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe('Not logged in; run `artifactserver auth login`.');
+    expect(message).not.toContain('fake-secret-token');
+    expect(message).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+  });
+
+  it('keeps bearer tokens and JWTs out of plan/review API errors and Pi stderr logs', async () => {
+    const bearer = 'Bearer fake-secret-token';
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fake-signature';
+    fakeCli(`${bearer} ${jwt}`, 7);
+    process.env.PLANNOTATOR_REMOTE = '0';
+    process.env.PLANNOTATOR_DATA_DIR = tempDir();
+    const planServer = await startPlannotatorServer({ plan: '# Plan', origin: 'claude-code', htmlContent: '<html></html>' });
+    const reviewServer = await startReviewServer({ rawPatch: '', gitRef: 'HEAD', origin: 'claude-code', htmlContent: '<html></html>' });
+    const outputs: string[] = [];
+    const originalWrite = process.stderr.write;
+    try {
+      const planResponse = await fetch(`${planServer.url}/api/artifact-share`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Plan', title: 'Plan' }),
+      });
+      const reviewResponse = await fetch(`${reviewServer.url}/api/artifact-share`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Review', title: 'Review' }),
+      });
+      const planBody = await planResponse.text();
+      const reviewBody = await reviewResponse.text();
+      expect(planResponse.status).toBe(502);
+      expect(reviewResponse.status).toBe(502);
+      expect(planBody).toContain('Artifact Server publish failed (exit 7).');
+      expect(reviewBody).toContain('Artifact Server publish failed (exit 7).');
+      expect(`${planBody}${reviewBody}`).not.toContain(bearer);
+      expect(`${planBody}${reviewBody}`).not.toContain(jwt);
+
+      (process.stderr as { write: unknown }).write = ((chunk: unknown) => {
+        outputs.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      await writeRemoteShareLink('# Plan', undefined, 'review', 'plan');
+      expect(outputs.join('')).toContain('Artifact Server publish failed (exit 7).');
+      expect(outputs.join('')).not.toContain(bearer);
+      expect(outputs.join('')).not.toContain(jwt);
+    } finally {
+      (process.stderr as { write: unknown }).write = originalWrite;
+      planServer.stop();
+      reviewServer.stop();
+    }
   });
 });
