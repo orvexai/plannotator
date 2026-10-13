@@ -40,7 +40,7 @@ export function postToShell(message: ToShell): void {
 export function listenToShell(onMessage: (message: SurfaceShellMessage) => void): () => void {
   const receive = (value: unknown) => {
     const read = readSurfaceShellMessage(value);
-    if (read.ok) onMessage(read.message);
+    if (read.ok === true) onMessage(read.message);
     else postToShell({ type: 'error', code: read.code, message: read.message });
   };
   Object.defineProperty(window, 'plannotatorSurface', { value: Object.freeze({ receive }), configurable: true });
