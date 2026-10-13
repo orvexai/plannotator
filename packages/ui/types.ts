@@ -41,6 +41,15 @@ export interface ImageAttachment {
   name: string;
 }
 
+/** Structured author returned with comments imported from Artifact Server. */
+export interface ArtifactServerAuthor {
+  displayName: string;
+  principalId?: string;
+  principalKind?: 'human' | 'service';
+  authorizedByPrincipalId?: string | null;
+  actor?: { kind: 'mcp-client'; clientId: string } | null;
+}
+
 /** DOM-relative text position used to restore a document annotation selection. */
 export interface AnnotationTextMeta {
   parentTagName: string;
@@ -83,6 +92,7 @@ export interface Annotation {
   originalText: string; // The text that was selected
   createdA: number;
   author?: string; // Tater identity for collaborative sharing
+  artifactServerAuthor?: ArtifactServerAuthor; // Structured source attribution retained on imported Artifact Server comments
   source?: string; // External tool identifier (e.g., "eslint") — set when annotation comes from external API
   images?: ImageAttachment[]; // Attached images with human-readable names
   mentions?: readonly string[]; // opaque host ids named with `@` in the comment body, set ONLY when a host supplied a `mentionSource` to the composer and at least one token survived; the key is absent otherwise. Host data: the package never renders, exports, shares or archives it.

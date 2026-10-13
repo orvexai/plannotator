@@ -11,6 +11,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Annotation, type ImageAttachment } from '../types';
 import {
   type SharePayload,
+  type ArtifactServerComment,
   parseShareHash,
   decompress,
   fromShareable,
@@ -309,7 +310,7 @@ export function useSharing(
       const reviewUrl = new URL(url);
       if (reviewUrl.pathname === '/review' && reviewUrl.searchParams.has('artifact')) {
         const response = await fetch('/api/artifact-comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reviewUrl: reviewUrl.toString() }), signal: AbortSignal.timeout(120_000) });
-        const result = await response.json() as { title?: string; comments?: Array<{ id: string; body: string; path: string | null; author: { displayName: string }; createdAt: string; replies?: Array<{ id: string; body: string; author: { displayName: string }; createdAt: string }> }>; error?: string };
+        const result = await response.json() as { title?: string; comments?: ArtifactServerComment[]; error?: string };
         if (!response.ok || !Array.isArray(result.comments)) throw new Error(result.error || 'Could not import Artifact Server comments');
         const imported = artifactCommentsToAnnotations(result.comments);
         const newItems = imported.filter(item => !annotations.some(existing => existing.id === item.id));
