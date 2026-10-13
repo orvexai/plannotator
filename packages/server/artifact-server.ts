@@ -11,6 +11,32 @@ export interface ArtifactCliResult {
 
 export type ArtifactCliRunner = (args: string[]) => Promise<ArtifactCliResult>;
 
+const CLI_NOT_FOUND = 'Artifact Server CLI not found.';
+const NOT_LOGGED_IN = 'Not logged in; run `artifactserver auth login`.';
+
+class ArtifactServerCliError extends Error {}
+
+function isAuthenticationFailure(stderr: string): boolean {
+  return /not logged in|not authenticated|authentication required|please log in/i.test(stderr);
+}
+
+function cliFailure(operation: 'publish' | 'comments', stderr: string, exitCode: number | null): Error {
+  if (isAuthenticationFailure(stderr)) return new ArtifactServerCliError(NOT_LOGGED_IN);
+  const action = operation === 'publish' ? 'publish' : 'read comments';
+  return new ArtifactServerCliError(`Artifact Server ${action} failed (exit ${exitCode ?? 'unknown'}).`);
+}
+
+async function invokeArtifactServerCli(args: string[], runner: ArtifactCliRunner): Promise<ArtifactCliResult> {
+  try {
+    return await runner(args);
+  } catch (error) {
+    // A custom runner or process-launch failure must not expose arbitrary error
+    // text. The default runner classifies ENOENT before it reaches this point.
+    if (error instanceof ArtifactServerCliError) throw error;
+    throw new Error('Artifact Server CLI could not be started.');
+  }
+}
+
 export async function publishToArtifactServer(
   content: string,
   title: string,
@@ -25,7 +51,7 @@ export async function publishToArtifactServer(
     await writeFile(path, content, 'utf8');
     const args = ['publish', path, '--server', origin, '--name', title];
     appendConfiguredProfile(args);
-    const result = await runCli(args);
+    const result = await invokeArtifactServerCli(args, runCli);
     const publication = JSON.parse(result.stdout) as {
       artifact?: { id?: unknown; projectId?: unknown };
       version?: { id?: unknown };
@@ -76,7 +102,7 @@ export async function readArtifactServerComments(
     '--limit', '5000',
   ];
   appendConfiguredProfile(args);
-  const result = await runCli(args);
+  const result = await invokeArtifactServerCli(args, runCli);
   const parsed = JSON.parse(result.stdout) as { items?: unknown };
   if (!Array.isArray(parsed.items)) throw new Error('Artifact Server CLI returned an invalid comments response.');
   return { title: `Artifact ${artifactId}`, comments: parsed.items as ArtifactComment[] };
@@ -106,9 +132,18 @@ export function normalizeArtifactServerUrl(value: string): string {
 }
 
 async function runArtifactServerCli(args: string[]): Promise<ArtifactCliResult> {
-  const proc = Bun.spawn([process.env.PLANNOTATOR_ARTIFACTSERVER_CLI || 'artifactserver', ...args], {
-    stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
-  });
+  const proc = (() => {
+    try {
+      return Bun.spawn([process.env.PLANNOTATOR_ARTIFACTSERVER_CLI || 'artifactserver', ...args], {
+        stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
+      });
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+        throw new ArtifactServerCliError(CLI_NOT_FOUND);
+      }
+      throw new ArtifactServerCliError('Artifact Server CLI could not be started.');
+    }
+  })();
   const timeout = setTimeout(() => proc.kill(), 120_000);
   try {
     const [exitCode, stdout, stderr] = await Promise.all([
@@ -116,7 +151,7 @@ async function runArtifactServerCli(args: string[]): Promise<ArtifactCliResult> 
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
     ]);
-    if (exitCode !== 0) throw new Error(stderr.trim() || `Artifact Server CLI exited with status ${exitCode}.`);
+    if (exitCode !== 0) throw cliFailure(args[0] === 'comments' ? 'comments' : 'publish', stderr, exitCode);
     return { stdout, stderr };
   } finally {
     clearTimeout(timeout);
