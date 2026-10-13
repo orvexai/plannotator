@@ -12,16 +12,28 @@ export interface ArtifactCliResult {
 export type ArtifactCliRunner = (args: string[]) => Promise<ArtifactCliResult>;
 
 const CLI_NOT_FOUND = 'Artifact Server CLI not found.';
-const NOT_LOGGED_IN = 'Not logged in; run `artifactserver auth login`.';
 
 class ArtifactServerCliError extends Error {}
 
+// Covers the Artifact Server CLI's own profile and credential failures, such as
+// "No Artifact Server profile matches <origin>." before anyone has logged in.
 function isAuthenticationFailure(stderr: string): boolean {
-  return /not logged in|not authenticated|authentication required|please log in/i.test(stderr);
+  return /not logged in|not authenticated|authentication required|please log in|no artifact server profile matches|credential is invalid or no longer active|credential for this artifact server profile is missing|run artifactserver auth login/i.test(stderr);
 }
 
-function cliFailure(operation: 'publish' | 'comments', stderr: string, exitCode: number | null): Error {
-  if (isAuthenticationFailure(stderr)) return new ArtifactServerCliError(NOT_LOGGED_IN);
+// Built from the validated --server argument only, never from CLI output.
+function notLoggedIn(args: string[]): string {
+  const server = args[args.indexOf('--server') + 1];
+  const origin = args.includes('--server') && server ? ` ${server}` : '';
+  return `Not logged in; run \`artifactserver auth login${origin}\` in a terminal.`;
+}
+
+const PROJECT_REQUIRED = 'Artifact Server has several projects; set PLANNOTATOR_ARTIFACT_SERVER_PROJECT to the project ID to share into.';
+
+function cliFailure(args: string[], stderr: string, exitCode: number | null): Error {
+  const operation = args[0] === 'comments' ? 'comments' : 'publish';
+  if (isAuthenticationFailure(stderr)) return new ArtifactServerCliError(notLoggedIn(args));
+  if (/PROJECT_SELECTION_REQUIRED/.test(stderr)) return new ArtifactServerCliError(PROJECT_REQUIRED);
   const action = operation === 'publish' ? 'publish' : 'read comments';
   return new ArtifactServerCliError(`Artifact Server ${action} failed (exit ${exitCode ?? 'unknown'}).`);
 }
@@ -50,6 +62,10 @@ export async function publishToArtifactServer(
     const path = join(dir, 'review.md');
     await writeFile(path, content, 'utf8');
     const args = ['publish', path, '--server', origin, '--name', title];
+    // Comments read their project from the Review URL; publishing must name one
+    // whenever the server has more than one active project.
+    const project = process.env.PLANNOTATOR_ARTIFACT_SERVER_PROJECT?.trim();
+    if (project) args.push('--project', project);
     appendConfiguredProfile(args);
     const result = await invokeArtifactServerCli(args, runCli);
     const publication = JSON.parse(result.stdout) as {
@@ -156,7 +172,7 @@ export async function runArtifactServerCli(args: string[]): Promise<ArtifactCliR
     if (error?.code === 'ENOENT') throw new ArtifactServerCliError(CLI_NOT_FOUND);
     if (error) throw new ArtifactServerCliError('Artifact Server CLI could not be started.');
     const stderr = stderrChunks.join('');
-    if (exitCode !== 0) throw cliFailure(args[0] === 'comments' ? 'comments' : 'publish', stderr, exitCode);
+    if (exitCode !== 0) throw cliFailure(args, stderr, exitCode);
     return { stdout: stdoutChunks.join('') };
   } finally {
     clearTimeout(timeout);
