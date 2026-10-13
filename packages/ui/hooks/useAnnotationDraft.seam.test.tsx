@@ -18,6 +18,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import * as useAnnotationDraftModule from './useAnnotationDraft';
 import { AnnotationType, type Annotation } from '../types';
+import { artifactCommentsToAnnotations } from '../utils/sharing';
 import type { DraftTransport } from './useAnnotationDraft';
 
 // Capture real function references at import time.
@@ -236,6 +237,75 @@ describe('DraftTransport seam', () => {
     const restored = restoreSession.result.current!.restoreDraft();
     expect(restored.annotations[0]!.htmlAdditionalTargets)
       .toEqual(MULTI_ANNOTATION.htmlAdditionalTargets);
+    await restoreSession.unmount();
+  });
+
+  test.skipIf(!hasDom)('Artifact Server thread and reply authors survive draft save and restore', async () => {
+    const artifactServerAuthor = {
+      authorizedByPrincipalId: 'operator-7',
+      displayName: 'MCP client artifact-server for Daniel',
+      principalId: 'human-1',
+      principalKind: 'human' as const,
+      actor: { kind: 'mcp-client' as const, clientId: 'artifact-server' },
+    };
+    const importedAnnotations = artifactCommentsToAnnotations([{
+      id: 'thread-persist',
+      body: 'Please revise',
+      path: null,
+      author: artifactServerAuthor,
+      createdAt: '2026-10-13T00:00:00.000Z',
+      replies: [{
+        id: 'reply-persist',
+        body: 'Updated',
+        author: artifactServerAuthor,
+        createdAt: '2026-10-13T00:01:00.000Z',
+      }],
+    }]);
+
+    const { transport, state } = makeFakeTransport();
+    setDraftTransport(transport);
+    const session = await mountHook({
+      annotations: importedAnnotations,
+      globalAttachments: [],
+      isApiMode: true,
+      isSharedSession: false,
+      submitted: false,
+    });
+    await tick(50);
+    await act(async () => {
+      session.result.current!.scheduleDraftSave();
+    });
+    await tick(600);
+    expect(state.saved.length).toBeGreaterThanOrEqual(1);
+
+    const savedBody = state.saved.at(-1) as { annotations: Annotation[] };
+    expect(savedBody.annotations.map(annotation => annotation.artifactServerAuthor))
+      .toEqual([artifactServerAuthor, artifactServerAuthor]);
+    expect(savedBody.annotations.map(annotation => annotation.author))
+      .toEqual([artifactServerAuthor.displayName, artifactServerAuthor.displayName]);
+    await session.unmount();
+
+    // Feed the actual saved payload back through the transport's load path.
+    const restoreTransport: DraftTransport = {
+      load: async () => ({ data: state.saved.at(-1) ?? null, generation: null }),
+      save: async () => {},
+      remove: async () => {},
+    };
+    setDraftTransport(restoreTransport);
+    const restoreSession = await mountHook({
+      annotations: [],
+      globalAttachments: [],
+      isApiMode: true,
+      isSharedSession: false,
+      submitted: false,
+    });
+    await tick(50);
+    expect(restoreSession.result.current!.draftBanner?.count).toBe(2);
+    const restored = restoreSession.result.current!.restoreDraft();
+    expect(restored.annotations.map(annotation => annotation.artifactServerAuthor))
+      .toEqual([artifactServerAuthor, artifactServerAuthor]);
+    expect(restored.annotations.map(annotation => annotation.author))
+      .toEqual([artifactServerAuthor.displayName, artifactServerAuthor.displayName]);
     await restoreSession.unmount();
   });
 });
