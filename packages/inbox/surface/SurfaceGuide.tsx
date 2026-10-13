@@ -25,10 +25,10 @@ export function SurfaceGuide({ open, section, onSection }: Props) {
   const [reviewed, setReviewed] = useState<boolean[]>(() => open.reviewed ?? []);
 
   useEffect(() => {
-    if (!parsed.ok) postToShell({ type: 'error', code: 'guide_invalid', message: `${parsed.error.path}: ${parsed.error.message}` });
+    if (parsed.ok === false) postToShell({ type: 'error', code: 'guide_invalid', message: `${parsed.error.path}: ${parsed.error.message}` });
   }, [parsed]);
 
-  if (!parsed.ok) return null;
+  if (parsed.ok === false) return null;
   return (
     <div className="sf-guide" data-surface-guide={open.message_id}>
       <Suspense fallback={null}>

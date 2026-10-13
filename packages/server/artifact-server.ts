@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -6,7 +7,6 @@ export const DEFAULT_ARTIFACT_SERVER_URL = 'https://artifacts.orvex.ai';
 
 export interface ArtifactCliResult {
   stdout: string;
-  stderr: string;
 }
 
 export type ArtifactCliRunner = (args: string[]) => Promise<ArtifactCliResult>;
@@ -131,28 +131,33 @@ export function normalizeArtifactServerUrl(value: string): string {
   return url.origin;
 }
 
-async function runArtifactServerCli(args: string[]): Promise<ArtifactCliResult> {
-  const proc = (() => {
-    try {
-      return Bun.spawn([process.env.PLANNOTATOR_ARTIFACTSERVER_CLI || 'artifactserver', ...args], {
-        stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
-      });
-    } catch (error) {
-      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
-        throw new ArtifactServerCliError(CLI_NOT_FOUND);
-      }
-      throw new ArtifactServerCliError('Artifact Server CLI could not be started.');
+export async function runArtifactServerCli(args: string[]): Promise<ArtifactCliResult> {
+  let proc: ReturnType<typeof spawn>;
+  try {
+    proc = spawn(process.env.PLANNOTATOR_ARTIFACTSERVER_CLI || 'artifactserver', args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      throw new ArtifactServerCliError(CLI_NOT_FOUND);
     }
-  })();
+    throw new ArtifactServerCliError('Artifact Server CLI could not be started.');
+  }
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  proc.stdout!.setEncoding('utf8').on('data', (chunk: string) => stdoutChunks.push(chunk));
+  proc.stderr!.setEncoding('utf8').on('data', (chunk: string) => stderrChunks.push(chunk));
   const timeout = setTimeout(() => proc.kill(), 120_000);
   try {
-    const [exitCode, stdout, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
+    const { exitCode, error } = await new Promise<{ exitCode: number | null; error?: NodeJS.ErrnoException }>((resolve) => {
+      proc.once('error', (error: NodeJS.ErrnoException) => resolve({ exitCode: null, error }));
+      proc.once('close', (code) => resolve({ exitCode: code }));
+    });
+    if (error?.code === 'ENOENT') throw new ArtifactServerCliError(CLI_NOT_FOUND);
+    if (error) throw new ArtifactServerCliError('Artifact Server CLI could not be started.');
+    const stderr = stderrChunks.join('');
     if (exitCode !== 0) throw cliFailure(args[0] === 'comments' ? 'comments' : 'publish', stderr, exitCode);
-    return { stdout, stderr };
+    return { stdout: stdoutChunks.join('') };
   } finally {
     clearTimeout(timeout);
   }

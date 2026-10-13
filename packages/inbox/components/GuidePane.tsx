@@ -71,7 +71,7 @@ export function GuidePane({ thread, message, onBack, onClose }: GuidePaneProps) 
       .then((answer) => {
         if (cancelled) return;
         const parsed = parseGuideSnapshot(answer.snapshot);
-        if (parsed.ok) setSnapshot(parsed.value);
+        if (parsed.ok === true) setSnapshot(parsed.value);
         else setError(`This guided review could not be read (${parsed.error.path}: ${parsed.error.message}).`);
       })
       .catch((cause: unknown) => {

@@ -196,16 +196,6 @@ export function fromShareable(data: ShareableAnnotation[], diffContexts?: (strin
   });
 }
 
-function buildDiffContextArray(annotations: Annotation[]): (string | null)[] | null {
-  const arr = annotations.map(a => a.diffContext || null);
-  return arr.some(v => v !== null) ? arr : null;
-}
-
-function buildSourceArray(annotations: Annotation[]): (string | undefined)[] | null {
-  const arr = annotations.map(a => a.source || undefined);
-  return arr.some(v => v !== undefined) ? arr : null;
-}
-
 /**
  * Parse a share URL hash and return the payload
  * Returns null if no valid hash or parsing fails

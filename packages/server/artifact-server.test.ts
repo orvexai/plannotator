@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { publishToArtifactServer, readArtifactServerComments } from './artifact-server';
+import { publishToArtifactServer, readArtifactServerComments, runArtifactServerCli } from './artifact-server';
 import { writeRemoteShareLink } from './share-url';
 import { startPlannotatorServer } from './index';
 import { startReviewServer } from './review';
@@ -18,9 +18,9 @@ function tempDir(): string {
   return dir;
 }
 
-function fakeCli(stderr: string, exitCode: number): string {
+function fakeCli(stderr: string, exitCode: number, stdout = ''): string {
   const path = join(tempDir(), 'artifactserver');
-  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(stderr)} >&2\nexit ${exitCode}\n`);
+  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(stdout)}\nprintf '%s\\n' ${JSON.stringify(stderr)} >&2\nexit ${exitCode}\n`);
   chmodSync(path, 0o755);
   process.env.PLANNOTATOR_ARTIFACTSERVER_CLI = path;
   return path;
@@ -41,7 +41,7 @@ describe('Artifact Server CLI sharing', () => {
     const calls: string[][] = [];
     const result = await publishToArtifactServer('# Plan', 'Example plan', 'https://artifacts.orvex.ai', async (args) => {
       calls.push(args);
-      return { stdout: JSON.stringify({ artifact: { id: 'art-1', projectId: 'proj-1' }, version: { id: 'ver-1' }, links: { review: 'https://artifacts.orvex.ai/review?artifact=art-1&project=proj-1&version=ver-1' } }), stderr: '' };
+      return { stdout: JSON.stringify({ artifact: { id: 'art-1', projectId: 'proj-1' }, version: { id: 'ver-1' }, links: { review: 'https://artifacts.orvex.ai/review?artifact=art-1&project=proj-1&version=ver-1' } }) };
     });
     expect(calls[0]?.[0]).toBe('publish');
     expect(calls[0]).toContain('--server');
@@ -55,7 +55,7 @@ describe('Artifact Server CLI sharing', () => {
     let args: string[] = [];
     const result = await readArtifactServerComments('https://artifacts.orvex.ai/review?artifact=art-1&project=proj-1&version=ver-1', 'https://artifacts.orvex.ai', async (received) => {
       args = received;
-      return { stdout: JSON.stringify({ items: [{ id: 'comment-1', body: 'Please revise', path: null, author: { displayName: 'Reviewer' }, createdAt: '2026-10-13T00:00:00Z', replies: [] }] }), stderr: '' };
+      return { stdout: JSON.stringify({ items: [{ id: 'comment-1', body: 'Please revise', path: null, author: { displayName: 'Reviewer' }, createdAt: '2026-10-13T00:00:00Z', replies: [] }] }) };
     });
     expect(args.slice(0, 3)).toEqual(['comments', 'list', 'art-1']);
     expect(args).toContain('--include-replies');
@@ -74,9 +74,9 @@ describe('Artifact Server CLI sharing', () => {
     const runCli = async (args: string[]) => {
       calls.push(args);
       if (args[0] === 'publish') {
-        return { stdout: JSON.stringify({ artifact: { id: 'a', projectId: 'p' }, version: { id: 'v' }, links: { review: 'https://artifacts.orvex.ai/review?artifact=a&project=p&version=v' } }), stderr: '' };
+        return { stdout: JSON.stringify({ artifact: { id: 'a', projectId: 'p' }, version: { id: 'v' }, links: { review: 'https://artifacts.orvex.ai/review?artifact=a&project=p&version=v' } }) };
       }
-      return { stdout: JSON.stringify({ items: [] }), stderr: '' };
+      return { stdout: JSON.stringify({ items: [] }) };
     };
     try {
       await publishToArtifactServer('# Plan', 'Plan', undefined, runCli);
@@ -107,6 +107,16 @@ describe('Artifact Server CLI sharing', () => {
     expect(message).toBe('Not logged in; run `artifactserver auth login`.');
     expect(message).not.toContain('fake-secret-token');
     expect(message).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+  });
+
+  it('drops token-shaped CLI stderr after a successful CLI exit', async () => {
+    const bearer = 'Bearer fake-secret-token';
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fake-signature';
+    fakeCli(`${bearer} ${jwt}`, 0, '{"ok":true}');
+    const result = await runArtifactServerCli(['publish']);
+    expect(result).toEqual({ stdout: '{"ok":true}\n' });
+    expect(JSON.stringify(result)).not.toContain(bearer);
+    expect(JSON.stringify(result)).not.toContain(jwt);
   });
 
   it('keeps bearer tokens and JWTs out of plan/review API errors and Pi stderr logs', async () => {
