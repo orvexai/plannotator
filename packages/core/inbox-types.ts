@@ -151,6 +151,17 @@ export type InboxAuthor =
     };
 
 /** The hosts whose names the Inbox knows, keyed by `author.host`. */
+/**
+ * One of the Inbox's own notes to the asking agent: Mark read's set-aside
+ * note (`set_aside`) or a late Undo's reopened note (`reopened`). They are
+ * stored as the person's messages so they reach the agent like any reply,
+ * but they are not the person's reply and not a look: the list's `sent`,
+ * `unseen`, the look boundary and "came back" all read past them.
+ */
+export function isInboxNote(message: { author: { kind: string }; set_aside?: readonly string[] | null; reopened?: readonly string[] | null }): boolean {
+  return message.author.kind === "person" && ((message.set_aside?.length ?? 0) > 0 || (message.reopened?.length ?? 0) > 0);
+}
+
 export const INBOX_HOST_NAMES: Readonly<Record<string, string>> = {
   "claude-code": "Claude Code",
   claude: "Claude Code",
@@ -425,6 +436,14 @@ export interface InboxQuestionRecord {
 /** A question Mark read closed (`InboxQuestionRecord.set_aside`). */
 export interface InboxQuestionSetAside {
   at: string;
+  /**
+   * The Mark read that closed it: the root's `person_read_seq` then. Undo
+   * reopens only the questions its own Mark read closed (owner ruling
+   * 2026-10-12); one an earlier Mark read closed stays closed. Absent on
+   * records older than the ruling, which match by `at` (the Mark read's
+   * `person_read_at`).
+   */
+  read_seq?: number;
   previous: Pick<InboxQuestionRecord, "answer" | "revision" | "sent_revision" | "picked_by" | "picked_at">;
 }
 
@@ -526,7 +545,11 @@ export interface InboxThreadSummary {
   message_count: number;
   resolved_at: string | null;
   questions: InboxQuestionSummary;
-  /** The last message is an agent's and the thread is open: it waits on the person. */
+  /**
+   * The last message is an agent's and the thread is open: it waits on the
+   * person. The Inbox's own notes (`isInboxNote`) are read past, and it is
+   * false while a Mark read stands (nothing waits on the person then).
+   */
   waiting_on_person: boolean;
 }
 
@@ -558,10 +581,22 @@ export interface InboxListRow extends InboxThreadSummary {
   answered_not_sent: boolean;
   /** When the oldest open question was asked, or null when none is open. */
   waiting_since: string | null;
-  /** Agent messages after the person's last look (a reply of theirs counts as a look). */
+  /**
+   * Agent messages after the person's last look (a reply of theirs counts as
+   * a look; the Inbox's own notes, `isInboxNote`, do not).
+   */
   unseen: number;
-  /** The person's reply is the last message: when, and when the agent read it (null until it has). */
+  /**
+   * The person's reply is the last message, the Inbox's own notes read past:
+   * when, and when the agent read it (null until it has).
+   */
   sent: { at: string; checked_at: string | null } | null;
+  /**
+   * When the latest agent message arrived (`last_at` also moves on the
+   * person's messages and the Inbox's notes). The window's held list counts
+   * agent activity by it. Absent from an older Inbox.
+   */
+  last_agent_at?: string | null;
   /** A message in the thread carries a guided review: the row's "Guided review" mark. */
   guide: boolean;
   /**
@@ -582,9 +617,10 @@ export interface InboxListRow extends InboxThreadSummary {
    * `agent_after_archive`, and something there still waits: an agent
    * message after the archive the person has not looked at, a live question
    * open or picked, or the person's reply after the archive the agent has not
-   * read. The thread is back in the list, placed as an open thread would be;
-   * once handled it returns to the archive on its own. Derived. Absent from an
-   * older Inbox.
+   * read (not once a Mark read made after it stands: Mark read sends a
+   * came-back thread back to the archive). The thread is back in the list,
+   * placed as an open thread would be; once handled it returns to the archive
+   * on its own. Derived. Absent from an older Inbox.
    */
   back_from_archive?: boolean;
 }
@@ -753,4 +789,160 @@ export const INBOX_SOUND_MAX_VOLUME = 100;
 /** A volume the Inbox keeps: a whole number from 10 to 100. */
 export function isInboxSoundVolume(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= INBOX_SOUND_MIN_VOLUME && value <= INBOX_SOUND_MAX_VOLUME;
+}
+
+/**
+ * The agents the Inbox connects itself to on `plannotator inbox` (the
+ * approved "inbox-agent-awareness" design; packages/server/inbox-agents.ts).
+ * Terminal agents and the Claude desktop app; editors keep their one-click
+ * link or snippet in Settings and are never written to automatically.
+ */
+export type InboxAgentId =
+  | "claude-code"
+  | "codex"
+  | "gemini"
+  | "cursor"
+  | "windsurf"
+  | "amp"
+  | "cline"
+  | "kiro"
+  | "pi"
+  | "opencode"
+  | "claude-app";
+
+export const INBOX_AGENT_IDS: readonly InboxAgentId[] = [
+  "claude-code",
+  "codex",
+  "gemini",
+  "cursor",
+  "windsurf",
+  "amp",
+  "cline",
+  "kiro",
+  "pi",
+  "opencode",
+  "claude-app",
+];
+
+export const INBOX_AGENT_LABELS: Readonly<Record<InboxAgentId, string>> = {
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  gemini: "Gemini CLI",
+  cursor: "Cursor",
+  windsurf: "Windsurf / Devin",
+  amp: "Amp",
+  cline: "Cline",
+  kiro: "Kiro",
+  pi: "Pi",
+  opencode: "OpenCode",
+  "claude-app": "Claude app",
+};
+
+/** "Codex", "Codex and Amp", "Codex, Amp and Pi". */
+export function inboxAgentList(ids: readonly InboxAgentId[]): string {
+  const names = ids.map((id) => INBOX_AGENT_LABELS[id]);
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/** What one `plannotator inbox` run did to the agents on this computer. */
+export interface InboxConnectReport {
+  at: string;
+  /** The first run that connected anything on this computer; later runs say "new on this computer". */
+  first: boolean;
+  /** Skipped as a whole: `PLANNOTATOR_INBOX_CONNECT=0`, or a test sandbox whose home is the real one. */
+  skipped?: "env" | "sandbox";
+  /** Connected by this run. */
+  added: InboxAgentId[];
+  /** Already reached the Inbox before this run (found, or connected earlier). */
+  already: InboxAgentId[];
+  /** Could not be connected; nothing was changed. Tried again at the next run. */
+  failed: { agent: InboxAgentId; reason: string; path: string | null }[];
+  /** Have a `plannotator-inbox` entry that runs something else; left alone. */
+  foreign: { agent: InboxAgentId; path: string | null }[];
+  /** Found, but only a person can connect them (no CLI on PATH, a config file Plannotator does not edit). */
+  manual: InboxAgentId[];
+  /** Why each manual agent needs a person, said once per reason (the terminal prints these). */
+  manual_why?: { agent: InboxAgentId; why: string }[];
+  /** Did not finish within the time limits; tried again at the next run. */
+  unfinished: InboxAgentId[];
+  /** Claude Code's plugin gives it the `plannotator_inbox` tool already. */
+  claude_code: boolean;
+}
+
+/** The agents whose own instructions file can carry the Inbox note (packages/server/inbox-agent-notes.ts). */
+export type InboxNoteAgentId = "claude-code" | "codex" | "opencode" | "pi" | "gemini";
+export const INBOX_NOTE_AGENT_IDS: readonly InboxNoteAgentId[] = ["claude-code", "codex", "gemini", "pi", "opencode"];
+
+/**
+ * Where an agent's note would go and how it stands:
+ *  - absent: no note; `create` says whether adding it creates the file.
+ *  - added: the note Plannotator wrote is there, untouched.
+ *  - edited: the note is there but the person changed it; Plannotator never updates it.
+ *  - damaged: the markers are broken (one, several, or out of order); nothing is written.
+ *  - refused: the file cannot be edited (not a regular file, over 1 MiB, not UTF-8, unreadable).
+ *  - unavailable: no file to add to (OpenCode's AGENTS.md does not exist, and Plannotator never creates it).
+ */
+export interface InboxAgentNoteStatus {
+  agent: InboxNoteAgentId;
+  /** The file, `~` for the home folder. */
+  path: string | null;
+  /** The file is a link; `target` is where it leads (shown). */
+  target: string | null;
+  state: "absent" | "added" | "edited" | "damaged" | "refused" | "unavailable";
+  /** Adding it creates the file. */
+  create: boolean;
+  /** Plannotator created the file (removing the note deletes it when nothing else is left). */
+  created: boolean;
+  /** Why it is refused, damaged or unavailable. */
+  reason: string | null;
+  /** Other agents whose note lives in the same file (a link to one shared file): one section, kept while any of them has it on. */
+  shared_with?: InboxNoteAgentId[];
+}
+
+/** One agent in `GET /api/inbox/agents` (Settings → Agents and the first-open card). */
+export interface InboxAgentRow {
+  id: InboxAgentId;
+  label: string;
+  /** Found on this computer (its command on PATH, its folder, Plannotator's plugin). */
+  detected: boolean;
+  reach: {
+    kind: "tool" | "mcp" | "manual" | "none";
+    on: boolean;
+    state: "connected" | "off" | "removed" | "foreign" | "not_connected" | "manual" | "unreadable";
+    path: string | null;
+    /** PLANNOTATOR_INBOX_TOOL decides it. */
+    locked: boolean;
+    reason: string | null;
+  };
+  /** Claude Code, Pi and OpenCode only: their `plannotator_inbox` tool switch (`inboxTool`), shown whether or not the agent was found. */
+  tool?: { on: boolean; locked: boolean } | null;
+  /** Claude Code, Pi and OpenCode only. `needs_tool`: the tool is off, so there is no reminder. */
+  reminder: { on: boolean; locked: boolean; needs_tool: boolean } | null;
+  note: InboxAgentNoteStatus | null;
+}
+
+export interface InboxAgentsModel {
+  agents: InboxAgentRow[];
+  last_report: (InboxConnectReport & { seen?: boolean }) | null;
+  connecting: boolean;
+  /** PLANNOTATOR_INBOX_CONNECT turns the automatic step off. */
+  connect_env_off: boolean;
+  /** PLANNOTATOR_INBOX_TOOL's value when set. */
+  tool_env: boolean | null;
+  /** PLANNOTATOR_INBOX_NOTES=0: no note offer, and note rows only for a note already written (it can be turned off, not added). */
+  notes_env_off?: boolean;
+  /** The note question was answered at least once. */
+  notes_offered: boolean;
+  /** The agents the note question was asked about: each is asked once (absent from an Inbox of 0.28.18 or older, which asked once in all). */
+  notes_asked?: InboxNoteAgentId[];
+  /** The exact block a note writes, markers included. */
+  note_text: string;
+  /** A switch's refusal, after POST /api/inbox/agents. */
+  error?: string | null;
+}
+
+/** "Codex, Gemini CLI and Pi" for note agents. */
+export function inboxNoteAgentList(ids: readonly InboxNoteAgentId[]): string {
+  return inboxAgentList(ids);
 }

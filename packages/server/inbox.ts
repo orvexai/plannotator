@@ -69,6 +69,8 @@ import {
   resolveInboxTool,
   saveConfig,
   configuredInboxTool,
+  configuredInboxReminder,
+  resolveInboxReminder,
   type InboxToolHost,
   type PlannotatorConfig,
   type ThemeConfig,
@@ -114,10 +116,34 @@ import { inboxMessageImageRoute } from "./inbox-message-images";
 import { recordInboxAttachments, sweepStaleInboxSendTemps } from "@plannotator/shared/inbox/attachments";
 import { createInboxLiveSessions } from "./inbox-sessions";
 import { createInboxDevices, DOOR_PREFIX } from "./inbox-devices";
+import type { PairingProbes } from "./inbox-pairing-checks";
 import { createInboxRelay } from "./inbox-relay";
 import type { TailscaleRunner } from "@plannotator/shared/tailscale";
 import { createInboxTailscale, PHONES_TAILNET_HTTPS_PORT, type InboxTailscale } from "./inbox-tailscale";
 import { createInboxUpdates, type InboxUpdatesOptions } from "./inbox-updates";
+import {
+  agentSpec,
+  connectInboxAgents,
+  createAgentEnvironment,
+  createAgentEnvironmentFor,
+  displayPath,
+  inboxAgentReach,
+  inboxConnectDisabled,
+  readInboxAgents,
+  setInboxAgentReach,
+  setInboxTool,
+  writeInboxAgents,
+  type AgentEnvironment,
+} from "./inbox-agents";
+import { addInboxNote, INBOX_NOTE_BLOCK, inboxNotesDisabled, markNotesAsked, noteCandidateIds, notesAsked, noteStatus, removeInboxNote } from "./inbox-agent-notes";
+import {
+  INBOX_AGENT_IDS,
+  INBOX_AGENT_LABELS,
+  INBOX_NOTE_AGENT_IDS,
+  type InboxAgentId,
+  type InboxConnectReport,
+  type InboxNoteAgentId,
+} from "@plannotator/core/inbox-types";
 
 /** Where a request came in: the window's loopback port, or the tailnet-only listener `tailscale serve` points at. */
 type RequestVia = "local" | "tailnet";
@@ -201,6 +227,8 @@ export interface InboxServerOptions {
   now?: () => Date;
   /** How "Reach from my tailnet" runs the `tailscale` CLI. Default: the CLI on PATH. */
   tailscale?: TailscaleRunner;
+  /** Tests: how step 1 of Pair a phone reads this computer (packages/server/inbox-pairing-checks.ts). Default: its own tools. */
+  pairingProbes?: Partial<PairingProbes>;
   /**
    * Phones: pairing, the device door, the tailnet and Wi-Fi listeners, the
    * relay and Settings' Phones block. Default: `resolveInboxPhones`
@@ -222,6 +250,12 @@ export interface InboxServerOptions {
    * window's Undo lasts 7 s). Default `INBOX_SET_ASIDE_DELAY_MS`. Tests shorten it.
    */
   setAsideDelayMs?: number;
+  /**
+   * Where the agents the Inbox connects itself to live (home, environment,
+   * PATH, running their CLIs; inbox-agents.ts). Default: this process's.
+   * Tests give temp folders and fake CLIs.
+   */
+  agentEnvironment?: AgentEnvironment;
 }
 
 /**
@@ -245,6 +279,12 @@ export interface InboxServer {
   registry: InboxRegistryEntry;
   /** "Over your tailnet": its state, the window's switch and the run's flag. */
   tailscale: InboxTailscale;
+  /**
+   * Connect the agents on this computer (inbox-agents.ts): what
+   * `plannotator inbox` runs, here or over `/api/inbox/control/connect`. One
+   * run at a time; a call while one runs gets that run's report.
+   */
+  connectAgents: () => Promise<InboxConnectReport>;
   stop: () => void;
 }
 
@@ -593,6 +633,151 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     : version !== "dev"
       ? [process.execPath]
       : ["plannotator"];
+
+  /** The agents on this computer (inbox-agents.ts): connected by `plannotator inbox`, one run at a time. */
+  // A test that starts an Inbox without its own agent environment gets an empty scratch one
+  // (no PATH, a home inside its data dir): nothing reads or runs the person's real agents.
+  const agentEnvironment =
+    options.agentEnvironment ??
+    (process.env.PLANNOTATOR_TEST_SANDBOX
+      ? createAgentEnvironmentFor({ platform: process.platform, homeDir: join(dataDir, "agents-home"), env: { HOME: join(dataDir, "agents-home"), PATH: "" } })
+      : createAgentEnvironment());
+  let connecting: Promise<InboxConnectReport> | null = null;
+  const connectAgents = (): Promise<InboxConnectReport> => {
+    connecting ??= connectInboxAgents({ dataDir, selfCommand, environment: agentEnvironment }).finally(() => {
+      connecting = null;
+    });
+    return connecting;
+  };
+  /** What the window reads about the agents: the records (paths shown with ~), the last run's report, and whether a run is going. */
+  const agentsModel = async () => {
+    const file = readInboxAgents(dataDir);
+    const records = Object.fromEntries(
+      Object.entries(file.agents).map(([id, record]) => [id, { ...record, path: displayPath(record!.path, agentEnvironment) }]),
+    );
+    const config = loadConfig();
+    const env = agentEnvironment.env as NodeJS.ProcessEnv;
+    const toolEnv = parseInboxToolEnv(env);
+    const notesOff = inboxNotesDisabled(agentEnvironment.env);
+    const options = { dataDir, selfCommand, environment: agentEnvironment };
+    const agents = await Promise.all(
+      INBOX_AGENT_IDS.map(async (id) => {
+        const detected = agentSpec(id).detect(agentEnvironment);
+        const reach = await inboxAgentReach(id, options);
+        const host = (INBOX_TOOL_HOSTS as readonly string[]).includes(id) ? (id as InboxToolHost) : null;
+        // The Inbox tool switch of the three Plannotator hosts stays reachable whether or not the agent was found.
+        const tool = host ? { on: resolveInboxTool(config, env, host), locked: toolEnv !== undefined } : null;
+        const reminder = host ? { on: resolveInboxReminder(config, env, host), locked: toolEnv !== undefined, needs_tool: !resolveInboxTool(config, env, host) } : null;
+        // With PLANNOTATOR_INBOX_NOTES=0 only a note already written is listed, so it can still be turned off.
+        const status = (INBOX_NOTE_AGENT_IDS as readonly string[]).includes(id) ? noteStatus(id as InboxNoteAgentId, dataDir, agentEnvironment) : null;
+        const note = status && (!notesOff || status.state === "added" || status.state === "edited") ? status : null;
+        return { id, label: INBOX_AGENT_LABELS[id], detected, reach, tool, reminder, note };
+      }),
+    );
+    return {
+      agents,
+      records,
+      last_report: file.last_report ?? null,
+      connecting: connecting !== null,
+      connect_env_off: inboxConnectDisabled(agentEnvironment.env),
+      notes_env_off: notesOff,
+      tool_env: toolEnv ?? null,
+      notes_offered: loadConfig().inboxAgentNotes?.offered === true,
+      notes_asked: await notesAsked(options),
+      note_text: INBOX_NOTE_BLOCK,
+    };
+  };
+
+  /** Settings → Agents: one agent's switches (reach, reminder, note). Each applies to that agent's next session. */
+  const saveAgent = async (body: Record<string, unknown>) => {
+    const id = body.agent;
+    if (typeof id !== "string" || !(INBOX_AGENT_IDS as readonly string[]).includes(id)) {
+      throw new InboxError("validation_error", "agent: one of the agents the Inbox knows.", { field: "agent" });
+    }
+    const agent = id as InboxAgentId;
+    for (const field of ["reach", "tool", "reminder", "note"] as const) {
+      if (body[field] !== undefined && typeof body[field] !== "boolean") throw new InboxError("validation_error", `${field}: a boolean.`, { field });
+    }
+    if (body.reach === undefined && body.tool === undefined && body.reminder === undefined && body.note === undefined) {
+      throw new InboxError("validation_error", "body: reach, tool, reminder or note is required.");
+    }
+    const problems: string[] = [];
+    if (typeof body.reach === "boolean") {
+      const problem = await setInboxAgentReach(agent, body.reach, { dataDir, selfCommand, environment: agentEnvironment });
+      if (problem) problems.push(problem);
+    }
+    if (typeof body.tool === "boolean") {
+      if (!(INBOX_TOOL_HOSTS as readonly string[]).includes(agent)) throw new InboxError("validation_error", "tool: only Claude Code, Pi and OpenCode have one.", { field: "tool" });
+      const problem = setInboxTool(agent as InboxToolHost, body.tool, agentEnvironment);
+      if (problem) problems.push(problem);
+    }
+    if (typeof body.reminder === "boolean") {
+      if (!(INBOX_TOOL_HOSTS as readonly string[]).includes(agent)) throw new InboxError("validation_error", "reminder: only Claude Code, Pi and OpenCode have one.", { field: "reminder" });
+      if (parseInboxToolEnv(agentEnvironment.env as NodeJS.ProcessEnv) !== undefined) problems.push("PLANNOTATOR_INBOX_TOOL decides this");
+      else {
+        const current = loadConfig().inboxReminder;
+        const next: Partial<Record<InboxToolHost, boolean>> = {};
+        for (const host of INBOX_TOOL_HOSTS) {
+          const value = configuredInboxReminder({ inboxReminder: current }, host);
+          if (value !== undefined) next[host] = value;
+        }
+        next[agent as InboxToolHost] = body.reminder;
+        saveConfig({ inboxReminder: next });
+        if (configuredInboxReminder(loadConfig(), agent as InboxToolHost) !== body.reminder) problems.push("Plannotator's config.json can't be written");
+      }
+    }
+    if (typeof body.note === "boolean") {
+      if (!(INBOX_NOTE_AGENT_IDS as readonly string[]).includes(agent)) throw new InboxError("validation_error", "note: this agent has no instructions file.", { field: "note" });
+      if (inboxNotesDisabled(agentEnvironment.env) && body.note) throw new InboxError("notes_disabled", "PLANNOTATOR_INBOX_NOTES=0 is set: notes are off.");
+      // Adding one needs the agent here, as the note dialog and --notes ask; switching one off never does.
+      if (body.note && !agentSpec(agent).detect(agentEnvironment)) {
+        problems.push(`${INBOX_AGENT_LABELS[agent]} was not found on this computer`);
+      } else {
+        const change = body.note ? addInboxNote(agent as InboxNoteAgentId, dataDir, agentEnvironment) : removeInboxNote(agent as InboxNoteAgentId, dataDir, agentEnvironment);
+        if (!change.ok) problems.push(change.reason);
+        // A yes in Settings answers the note dialog for this agent: removing the note later never asks again.
+        else if (body.note) await markNotesAsked([agent as InboxNoteAgentId], { dataDir, selfCommand, environment: agentEnvironment });
+      }
+    }
+    return { ...(await agentsModel()), error: problems.length ? problems.join("; ") : null };
+  };
+
+  /**
+   * The note dialog's answer: add the notes the person ticked (none for Not
+   * now or Don't add a note). `asked` names the agents the dialog showed:
+   * each is asked once, except one whose add failed, which is asked again.
+   * Without `asked` (an older window) the agents that can take a note now
+   * count as asked. `seen`: the dialog's band showed the last run's news.
+   */
+  const answerNotes = async (body: Record<string, unknown>) => {
+    const isNoteList = (value: unknown) => Array.isArray(value) && value.every((id) => typeof id === "string" && (INBOX_NOTE_AGENT_IDS as readonly string[]).includes(id));
+    const add = body.add;
+    if (!isNoteList(add)) {
+      throw new InboxError("validation_error", "add: a list of agents (claude-code, codex, gemini, pi, opencode).", { field: "add" });
+    }
+    if (body.asked !== undefined && !isNoteList(body.asked)) {
+      throw new InboxError("validation_error", "asked: a list of agents (claude-code, codex, gemini, pi, opencode).", { field: "asked" });
+    }
+    if (body.seen !== undefined && typeof body.seen !== "boolean") throw new InboxError("validation_error", "seen: a boolean.", { field: "seen" });
+    const adding = [...new Set(add as InboxNoteAgentId[])];
+    if (inboxNotesDisabled(agentEnvironment.env) && adding.length > 0) throw new InboxError("notes_disabled", "PLANNOTATOR_INBOX_NOTES=0 is set: notes are off.");
+    const options = { dataDir, selfCommand, environment: agentEnvironment };
+    // Read before adding: an agent whose note is added is no longer a candidate.
+    const shown = (body.asked as InboxNoteAgentId[] | undefined) ?? (await noteCandidateIds(options));
+    const results = adding.map((agent) =>
+      // Never a file for an agent that is not on this computer.
+      agentSpec(agent).detect(agentEnvironment)
+        ? addInboxNote(agent, dataDir, agentEnvironment)
+        : ({ ok: false, agent, reason: `${INBOX_AGENT_LABELS[agent]} was not found on this computer`, path: null } as const),
+    );
+    const failed = new Set(results.filter((result) => !result.ok).map((result) => result.agent));
+    await markNotesAsked([...new Set([...shown, ...adding])].filter((id) => !failed.has(id)), options);
+    if (body.seen === true) {
+      const file = readInboxAgents(dataDir);
+      if (file.last_report && !file.last_report.seen) writeInboxAgents(dataDir, { ...file, last_report: { ...file.last_report, seen: true } });
+    }
+    return { results, ...(await agentsModel()) };
+  };
 
   /** The agent tool knob per host: the effective value, and whether the env var decides it. */
   const inboxToolState = () => {
@@ -1139,6 +1324,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
         return json({ tailscale: tailscale.enableForRun() });
       }
+      // `plannotator inbox` while this Inbox runs (an agent started it with
+      // --background): connect the agents on this computer, as a start does.
+      if (path === "/api/inbox/control/connect") {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        return json({ connect: await connectAgents() });
+      }
       if (path === INBOX_BRIDGE_POLL_PATH || path === INBOX_BRIDGE_EVENT_PATH) {
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
         try {
@@ -1163,6 +1354,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     if (via === "tailnet" && req.method === "POST" && (path === "/api/inbox/pairing" || path === "/api/inbox/tailnet" || path === "/api/inbox/lan")) {
       return localOnly();
     }
+    // What reached the pairing code, and step 1's checks of this computer, are this computer's own business too.
+    if (via === "tailnet" && (path === "/api/inbox/pairing" || path === "/api/inbox/pairing/checks")) return localOnly();
 
     try {
       if (path === "/api/inbox/health" && req.method === "GET") return json(health());
@@ -1218,6 +1411,23 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (path === "/api/inbox/update/check") {
           const checked = await updates.checkNow();
           return json({ ...updates.details(), checked });
+        }
+        return json({ error: "Not found", code: "not_found" }, 404);
+      }
+      // The agents on this computer: paths in the person's home, so only on this computer.
+      if (path === "/api/inbox/agents" || path.startsWith("/api/inbox/agents/")) {
+        // The person's own agent files: only on this computer.
+        if (via === "tailnet") return localOnly();
+        if (path === "/api/inbox/agents" && req.method === "GET") return json(await agentsModel());
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        if (path === "/api/inbox/agents") return json(await saveAgent(body));
+        if (path === "/api/inbox/agents/notes") return json(await answerNotes(body));
+        if (path === "/api/inbox/agents/seen") {
+          const file = readInboxAgents(dataDir);
+          if (file.last_report && !file.last_report.seen) writeInboxAgents(dataDir, { ...file, last_report: { ...file.last_report, seen: true } });
+          return json(await agentsModel());
         }
         return json({ error: "Not found", code: "not_found" }, 404);
       }
@@ -1291,7 +1501,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
         const body = await readBody(req);
         if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
-        return json({ thread: store.markSeen(seenMatch[1]!) });
+        // `through_seq` (optional): the seq of the newest message the window showed; the look stops there.
+        const through = body.through_seq;
+        if (through !== undefined && through !== null && !(typeof through === "number" && Number.isSafeInteger(through) && through >= 0)) {
+          throw new InboxError("validation_error", "through_seq: a message seq (a whole number, 0 or more).", { field: "through_seq" });
+        }
+        return json({ thread: store.markSeen(seenMatch[1]!, typeof through === "number" ? through : undefined) });
       }
 
       // Mark read and its Undo: the thread leaves the top for Quiet, its waiting questions closed (store.markRead).
@@ -1485,6 +1700,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       dispatch: fetch,
       now: options.now,
       tailscale: options.tailscale,
+      probes: options.pairingProbes,
       relay: { paired: async (device) => (relay ? relay.paired(device) : null), revoked: (device) => relay?.revoked(device) },
     });
     phones = devices;
@@ -1554,7 +1770,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     tailnetStopFailedPort = tailscale.stop().failedPort;
   };
 
-  return { port, url: baseUrl, token, serverSession, portChanged, store, registry, tailscale, stop };
+  return { port, url: baseUrl, token, serverSession, portChanged, store, registry, tailscale, connectAgents, stop };
 }
 
 /** Print where the Inbox is, and open it when a person asked for it. */
