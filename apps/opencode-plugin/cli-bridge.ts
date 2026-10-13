@@ -380,8 +380,9 @@ export function buildCliBridgeEnv(
     ...(bridge?.sharingEnabled !== undefined && {
       PLANNOTATOR_SHARE: bridge.sharingEnabled ? "enabled" : "disabled",
     }),
-    ...(bridge?.shareBaseUrl && { PLANNOTATOR_SHARE_URL: bridge.shareBaseUrl }),
-    ...(bridge?.pasteApiUrl && { PLANNOTATOR_PASTE_URL: bridge.pasteApiUrl }),
+    ...((bridge?.shareBaseUrl || bridge?.pasteApiUrl) && {
+      PLANNOTATOR_ARTIFACT_SERVER_URL: bridge.shareBaseUrl || bridge.pasteApiUrl,
+    }),
     // Kept literal (packages/server's OPENCODE_TOOL_CAPABLE_ENV): this module
     // must not pull the server package into the plugin bundle.
     ...(bridge?.toolCapable && { PLANNOTATOR_OPENCODE_TOOL_CAPABLE: "1" }),

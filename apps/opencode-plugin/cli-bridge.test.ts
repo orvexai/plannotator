@@ -144,8 +144,7 @@ process.exit(1);
       pasteApiUrl: "https://paste.example.test",
     })).toEqual({
       PLANNOTATOR_SHARE: "disabled",
-      PLANNOTATOR_SHARE_URL: "https://share.example.test",
-      PLANNOTATOR_PASTE_URL: "https://paste.example.test",
+      PLANNOTATOR_ARTIFACT_SERVER_URL: "https://share.example.test",
     });
 
     expect(buildCliBridgeEnv({ sharingEnabled: true })).toEqual({

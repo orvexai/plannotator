@@ -319,9 +319,9 @@ export async function startAnnotateServer(options: {
 	const sharingEnabled =
 		options.sharingEnabled ?? resolveSharingEnabled(loadConfig());
 	const shareBaseUrl =
-		(options.shareBaseUrl ?? process.env.PLANNOTATOR_SHARE_URL) || undefined;
+		(options.shareBaseUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
 	const pasteApiUrl =
-		(options.pasteApiUrl ?? process.env.PLANNOTATOR_PASTE_URL) || undefined;
+		(options.pasteApiUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
 
 	let resolveDecision!: (result: {
 		feedback: string;

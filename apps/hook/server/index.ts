@@ -727,10 +727,10 @@ process.once("SIGTERM", () => process.exit(143));
 const sharingEnabled = resolveSharingEnabled(loadConfig());
 
 // Custom share portal URL for self-hosting
-const shareBaseUrl = process.env.PLANNOTATOR_SHARE_URL || undefined;
+const shareBaseUrl = process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined;
 
 // Paste service URL for short URL sharing
-const pasteApiUrl = process.env.PLANNOTATOR_PASTE_URL || undefined;
+const pasteApiUrl = process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined;
 
 // Detect calling agent from environment variables set by agent runtimes.
 // Priority:
@@ -1680,7 +1680,6 @@ if (args[0] === "sessions") {
         if (rawHtml) {
           await writeRemoteShareLink("", shareBaseUrl, "annotate", "HTML document only", {
             rawHtml: inlineHtmlLocalAssets(rawHtml, absolutePath),
-            pasteApiUrl,
           }).catch(() => {});
         } else if (markdown) {
           await writeRemoteShareLink(markdown, shareBaseUrl, "annotate", "document only").catch(() => {});

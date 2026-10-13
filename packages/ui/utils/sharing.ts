@@ -11,7 +11,6 @@
 import { AnnotationType, type Annotation, type DocumentRenderAs, type ImageAttachment } from '../types';
 import { isDiagramRenderKind } from '@plannotator/core/annotatable';
 import { compress, decompress } from '@plannotator/core/compress';
-import { encrypt, decrypt } from '@plannotator/core/crypto';
 
 // Image in shareable format: plain string (old) or [path, name] tuple (new)
 type ShareableImage = string | [string, string];
@@ -21,6 +20,30 @@ export type ShareableAnnotation =
   | ['D', string, string | null, ShareableImage[]?]                    // Deletion: type, original, author, images
   | ['C', string, string, string | null, ShareableImage[]?, (1)?]      // Comment: type, original, comment, author, images, isQuickLabel
   | ['G', string, string | null, ShareableImage[]?];                   // Global Comment: type, comment, author, images
+
+export interface ArtifactServerComment {
+  id: string;
+  body: string;
+  path: string | null;
+  author: { displayName: string };
+  createdAt: string;
+  replies?: Array<{ id: string; body: string; author: { displayName: string }; createdAt: string }>;
+}
+
+export function artifactCommentsToAnnotations(comments: ArtifactServerComment[]): Annotation[] {
+  return comments.flatMap(comment => [
+    { id: `artifact-${comment.id}`, blockId: '', startOffset: 0, endOffset: 0, type: comment.path ? AnnotationType.COMMENT : AnnotationType.GLOBAL_COMMENT, text: comment.body, originalText: comment.path || '', createdA: Date.parse(comment.createdAt) || Date.now(), author: comment.author.displayName },
+    ...(comment.replies || []).map(reply => ({ id: `artifact-${reply.id}`, blockId: '', startOffset: 0, endOffset: 0, type: AnnotationType.GLOBAL_COMMENT, text: reply.body, originalText: '', createdA: Date.parse(reply.createdAt) || Date.now(), author: reply.author.displayName, inReplyTo: `artifact-${comment.id}` })),
+  ] as Annotation[]);
+}
+
+export function composeArtifactShareDocument(markdown: string, annotations: Annotation[], rawHtml?: string): string {
+  const feedback = annotations.map(annotation => {
+    const anchor = annotation.originalText ? `> ${annotation.originalText.replace(/\n/g, '\n> ')}\n\n` : '';
+    return `### ${annotation.author || 'Reviewer'}\n\n${anchor}${annotation.text || 'Suggested deletion'}`;
+  }).join('\n\n');
+  return [markdown, rawHtml ? `\n\n## HTML source\n\n\`\`\`html\n${rawHtml}\n\`\`\`` : '', feedback ? `\n\n## Existing feedback\n\n${feedback}` : ''].join('');
+}
 
 export interface SharePayload {
   p: string;  // plan markdown
@@ -184,32 +207,6 @@ function buildSourceArray(annotations: Annotation[]): (string | undefined)[] | n
 }
 
 /**
- * Generate a full shareable URL from plan and annotations
- */
-export async function generateShareUrl(
-  markdown: string,
-  annotations: Annotation[],
-  globalAttachments?: ImageAttachment[],
-  baseUrl: string = DEFAULT_SHARE_BASE,
-  rawHtml?: string,
-): Promise<string | null> {
-  // HTML content is too large for URL hashes — force paste service path
-  if (rawHtml) return null;
-  const diffContexts = buildDiffContextArray(annotations);
-  const sources = buildSourceArray(annotations);
-  const payload: SharePayload = {
-    p: markdown,
-    a: toShareable(annotations),
-    g: globalAttachments?.length ? toShareableImages(globalAttachments) : undefined,
-    ...(diffContexts ? { d: diffContexts } : {}),
-    ...(sources ? { s: sources } : {}),
-  };
-
-  const hash = await compress(payload);
-  return `${baseUrl}/#${hash}`;
-}
-
-/**
  * Parse a share URL hash and return the payload
  * Returns null if no valid hash or parsing fails
  */
@@ -238,139 +235,4 @@ export function formatUrlSize(url: string): string {
     return `${bytes} B`;
   }
   return `${(bytes / 1024).toFixed(1)} KB`;
-}
-
-// ---------------------------------------------------------------------------
-// Short URL support (paste-service backed)
-// ---------------------------------------------------------------------------
-
-const DEFAULT_PASTE_API = 'https://plannotator-paste.plannotator.workers.dev';
-const DEFAULT_SHARE_BASE = 'https://share.plannotator.ai';
-
-export class ShortShareUrlError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ShortShareUrlError';
-  }
-}
-
-/**
- * Create a short share URL by posting compressed plan data to the paste service.
- *
- * Returns `{ shortUrl, id }` on success, or `null` when the paste service is
- * unavailable (e.g. self-hosted environments without a paste backend). Callers
- * should fall back to the hash-based URL in that case.
- *
- * The request has a 5-second timeout so UI responsiveness is not affected.
- */
-export async function createShortShareUrl(
-  markdown: string,
-  annotations: Annotation[],
-  globalAttachments?: ImageAttachment[],
-  options?: {
-    /** Override the paste API base URL (default: https://plannotator-paste.plannotator.workers.dev) */
-    pasteApiUrl?: string;
-    /** Override the share site base URL used in the returned short link */
-    shareBaseUrl?: string;
-  },
-  rawHtml?: string,
-): Promise<{ shortUrl: string; id: string } | null> {
-  const pasteApi = options?.pasteApiUrl ?? DEFAULT_PASTE_API;
-  const shareBase = options?.shareBaseUrl ?? DEFAULT_SHARE_BASE;
-
-  try {
-    const diffContexts = buildDiffContextArray(annotations);
-    const sources = buildSourceArray(annotations);
-    const payload: SharePayload = {
-      p: markdown,
-      a: toShareable(annotations),
-      g: globalAttachments?.length ? toShareableImages(globalAttachments) : undefined,
-      ...(diffContexts ? { d: diffContexts } : {}),
-      ...(sources ? { s: sources } : {}),
-      ...(rawHtml ? { h: rawHtml, r: 'html' as const } : {}),
-    };
-
-    const compressed = await compress(payload);
-
-    // Encrypt before uploading — server only sees ciphertext
-    const { ciphertext, key } = await encrypt(compressed);
-
-    const response = await fetch(`${pasteApi}/api/paste`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: ciphertext }),
-      signal: AbortSignal.timeout(5_000),
-    });
-
-    if (!response.ok) {
-      if (response.status === 413) {
-        throw new ShortShareUrlError(await readPasteError(response, 'Share payload is too large'));
-      }
-      console.warn(`[sharing] Paste service returned ${response.status}`);
-      return null;
-    }
-
-    const result = (await response.json()) as { id: string };
-    // Embed paste origin in fragment when non-default so the share portal can
-    // fetch from the right service without a server.
-    const pasteParam = pasteApi !== DEFAULT_PASTE_API
-      ? `&paste=${btoa(pasteApi).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')}`
-      : '';
-    const shortUrl = `${shareBase}/p/${result.id}#key=${key}${pasteParam}`;
-
-    return { shortUrl, id: result.id };
-  } catch (e) {
-    if (e instanceof ShortShareUrlError) {
-      throw e;
-    }
-    // Service unavailable — expected for self-hosted setups without a paste backend.
-    // The caller is responsible for falling back to hash-based sharing silently.
-    return null;
-  }
-}
-
-async function readPasteError(response: Response, fallback: string): Promise<string> {
-  try {
-    const body = (await response.json()) as { error?: unknown };
-    return typeof body.error === 'string' && body.error.trim() ? body.error : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-/**
- * Load plan data from a paste service using the paste ID embedded in a short URL.
- *
- * Fetches the compressed payload from `<pasteApiUrl>/api/paste/<pasteId>` and
- * decompresses it into a `SharePayload`. Returns `null` on any failure.
- */
-export async function loadFromPasteId(
-  pasteId: string,
-  pasteApiUrl: string = DEFAULT_PASTE_API,
-  encryptionKey?: string
-): Promise<SharePayload | null> {
-  try {
-    const response = await fetch(`${pasteApiUrl}/api/paste/${pasteId}`, {
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!response.ok) {
-      console.warn(`[sharing] Paste fetch returned ${response.status} for id ${pasteId}`);
-      return null;
-    }
-
-    const result = (await response.json()) as { data: string };
-
-    if (encryptionKey) {
-      // Encrypted path: decrypt ciphertext, then decompress
-      const compressed = await decrypt(result.data, encryptionKey);
-      return await decompress(compressed) as SharePayload;
-    }
-
-    // Legacy unencrypted path: decompress directly
-    return await decompress(result.data) as SharePayload;
-  } catch (e) {
-    console.warn('[sharing] Failed to load from paste ID:', e);
-    return null;
-  }
 }

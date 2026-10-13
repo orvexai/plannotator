@@ -5854,7 +5854,7 @@ const App: React.FC = () => {
       return;
     }
     if (await copyTextToClipboard(url)) {
-      toast.success('Share link copied');
+      toast.success('Saved to Artifact Server');
     } else {
       toast.error('Failed to copy');
     }

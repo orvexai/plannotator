@@ -65,6 +65,7 @@ import { isAIEndpointPath, isLongLivedAIEndpointPath, type AIEndpoints, type Ses
 import { isArchiveDocumentMutation } from "@plannotator/shared/archive-mode";
 import { readPlanFile } from "@plannotator/shared/doc-resolve";
 import { checkServerSession, createServerSessionNonce, serverSessionMismatchBody } from "@plannotator/shared/server-session";
+import { publishToArtifactServer, readArtifactServerComments, DEFAULT_ARTIFACT_SERVER_URL } from "./artifact-server";
 
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
@@ -100,9 +101,11 @@ export interface ServerOptions {
   htmlContent: string;
   /** Current permission mode to preserve (Claude Code only) */
   permissionMode?: string;
-  /** Whether URL sharing is enabled (default: true) */
+  /** Whether Artifact Server sharing is enabled (default: true) */
   sharingEnabled?: boolean;
-  /** Custom base URL for share links (default: https://share.plannotator.ai) */
+  /** Artifact Server origin (default: https://artifacts.orvex.ai) */
+  artifactServerUrl?: string;
+  /** @deprecated Use artifactServerUrl. */
   shareBaseUrl?: string;
   /** Base URL of the paste service API for short URL sharing */
   pasteApiUrl?: string;
@@ -183,7 +186,8 @@ export interface ServerResult {
 export async function startPlannotatorServer(
   options: ServerOptions
 ): Promise<ServerResult> {
-  const { origin, htmlContent, permissionMode, sharingEnabled = true, shareBaseUrl, pasteApiUrl, onReady, mode, customPlanPath, planFilePath } = options;
+  const { origin, htmlContent, permissionMode, sharingEnabled = true, shareBaseUrl, onReady, mode, customPlanPath, planFilePath } = options;
+  const artifactServerUrl = options.artifactServerUrl || process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || DEFAULT_ARTIFACT_SERVER_URL;
   // `plan`, its slug, file trust and version diff are `let`: a host with
   // `planRevisions` pushes revised plans into the open review (updatePlan).
   let plan = options.plan;
@@ -432,6 +436,32 @@ export async function startPlannotatorServer(
             return Response.json({ error: "Archive is read-only" }, { status: 403 });
           }
 
+          if (url.pathname === "/api/artifact-share" && req.method === "POST") {
+            if (!isSameOriginOrNoOrigin(req.headers.get("origin"), url.host, req.headers.get("sec-fetch-site"))) {
+              return Response.json({ error: "Cross-origin request refused" }, { status: 403 });
+            }
+            if (!sharingEnabled || mode === "archive") return Response.json({ error: "Sharing is disabled" }, { status: 403 });
+            try {
+              const body = await req.json() as { content?: unknown; title?: unknown };
+              if (typeof body.content !== "string" || typeof body.title !== "string") return Response.json({ error: "content and title are required" }, { status: 400 });
+              return Response.json(await publishToArtifactServer(body.content, body.title, artifactServerUrl));
+            } catch (error) {
+              return Response.json({ error: error instanceof Error ? error.message : "Artifact Server publish failed" }, { status: 502 });
+            }
+          }
+          if (url.pathname === "/api/artifact-comments" && req.method === "POST") {
+            if (!isSameOriginOrNoOrigin(req.headers.get("origin"), url.host, req.headers.get("sec-fetch-site"))) {
+              return Response.json({ error: "Cross-origin request refused" }, { status: 403 });
+            }
+            try {
+              const body = await req.json() as { reviewUrl?: unknown };
+              if (typeof body.reviewUrl !== "string") return Response.json({ error: "reviewUrl is required" }, { status: 400 });
+              return Response.json(await readArtifactServerComments(body.reviewUrl, artifactServerUrl));
+            } catch (error) {
+              return Response.json({ error: error instanceof Error ? error.message : "Artifact Server comments could not be read" }, { status: 502 });
+            }
+          }
+
           // API: Get plan content
           if (url.pathname === "/api/plan") {
             if (mode === "archive") {
@@ -441,14 +471,15 @@ export async function startPlannotatorServer(
                 mode: "archive",
                 archivePlans,
                 sharingEnabled,
-                shareBaseUrl,
+                shareBaseUrl: artifactServerUrl,
+                artifactServerUrl,
                 isWSL: wslFlag,
                 serverConfig: getServerConfig(gitUser, agentToolHostForServer(options.sessionBridge, options.opencodeToolCapable)),
                 ...getAutoUpdateAdvert(),
                 ...getUpdateAdvert(origin, { exposed: isRemote }),
               });
             }
-            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl, pasteApiUrl, repoInfo, previousPlan, versionInfo, serverSession, ...(options.planRevisions ? { planRevision } : {}), projectRoot: process.cwd(), planDir: planFile?.dir, isWSL: wslFlag, serverConfig: getServerConfig(gitUser, agentToolHostForServer(options.sessionBridge, options.opencodeToolCapable)), ...getAutoUpdateAdvert(), ...getUpdateAdvert(origin, { exposed: isRemote }) });
+            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl: artifactServerUrl, artifactServerUrl, repoInfo, previousPlan, versionInfo, serverSession, ...(options.planRevisions ? { planRevision } : {}), projectRoot: process.cwd(), planDir: planFile?.dir, isWSL: wslFlag, serverConfig: getServerConfig(gitUser, agentToolHostForServer(options.sessionBridge, options.opencodeToolCapable)), ...getAutoUpdateAdvert(), ...getUpdateAdvert(origin, { exposed: isRemote }) });
           }
 
           // API: The live plan revision (open reviews that receive revised plans)

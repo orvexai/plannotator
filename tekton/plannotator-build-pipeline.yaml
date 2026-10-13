@@ -1,0 +1,52 @@
+---
+# Build and verify the Plannotator fork with the repository's Bun commands.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: plannotator-build
+  namespace: tekton-pipelines
+  labels:
+    app.kubernetes.io/name: plannotator-build-pipeline
+    app.kubernetes.io/component: ci-cd
+    app.kubernetes.io/part-of: plannotator-fork
+spec:
+  description: Clone Plannotator and run its test suite and production build with Bun.
+  params:
+    - name: repo-url
+      type: string
+      default: https://github.com/orvexai/plannotator.git
+    - name: revision
+      type: string
+      default: feat/share-artifact-server
+  workspaces:
+    - name: source
+  tasks:
+    - name: clone-repo
+      taskRef:
+        kind: Task
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: source
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+    - name: test-and-build
+      runAfter:
+        - clone-repo
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: bun-checks
+            image: oven/bun:1.4.2
+            workingDir: $(workspaces.source.path)
+            script: |
+              bun install --frozen-lockfile
+              bun run build
+              bun test
+      workspaces:
+        - name: source
+          workspace: source

@@ -397,8 +397,8 @@ async function getBridgeContext(
 ): Promise<OpenCodeBridgeContext> {
   return {
     sharingEnabled: resolveSharingEnabled(loadConfig()),
-    shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-    pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+    shareBaseUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
+    pasteApiUrl: process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || undefined,
     agents: await getAgents(),
     ...(toolCapable ? { toolCapable: true } : {}),
   };

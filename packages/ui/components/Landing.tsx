@@ -9,7 +9,7 @@ interface LandingProps {
 }
 
 export const Landing: React.FC<LandingProps> = ({ onEnter, shareBaseUrl }) => {
-  const demoUrl = shareBaseUrl || "https://share.plannotator.ai";
+  const demoUrl = shareBaseUrl || "https://artifacts.orvex.ai";
   return (
     <div className="min-h-screen bg-background text-foreground">
       {/* Nav */}
