@@ -104,9 +104,46 @@ describe('Artifact Server CLI sharing', () => {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    expect(message).toBe('Not logged in; run `artifactserver auth login`.');
+    expect(message).toBe('Not logged in; run `artifactserver auth login https://artifacts.orvex.ai` in a terminal.');
     expect(message).not.toContain('fake-secret-token');
     expect(message).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+  });
+
+  it('shares into the configured project and explains when one must be chosen', async () => {
+    const original = process.env.PLANNOTATOR_ARTIFACT_SERVER_PROJECT;
+    const calls: string[][] = [];
+    const runCli = async (args: string[]) => {
+      calls.push(args);
+      return { stdout: JSON.stringify({ artifact: { id: 'a', projectId: 'prj_team' }, version: { id: 'v' }, links: { review: 'https://artifacts.orvex.ai/review?artifact=a&project=prj_team&version=v' } }) };
+    };
+    try {
+      process.env.PLANNOTATOR_ARTIFACT_SERVER_PROJECT = 'prj_team';
+      await publishToArtifactServer('# Plan', 'Plan', 'https://artifacts.orvex.ai', runCli);
+      delete process.env.PLANNOTATOR_ARTIFACT_SERVER_PROJECT;
+      await publishToArtifactServer('# Plan', 'Plan', 'https://artifacts.orvex.ai', runCli);
+      // The exact stderr the CLI prints when the server has several projects.
+      fakeCli('Artifact Server: PROJECT_SELECTION_REQUIRED (HTTP 409): Choose a project before continuing: Default (prj_default), Team (prj_team).', 1);
+      await expect(publishToArtifactServer('# Plan', 'Plan', 'https://artifacts.orvex.ai')).rejects.toThrow(
+        'Artifact Server has several projects; set PLANNOTATOR_ARTIFACT_SERVER_PROJECT to the project ID to share into.',
+      );
+    } finally {
+      if (original === undefined) delete process.env.PLANNOTATOR_ARTIFACT_SERVER_PROJECT;
+      else process.env.PLANNOTATOR_ARTIFACT_SERVER_PROJECT = original;
+    }
+    expect(calls[0]).toContain('--project');
+    expect(calls[0]?.[calls[0].indexOf('--project') + 1]).toBe('prj_team');
+    expect(calls[1]).not.toContain('--project');
+  });
+
+  it('treats a missing Artifact Server CLI profile as logged out for publish and comments', async () => {
+    // The exact stderr the Artifact Server CLI prints before the first login.
+    fakeCli('Artifact Server: CliProfileError: No Artifact Server profile matches https://artifacts.orvex.ai.', 1);
+    const hint = 'Not logged in; run `artifactserver auth login https://artifacts.orvex.ai` in a terminal.';
+    await expect(publishToArtifactServer('# Plan', 'Plan', 'https://artifacts.orvex.ai')).rejects.toThrow(hint);
+    await expect(readArtifactServerComments(
+      'https://artifacts.orvex.ai/review?artifact=a&project=p&version=v',
+      'https://artifacts.orvex.ai',
+    )).rejects.toThrow(hint);
   });
 
   it('drops token-shaped CLI stderr after a successful CLI exit', async () => {
