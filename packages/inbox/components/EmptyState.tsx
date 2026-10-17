@@ -106,7 +106,7 @@ function InstallBlock({ host, generation }: { host: PluginHost; generation?: '1'
   return (
     <div className="ib-cn-blk" data-install="opencode">
       <div>
-        <Choice
+        <Choice<'1' | '2'>
           label="OpenCode version"
           value={version}
           options={[
@@ -267,7 +267,7 @@ export function EmptyState({ context, agents, agentsUnavailable, onRetry, sessio
         </h3>
         <p>Plannotator&apos;s own connections bring your replies back into the session by themselves. Which agent do you use?</p>
         <div className="ib-cn-acts">
-          <Choice
+          <Choice<PluginHost>
             label="Your agent"
             value={firstPick}
             options={PLUGIN_HOSTS.map((id) => ({ id, label: id === 'claude-code' ? 'Claude Code' : id === 'pi' ? 'Pi' : 'OpenCode' }))}

@@ -197,7 +197,7 @@ export function AgentNoteDialog({ rows, report, noteText, onModel, onSettings, o
                   <li key={row.id}>
                     <div className="ib-anote-r ib-anote-nobox" data-agent={row.id}>
                       <HostMark host={row.id} />
-                      <RowMain row={row} failure={s.kind === 'done' && !s.result.ok ? s.result.reason : null} onRetry={() => void retry(row.id as InboxNoteAgentId)} />
+                      <RowMain row={row} failure={s.kind === 'done' && 'reason' in s.result ? s.result.reason : null} onRetry={() => void retry(row.id as InboxNoteAgentId)} />
                       <span className="ib-anote-st">
                         {s.kind === 'busy' ? (
                           <span className="ib-anote-pill">Adding…</span>

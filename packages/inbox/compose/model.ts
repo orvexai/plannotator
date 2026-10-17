@@ -114,7 +114,7 @@ export function subjectPreview(body: string, files: readonly string[] = []): str
 export function composeThreadName(value: string): { name: string } | { error: string } {
   if (value.trim() === '') return { name: '' };
   const checked = checkInboxThreadName(value);
-  return checked.ok ? { name: checked.name } : { error: `Thread name ${checked.message}` };
+  return 'message' in checked ? { error: `Thread name ${checked.message}` } : { name: checked.name };
 }
 
 /**
