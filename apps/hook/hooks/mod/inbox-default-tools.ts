@@ -17,7 +17,7 @@ export const INBOX_DEFAULT_TOOLS: readonly InboxToolInfo[] = [
         "body": {
           "type": "string",
           "minLength": 1,
-          "description": "The message, markdown. Question blocks render as answerable cards. In a block, add `Stopped: <why>` only for a question that leaves you nothing else to work on (otherwise leave the line out, never `Stopped: no`); `Holds up: <work>; <work>` names the work that waits while you go on."
+          "description": "The message, markdown. Question blocks render as answerable cards.\n\nTwo Inbox-only lines a question block can carry, each on its own line after the question:\n- `Stopped: <why>` only when you truly cannot go on until this is answered: the thread goes first in the person's list, under \"Stopped on you\". Otherwise leave the line out. A negative value (`no`, `none`, `n/a`, `-`) means no stop, so never write `Stopped: no`.\n- `Holds up: <work>; <work>` names the work that waits on the answer while you go on: listed under \"Holding up work\" (a `Stopped:` line wins). A `none` entry holds nothing up.\n\n:::question\nWhich database password should I use for staging?\n\nStopped: can't run the migration without it\nHolds up: staging deploy; release notes\n\n- [ ] The one in 1Password \"staging-db\"\n- [ ] Make a new one\n:::"
         },
         "project_path": {
           "description": "Absolute path of the repository or folder you work in; the thread lands in that project's row. The `plannotator inbox mcp` shim fills it from its working folder.",
@@ -28,7 +28,7 @@ export const INBOX_DEFAULT_TOOLS: readonly InboxToolInfo[] = [
           "type": "string"
         },
         "thread": {
-          "description": "A short thread name (1-120 characters, one line). Without it, your messages join your session's open thread in this project (a new one the first time, or once the person resolved it; a thread keeps its first subject). With it, the same name in this project is the same open thread, across sessions (compared without case, spacing or invisible characters). Use it to split separate work, or to join another session's thread. Ignored with reply_to.",
+          "description": "A short thread name (1-120 characters, one line). Without it, your messages join your session's open thread in this project (a new one the first time, or once the person resolved it; a thread keeps its first subject). With it, the same name in this project is the same open thread, across sessions (compared without case, spacing or invisible characters). Use it to split separate work, or to join another session's thread. Ignored with reply_to, with one exception: in a thread the person started (read_thread or wait_for_reply says name_this_thread: true, or the Inbox's message asks you to name it), your reply's `thread` names that thread, once: a few words saying what it is about, not the name of another open thread in the project.",
           "type": "string"
         },
         "reply_to": {
@@ -59,7 +59,7 @@ export const INBOX_DEFAULT_TOOLS: readonly InboxToolInfo[] = [
           "type": "string"
         },
         "attachments": {
-          "description": "Files to show the person beside your message, e.g. [\"docs/plan.md\", \"/tmp/checkout.png\", \"src/retry.mjs\"]: absolute (anywhere you can read) or relative to project_path. Any regular file, any size. Markdown, plain text, config and data files, Mermaid and Graphviz sources and HTML (its relative images and frames load from its folder) open in Plannotator's viewers; images (PNG, JPEG, GIF, WebP, SVG, AVIF, BMP, ICO) show in the message; source code, scripts and other text open as code with line comments; PDFs and anything else are offered as a download. Folders and .env files are refused. The Inbox keeps the version you sent and shows the file as it is now, saying when it changed. The person's annotations, including comments on images and code lines, come back in their reply. Each attachment's kind in the result is markdown, text, html, mermaid, graphviz, code, image, pdf or file; treat any other as file. A markdown link to an attached file in the body, e.g. [the mock](proto/admin.html), opens it beside the thread.",
+          "description": "Files to show the person beside your message, e.g. [\"docs/plan.md\", \"/tmp/checkout.png\", \"src/retry.mjs\"]: absolute (anywhere you can read) or relative to project_path. Any regular file, any size. Markdown, plain text, config and data files, Mermaid and Graphviz sources and HTML (its relative images and frames load from its folder) open in Plannotator's viewers; images (PNG, JPEG, GIF, WebP, SVG, AVIF, BMP, ICO) show in the message; videos (MP4, MOV, WebM) play beside it, and the person comments at moments (each comment comes back with its time and the paused frame's path); source code, scripts and other text open as code with line comments; PDFs and anything else are offered as a download. Folders and .env files are refused. The Inbox keeps the version you sent and shows the file as it is now, saying when it changed. The person's annotations, including comments on images and code lines, come back in their reply. Each attachment's kind in the result is markdown, text, html, mermaid, graphviz, code, image, video, pdf or file; treat any other as file. A markdown link to an attached file in the body, e.g. [the mock](proto/admin.html), opens it beside the thread.",
           "type": "array",
           "items": {
             "type": "string"
@@ -74,7 +74,7 @@ export const INBOX_DEFAULT_TOOLS: readonly InboxToolInfo[] = [
   },
   {
     "name": "read_thread",
-    "description": "Read one Inbox thread (thread_id or message_id): every message with its questions and the person's answers. Without an id, list this project's threads, newest activity first, each with its section in the person's list: only the ones you sent in unless asked_by is \"anyone\", and only open ones unless include_resolved.",
+    "description": "Read one Inbox thread (thread_id or message_id): every message with its questions and the person's answers. A message the person marked 👍 Looks good carries `ack` (they read it and need nothing more; no reply is needed). Without an id, list this project's threads, newest activity first, each with its section in the person's list: only the ones you sent in unless asked_by is \"anyone\", and only open ones unless include_resolved.",
     "inputSchema": {
       "type": "object",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -116,7 +116,7 @@ export const INBOX_DEFAULT_TOOLS: readonly InboxToolInfo[] = [
   },
   {
     "name": "wait_for_reply",
-    "description": "Wait for the person's reply in a thread (thread_id or message_id), or in any open thread you asked when neither is given. Returns the reply as soon as it lands, or { status: \"waiting\", cursor } after about 50 seconds: call again with that cursor to keep waiting. Without a cursor, any reply after your last message in the thread counts.",
+    "description": "Wait for the person's reply in a thread (thread_id or message_id), or in any open thread you asked when neither is given. Returns the reply as soon as it lands, { status: \"acknowledged\" } when the person marked your latest message 👍 Looks good instead (no reply is coming for it; go on), or { status: \"waiting\", cursor } after about 50 seconds: call again with that cursor to keep waiting. Without a cursor, any reply after your last message in the thread counts.",
     "inputSchema": {
       "type": "object",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -299,7 +299,7 @@ export const INBOX_DEFAULT_TOOLS: readonly InboxToolInfo[] = [
           "type": "string"
         },
         "thread": {
-          "description": "A short thread name (1-120 characters, one line). Without it, your messages join your session's open thread in this project (a new one the first time, or once the person resolved it; a thread keeps its first subject). With it, the same name in this project is the same open thread, across sessions (compared without case, spacing or invisible characters). Use it to split separate work, or to join another session's thread. Ignored with reply_to.",
+          "description": "A short thread name (1-120 characters, one line). Without it, your messages join your session's open thread in this project (a new one the first time, or once the person resolved it; a thread keeps its first subject). With it, the same name in this project is the same open thread, across sessions (compared without case, spacing or invisible characters). Use it to split separate work, or to join another session's thread. Ignored with reply_to, with one exception: in a thread the person started (read_thread or wait_for_reply says name_this_thread: true, or the Inbox's message asks you to name it), your reply's `thread` names that thread, once: a few words saying what it is about, not the name of another open thread in the project.",
           "type": "string"
         },
         "reply_to": {

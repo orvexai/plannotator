@@ -3,7 +3,7 @@
  * under DOM_TESTS=1 happy-dom replaces the test process's Response, which
  * Bun.serve cannot answer with, so the server lives here instead.
  *
- *   bun tests/helpers/inbox-dom-server.ts <data dir> <projects dir> <count> [news | header-files]
+ *   bun tests/helpers/inbox-dom-server.ts <data dir> <projects dir> <count> [news | header-files | phones | whats-new]
  *
  * Seeds `count` projects (one per test, since the window keeps the first
  * server session it saw), each with a thread an agent is stopped on (two
@@ -17,8 +17,11 @@
  * you looked"), oldest first in `news`. A JSON line on stdin,
  * `{ "send": { project, session, body, reply_to? } }`, is an agent writing
  * while a test runs; the server answers `{ "sent": <message id> }` on stdout.
- * The set-aside note's delay is a minute, so no note is written while a test
- * runs.
+ * `{ "deliver": { session } }` is that session's connection delivering every
+ * reply waiting for it (the bridge's `delivered`); the server answers
+ * `{ "delivered": [<reply id>] }`. The set-aside note's delay (also the 👍
+ * Looks good Undo window) is a minute, so no note is written while a test
+ * runs, unless `INBOX_DOM_SET_ASIDE_MS` names a shorter one.
  *
  * With a fourth argument `header-files`, each project also gets a thread one
  * session writes three messages in: three files (one changed on disk after it
@@ -26,12 +29,29 @@
  * middle, last, ids: { <name>: <attachment id> } }`). Without it the seed is
  * exactly as before. With `phones` instead, the Inbox serves phones (see
  * `machine.json` below); the seed is the same.
+ *
+ * With a fourth argument `sent-multi`, each project also gets a message
+ * holding a pick-any question (with a recommendation) and a pick-one
+ * question, where the person sent an answer to the pick-any one only
+ * (`Toasts`, not the recommendation) and kept the other open; the world adds
+ * `sentMulti` (the message id).
+ *
+ * With `open-in`, "Open in" launches nothing: a recording launcher (platform
+ * `OPEN_IN_PLATFORM`, default mac; apps Finder, VS Code, Cursor, Zed) appends
+ * each launch to `<data dir>/launches.jsonl`. Each project also gets a thread
+ * with page.html, plan.md, build.zip, shot.png and gone.md (deleted after it
+ * was sent: missing); the world adds `openIn` (`{ thread, ids: { <name>: <id> } }`).
+ * The Inbox is published over the tailnet by a scripted `tailscale`, and the
+ * first line adds `tailnet: { listener, host, login }`: a request to that
+ * loopback port with that Host and login is one `tailscale serve` hands over.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { startInboxServer } from "../../packages/server/inbox";
+import type { InboxOpenInLauncher } from "../../packages/server/inbox-open-in";
 import { recordInboxAttachments } from "../../packages/shared/inbox/attachments";
-import { refuseRealDataDir } from "./real-data-dir";
+import { writeUpdateState } from "../../packages/shared/update-check";
+import { isScratchDataDir, refuseRealDataDir } from "./real-data-dir";
 
 const [dataDir, projectsDir, countArg, extra] = process.argv.slice(2);
 const withNews = extra === "news";
@@ -45,6 +65,14 @@ refuseRealDataDir(dataDir, "inbox-dom-server.ts");
 // startInboxServer reads and writes config.json through getPlannotatorDataDir()
 // even when it is given dataDir: point the env at the same scratch folder.
 process.env.PLANNOTATOR_DATA_DIR = dataDir;
+// The composers' skill picker reads the global skill folders under HOME (and
+// CLAUDE_CONFIG_DIR, CODEX_HOME, XDG_CONFIG_HOME): only a scratch HOME's,
+// never the person's. A test that wants skills writes them under its HOME.
+const scratchHome = isScratchDataDir(process.env.HOME?.trim() || "/") ? process.env.HOME!.trim() : join(dataDir, "home");
+process.env.HOME = scratchHome;
+process.env.CLAUDE_CONFIG_DIR = join(scratchHome, ".claude");
+process.env.CODEX_HOME = join(scratchHome, ".codex");
+process.env.XDG_CONFIG_HOME = join(scratchHome, ".config");
 
 const STOPPED = [
   "Before I build the invoice list:",
@@ -114,11 +142,53 @@ const pairingProbes = {
     (command === "openssl" && machine().noOpenssl) || (command !== "openssl" && machine().noBonjour) ? null : `/usr/bin/${command}`,
   firewall: () => (machine().firewall ?? "off") as "off" | "on" | "block_all" | "unknown",
 };
+/**
+ * With a fourth argument `whats-new`: this Inbox is 0.28.19 and the one before
+ * it ran 0.28.18 (the install script run by hand: no notes saved), and the
+ * release API is a fake on loopback here (PLANNOTATOR_UPDATE_API_URL), never
+ * GitHub. PLANNOTATOR_UPDATE_CHECK from the test's env still applies.
+ */
+const whatsNewMode = extra === "whats-new";
+if (whatsNewMode) {
+  writeUpdateState({ inboxVersion: "0.28.18" }, dataDir);
+  const releaseApi = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (path.endsWith("/releases/latest")) return Response.json({ tag_name: "v0.28.19", body: "" });
+      const m = /\/releases\/tags\/v(\d+\.\d+\.\d+)$/.exec(path);
+      if (!m) return new Response("not found", { status: 404 });
+      return Response.json({ tag_name: `v${m[1]}`, body: `## What's New in v${m[1]}\n\nWhat ${m[1]} brings to the Inbox.\n\n## Install / Update\n` });
+    },
+  });
+  process.env.PLANNOTATOR_UPDATE_API_URL = `http://127.0.0.1:${releaseApi.port}/releases/latest`;
+}
+const openInMode = extra === "open-in";
+/** Records each launch instead of starting an app. */
+const recordLaunch = (app: string, path: string) => {
+  appendFileSync(join(dataDir, "launches.jsonl"), `${JSON.stringify({ app, path })}\n`);
+  return Promise.resolve({ ok: true as const });
+};
+const openInLauncher: InboxOpenInLauncher = {
+  platform: (process.env.OPEN_IN_PLATFORM ?? "mac") as "mac" | "win" | "linux",
+  apps: () => [
+    { id: "reveal", label: "Finder", kind: "file-manager", icon: "finder" },
+    { id: "vscode", label: "VS Code", kind: "editor", icon: "vscode" },
+    { id: "cursor", label: "Cursor", kind: "editor", icon: "cursor" },
+    { id: "zed", label: "Zed", kind: "editor", icon: "zed" },
+  ],
+  reveal: (path) => recordLaunch("reveal", path),
+  openWithApp: (app, path) => recordLaunch(app.id, path),
+  openWithSystemDefault: (path) => recordLaunch("default", path),
+};
 const server = await startInboxServer({
   dataDir,
-  setAsideDelayMs: 60_000,
+  setAsideDelayMs: Number(process.env.INBOX_DOM_SET_ASIDE_MS) > 0 ? Number(process.env.INBOX_DOM_SET_ASIDE_MS) : 60_000,
   phones: phonesMode,
   ...(phonesMode ? { tailscale, pairingProbes } : {}),
+  ...(openInMode ? { openInLauncher, tailscale, publishTailnet: true } : {}),
+  ...(whatsNewMode ? { version: "0.28.19", binaryPath: null } : {}),
 });
 const store = server.store;
 type World = {
@@ -134,8 +204,32 @@ type World = {
   filed: string;
   attachment: string;
   files?: { thread: string; first: string; middle: string; last: string; ids: Record<string, string> };
+  sentMulti?: string;
+  openIn?: { thread: string; ids: Record<string, string> };
   news: string[];
 };
+const SENT_MULTI = [
+  "Two things before the release:",
+  "",
+  ":::question-multi",
+  "Which indicators ship?",
+  "",
+  "- [ ] Dot",
+  "- [ ] Banner",
+  "- [ ] Toasts",
+  "",
+  "Recommended: Dot, Banner",
+  ":::",
+  "",
+  ":::question",
+  "Which channel announces it?",
+  "",
+  "- [ ] Blog",
+  "- [ ] Changelog",
+  "",
+  "Recommended: Changelog",
+  ":::",
+].join("\n");
 const worlds: World[] = [];
 for (let i = 0; i < count; i++) {
   const root = join(projectsDir, `billing-${i}`);
@@ -180,8 +274,35 @@ for (let i = 0; i < count; i++) {
     const last = store.sendMessage({ project_id: project.id, author: headerAuthor, body: "The listing draft is attached.", reply_to: first.id, attachments: one }).message;
     files = { thread: first.id, first: first.id, middle: middle.id, last: last.id, ids: Object.fromEntries([...three, ...one].map((a) => [a.name, a.id])) };
   }
+  let sentMulti: string | undefined;
+  if (extra === "sent-multi") {
+    const sentAuthor = { ...author, session: `ses_sm${i}` };
+    const message = store.sendMessage({ project_id: project.id, author: sentAuthor, body: SENT_MULTI }).message;
+    const multi = store.questionsOf(message.id).find((q) => q.kind === "multi")!;
+    store.sendReply(message.id, {
+      idempotency_key: `sent-multi-${i}`,
+      skip_unanswered: false,
+      questions: [{ key: multi.key, revision: multi.revision, answer: { v: 1, key: multi.key, kind: multi.kind, prompt: multi.prompt, selected: ["Toasts"] } }],
+    });
+    sentMulti = message.id;
+  }
+  let openIn: World["openIn"];
+  if (openInMode) {
+    const names = ["page.html", "plan.md", "build.zip", "shot.png", "gone.md"];
+    writeFileSync(join(root, "page.html"), "<!doctype html><title>Checkout</title><h1>Checkout</h1>\n");
+    writeFileSync(join(root, "plan.md"), "# Rollout plan\n\nShip it.\n");
+    writeFileSync(join(root, "build.zip"), Buffer.from([0x50, 0x4b, 0x03, 0x04, 0, 0, 0xff, 0xfe]));
+    writeFileSync(join(root, "shot.png"), Buffer.from("89504e470d0a1a0a0000000d4948445200000001000000010806000000", "hex"));
+    writeFileSync(join(root, "gone.md"), "# Gone\n");
+    const sentFiles = await recordInboxAttachments(store.dir, names, { base: root, at: new Date().toISOString() });
+    const thread = store.sendMessage({ project_id: project.id, author: { ...author, session: `ses_o${i}` }, body: "The page, the plan and the build are attached.", attachments: sentFiles }).message;
+    unlinkSync(join(root, "gone.md"));
+    openIn = { thread: thread.id, ids: Object.fromEntries(sentFiles.map((a, n) => [names[n]!, a.id])) };
+  }
   worlds.push({
+    ...(openIn ? { openIn } : {}),
     ...(files ? { files } : {}),
+    ...(sentMulti ? { sentMulti } : {}),
     project: project.id,
     stopped: stopped.id,
     waiting: waiting.id,
@@ -200,11 +321,17 @@ for (let i = 0; i < count; i++) {
       : [],
   });
 }
-process.stdout.write(`${JSON.stringify({ port: server.port, worlds })}\n`);
+const tailnet = openInMode ? { listener: server.tailscale.listenerPort(), host: `macbook.tail0000.ts.net:${server.port}`, login: "ramos@example.com" } : undefined;
+process.stdout.write(`${JSON.stringify({ port: server.port, worlds, ...(tailnet ? { tailnet } : {}) })}\n`);
 // An agent writing while a test runs.
 void (async () => {
   for await (const line of console) {
-    const command = JSON.parse(line) as { send?: { project: string; session: string; body: string; reply_to?: string } };
+    const command = JSON.parse(line) as { send?: { project: string; session: string; body: string; reply_to?: string }; deliver?: { session: string } };
+    if (command.deliver) {
+      const ids = store.pendingReplies(command.deliver.session).map((reply) => store.recordDelivery(reply.id, { host: "claude-code", session: command.deliver!.session }).id);
+      process.stdout.write(`${JSON.stringify({ delivered: ids })}\n`);
+      continue;
+    }
     if (!command.send) continue;
     const { project, session, body, reply_to } = command.send;
     const sent = store.sendMessage({ project_id: project, author: { kind: "agent", host: "claude-code", session, name: "Claude Code" }, body, ...(reply_to ? { reply_to } : {}) });

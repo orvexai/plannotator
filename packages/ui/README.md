@@ -26,6 +26,8 @@ configurePlannotatorUI({
   aiTransport,
   skillCatalogTransport,       // skill-reference catalog for comment composers
   skillContentTransport,       // human-only skill contents for feedback injection
+  skillReferenceExport,        // false: no per-comment "Skills referenced" list (a host composing one block per message)
+  skillInstructionsDestination, // what the human-only line says instructions go with (default "your feedback")
   serverSync,
   webmcp,                      // browser-agent (WebMCP) provider policy: { enabled, namePrefix }
   mathRendererLoader,          // how KaTeX loads when no renderer is registered before first math render
@@ -347,6 +349,22 @@ All-files view).
 Neither prop reaches `CodeAnnotation` cards (the review-editor shape), which
 take no `renderCardFooter` either. See HANDOFF.md § "Annotation card header
 slot and mentions on the edit box (0.45.0)".
+
+- **`compareAnnotations?: (a, b) => number`** (unreleased) — the order of the
+  comment timeline and of each All-files group, for comments with an order of
+  their own (the Inbox sorts a video's comments by the moment they are at).
+  Ties keep creation order; replies still thread under their parent. Omit it
+  and the panel sorts by creation exactly as before.
+- **`title?`, `titleNote?`, `cardParts?: (annotation) => { quote?, images? }`**
+  (unreleased) — the header's title (default "Annotations") and a quiet note
+  at its right, and per card whether the built-in quote and image row are
+  drawn (the Inbox's video comments draw the moment and the frame in
+  `renderCardHeader` instead). Omit them and the panel is as before.
+- **Export: `exportLocation`** (unreleased) — a string a host sets on the
+  COPY of an annotation it hands the exporters (`exportAnnotations`,
+  `exportLinkedDocAnnotations`): one line printed under the entry's heading
+  (the Inbox's `At 1:42 (102.4 s of 7:41)`). Never stored; an annotation
+  without it exports byte-identically.
 
 ### WebMCP provider (`@plannotator/ui/webmcp`; 0.32.0)
 

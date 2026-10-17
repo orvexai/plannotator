@@ -7,12 +7,15 @@
  * compiled binary, with agents writing through `plannotator inbox mcp`
  * (scripts/inbox-sim.ts):
  *
- *  - a words-only reply in a Waiting thread skips its questions: the row does
- *    not move while the thread stays open, and sits in Sent, below New, once
- *    the person leaves it;
+ *  - a words-only reply defaults to Keep open (approval
+ *    "inbox-words-only-reply"); switched to skip, it skips the questions of a
+ *    Waiting thread: the row does not move while the thread stays open, and
+ *    sits in Sent, below New, once the person leaves it;
  *  - in a thread ONE session wrote (it asked, then posted a later update), a
- *    words-only Send is one reply: one new person message, carrying the skip
- *    and the words, to the message that asked;
+ *    words-only Send switched to skip is one reply: one new person message,
+ *    carrying the skip and the words, to the message that asked;
+ *  - a words-only reply left as it is keeps every question open, and the
+ *    agent's wait_for_reply gets the words plus the still-open line;
  *  - Mark read moves a thread to Quiet ("Read"), and an agent's new message
  *    brings it back to the top;
  *  - Mark read on a thread an agent is stopped on warns, and Z undoes it;
@@ -28,6 +31,7 @@ import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { SimAgent, scratchProject } from '../../scripts/inbox-sim';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { NO_BROWSER } from '../helpers/no-browser';
 
 const repo = resolve(__dirname, '../..');
 const binary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
@@ -122,7 +126,7 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   mkdirSync(proofDir, { recursive: true });
   const root = inboxScratch('plannotator-inbox-markread-e2e-');
   const dataDir = join(root, 'data');
-  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: 'none' };
+  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: NO_BROWSER };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   const url = started.stdout.trim();
@@ -179,7 +183,7 @@ test('the list before: Stopped, Waiting, then New', async () => {
   await shot('01-list-before', ['light', 'dark']);
 });
 
-test('a words-only reply skips the questions; the row keeps its place while the thread is open, then sits in Sent below New', async () => {
+test('a words-only reply keeps the questions open by default; switched to skip, it skips them; the row keeps its place while the thread is open, then sits in Sent below New', async () => {
   const { page, threads } = world;
   await page.locator(`.ib-lbody [data-thread-id="${threads.invoices}"]`).click();
   const pane = page.locator('section.ib-pane');
@@ -187,6 +191,11 @@ test('a words-only reply skips the questions; the row keeps its place while the 
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Reply' }).click();
   await page.locator('.ib-rtext').fill('Redo the design. Use the dense table from the payouts page, not cards; we can talk sort order after.');
   const chip = page.locator('[data-skip-chip]');
+  // No pick in this Send: Keep open is the default (approval "inbox-words-only-reply").
+  await expect(chip).toHaveAttribute('data-skip-chip', 'keep');
+  await expect(chip).toContainText('3 unanswered questions stay open');
+  await shot('02a-reply-keeps-open');
+  await chip.getByRole('button', { name: 'Skip them' }).click();
   await expect(chip).toContainText('3 unanswered questions will be skipped');
   await shot('02-reply-skips');
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Send' }).click();
@@ -221,6 +230,8 @@ test('one session asked, then posted an update: a words-only Send writes exactly
   const pane = page.locator('section.ib-pane');
   await expect(pane.getByRole('heading', { name: 'Status page: which index?' })).toBeVisible();
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Reply' }).click();
+  await expect(page.locator('[data-skip-chip]')).toContainText('1 unanswered question stays open');
+  await page.locator('[data-skip-chip]').getByRole('button', { name: 'Skip it' }).click();
   await expect(page.locator('[data-skip-chip]')).toContainText('1 unanswered question will be skipped');
   await page.locator('.ib-rtext').fill('Ship it as it is.');
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Send' }).click();
@@ -238,6 +249,32 @@ test('one session asked, then posted an update: a words-only Send writes exactly
   await expect(pane).toHaveCount(0);
 });
 
+test('a words-only reply left as it is: the questions stay open, and the agent gets the words and the still-open line', async () => {
+  const { page, agents, project } = world;
+  const asked = await agents.codex.send({ project_path: project, subject: 'Pricing page: a few calls', thread: 'pricing', body: INVOICES.replace('invoice list', 'pricing page') });
+  const threadId = asked.thread_id as string;
+  await page.goto(`${world.url}#thread=${threadId}`);
+  const pane = page.locator('section.ib-pane');
+  await expect(pane.getByRole('heading', { name: 'Pricing page: a few calls' })).toBeVisible();
+  await page.locator('.ib-pfoot').getByRole('button', { name: 'Reply' }).click();
+  await page.locator('.ib-rtext').fill("Received, I'll answer these after lunch.");
+  await expect(page.locator('[data-skip-chip]')).toHaveAttribute('data-skip-chip', 'keep');
+  await page.locator('.ib-pfoot').getByRole('button', { name: 'Send' }).click();
+  await expect(page.locator('.ib-rtext')).toHaveCount(0);
+  // The cards still take answers: nothing was skipped.
+  await expect(pane.getByText(/^Skipped with your reply/)).toHaveCount(0);
+  await shot('04c-words-only-keeps-open');
+  const waited = await agents.codex.waitForReply(threadId, 5);
+  expect((waited.reply as { body: string }).body).toBe(
+    "Received, I'll answer these after lunch.\n\nNo questions answered yet; all 3 are still open. Don't re-ask them; the person will answer in the Inbox.",
+  );
+  type Model = { thread: { messages: { questions?: { state: string }[] }[] } };
+  const model = (await (await fetch(new URL(`/api/inbox/threads/${threadId}`, world.url))).json()) as Model;
+  expect(model.thread.messages.flatMap((m) => m.questions ?? []).map((q) => q.state)).toEqual(['open', 'open', 'open']);
+  await page.keyboard.press('Escape');
+  await expect(pane).toHaveCount(0);
+});
+
 test('Mark read moves the thread to Quiet ("Read"); a new agent message brings it back to the top', async () => {
   const { page, threads } = world;
   await page.locator(`.ib-lbody [data-thread-id="${threads.search}"]`).click();
@@ -247,7 +284,7 @@ test('Mark read moves the thread to Quiet ("Read"); a new agent message brings i
   await expect(head).toHaveAttribute('aria-pressed', 'true');
   await expect(head).toContainText('Read');
   await expect(page.locator('[data-read-line]')).toContainText('It stays out of the top until Codex writes again.');
-  await expect(page.locator('[data-inbox-toast]')).toContainText('will move to Quiet');
+  await expect(page.locator('[data-inbox-toast]')).toContainText('Moves to Quiet');
   await shot('05-thread-read');
   await page.keyboard.press('Escape');
   await openQuiet(page);
@@ -268,8 +305,20 @@ test('Mark read on a thread an agent is stopped on warns with Reply; Z undoes it
   await expect(page.locator('[data-mark-read]')).toHaveAttribute('aria-pressed', 'false');
   await page.locator('body').press('e');
   const toast = page.locator('[data-inbox-toast]');
-  await expect(toast).toContainText('Claude Code was stopped on it.');
+  await expect(toast).toContainText('Claude Code was stopped');
   await expect(toast.getByRole('button', { name: 'Reply' })).toBeVisible();
+  // One 40 px line, no close, centered on the window (not the thread pane) 12 px above the pane's foot (never over Reply).
+  await expect(toast.getByRole('button')).toHaveCount(2);
+  await toast.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)).then(() => undefined));
+  const [toastBox, paneBox, footBox] = await Promise.all([toast.boundingBox(), page.locator('section.ib-pane').boundingBox(), page.locator('section.ib-pane .ib-pfoot').boundingBox()]);
+  expect(toastBox!.height).toBe(40);
+  expect(toastBox!.width).toBeLessThanOrEqual(520);
+  const viewport = page.viewportSize()!;
+  expect(Math.abs(toastBox!.x + toastBox!.width / 2 - viewport.width / 2)).toBeLessThanOrEqual(1);
+  // The list sits beside the thread, so the window's center is not the pane's.
+  expect(Math.abs(paneBox!.x + paneBox!.width / 2 - viewport.width / 2)).toBeGreaterThan(40);
+  expect(Math.abs(footBox!.y - (toastBox!.y + toastBox!.height) - 12)).toBeLessThanOrEqual(1);
+  expect(toastBox!.y + toastBox!.height).toBeLessThan(footBox!.y);
   await expect(page.locator('[data-mark-read]')).toHaveAttribute('aria-pressed', 'true');
   await shot('07-stopped-warning', ['light', 'dark']);
   await page.locator('body').press('z');
@@ -289,7 +338,14 @@ test('the row hover action marks read without opening the thread; its Undo puts 
   await action.click();
   await expect(page.locator('section.ib-pane')).toHaveCount(0);
   await expect.poll(() => sectionOf(page, threads.news)).toBe('quiet');
-  await page.locator('[data-inbox-toast]').getByRole('button', { name: /Undo/ }).click();
+  // No thread open: centered on the window, near the list's bottom.
+  const toast = page.locator('[data-inbox-toast]');
+  await expect(toast).toContainText('Moved to Quiet');
+  await toast.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)).then(() => undefined));
+  const [toastBox, listBox] = await Promise.all([toast.boundingBox(), page.locator('.ib-listcol').boundingBox()]);
+  expect(Math.abs(toastBox!.x + toastBox!.width / 2 - page.viewportSize()!.width / 2)).toBeLessThanOrEqual(1);
+  expect(Math.abs(listBox!.y + listBox!.height - (toastBox!.y + toastBox!.height) - 20)).toBeLessThanOrEqual(1);
+  await toast.getByRole('button', { name: /Undo/ }).click();
   await expect.poll(() => sectionOf(page, threads.news)).toBe('new');
   expect(world.errors).toEqual([]);
 });

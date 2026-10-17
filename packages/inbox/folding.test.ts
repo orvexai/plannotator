@@ -131,3 +131,23 @@ test("a reply of skips or of answers and skips: the store's first line is droppe
   expect(replyWords('Answered 1 question, skipped 2.\n\nRedo the design.')).toBe('Redo the design.');
   expect(replyWords('Skipped 1 question.')).toBe('');
 });
+
+test("a reply that answered nothing: the store's still-open line and what follows it are dropped", () => {
+  const line = "No questions answered yet; all 3 are still open. Don't re-ask them; the person will answer in the Inbox.";
+  expect(replyWords(`Later today.\n\n${line}`).trim()).toBe('Later today.');
+  expect(replyWords(`Later today.\n\n${line}\n\n# Feedback on the attached files\n\nTighten it.`).trim()).toBe('Later today.');
+  expect(replyWords(line)).toBe('');
+  expect(replyWords("Later.\n\nNo question answered yet; it is still open. Don't re-ask it; the person will answer in the Inbox.").trim()).toBe('Later.');
+  expect(replyWords("Later.\n\nNo new answers in this reply; 2 questions are still open. Don't re-ask them; the person will answer in the Inbox.").trim()).toBe('Later.');
+  // The person's own sentence that merely starts the same way is kept.
+  expect(replyWords('No questions answered yet, sorry.')).toBe('No questions answered yet, sorry.');
+});
+
+test('a reply of pasted files alone: the snippet names the files, never the still-open line the agent reads', () => {
+  const line = "No question answered yet; it is still open. Don't re-ask it; the person will answer in the Inbox.";
+  const file = (name: string) => ({ id: `att_${name}`, name }) as NonNullable<InboxMessageWire['attachments']>[number];
+  const reply = msg('m2', PERSON, 5, { body: line, attachments: [file('pasted-image-2026-10-16-0912.png'), file('notes.md')] });
+  expect(foldSnippet(reply)).toEqual({ kind: 'words', text: 'pasted-image-2026-10-16-0912.png, notes.md' });
+  // With words, the words.
+  expect(foldSnippet({ ...reply, body: `See these.\n\n${line}` })).toEqual({ kind: 'words', text: 'See these.' });
+});

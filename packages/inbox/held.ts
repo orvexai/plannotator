@@ -94,7 +94,9 @@ export function heldNotice(
   open?: OpenThread | null,
 ): HeldNotice {
   const before = rowsById(shown);
-  const projects = new Set<string>();
+  // By id: two projects can share a name ("api" at work and at home), and two
+  // projects are never "new in api".
+  const projects = new Map<string, string>();
   let count = 0;
   for (const row of rowsById(latest).values()) {
     // The thread the person has open (or just closed, until the list settles)
@@ -102,10 +104,27 @@ export function heldNotice(
     if (isOpenRow(row, open)) continue;
     if (!hasNewAgentActivity(before.get(row.thread_id), row, openedHere)) continue;
     count += 1;
-    projects.add(row.project.name);
+    projects.set(row.project.id, row.project.name);
   }
   if (count === 0) return { count, text: null };
-  return { count, text: projects.size === 1 ? `${count} new in ${[...projects][0]}` : `${count} new` };
+  return { count, text: projects.size === 1 ? `${count} new in ${[...projects.values()][0]}` : `${count} new` };
+}
+
+/**
+ * The rows Show brings in (design record "inbox-polish", item 6): each row of
+ * `latest` the list on screen lacks, or that carries agent activity the row on
+ * screen does not show (so it moved or changed). A row that stays as it was,
+ * or that changed only by the person's own hand (already shown in place), is
+ * not one of them.
+ */
+export function showBroughtIn(shown: readonly InboxListSection[], latest: readonly InboxListSection[]): Set<string> {
+  const before = rowsById(shown);
+  const out = new Set<string>();
+  for (const row of rowsById(latest).values()) {
+    const old = before.get(row.thread_id);
+    if (old === undefined || hasNewAgentActivity(old, row)) out.add(row.thread_id);
+  }
+  return out;
 }
 
 /**
@@ -198,6 +217,33 @@ export function settleThread(shown: readonly InboxListSection[], latest: readonl
     if (section.id !== next.section) return { ...section, threads };
     const at = threads.findIndex((row) => newestFirst(next, row) < 0);
     threads.splice(at < 0 ? threads.length : at, 0, next);
+    return { ...section, threads };
+  });
+}
+
+/**
+ * The held list with threads the person just started (compose's Send) put in
+ * (the owner, 2026-10-16: "When I create a new thread and hit send, why
+ * doesn't it show up in the Sent list?"). A thread the person started is
+ * their own action, like a pick or a Send in the open thread, which the held
+ * list shows at once; it is not agent activity, so nothing about it waits
+ * behind "N new". Each row `latest` has for `threadIds` and the list on
+ * screen lacks goes into its section at its place there (newest first: the
+ * top of Sent); every other row keeps its section and its order. A thread
+ * already on screen, or not in `latest`, changes nothing.
+ */
+export function addOwnThreads(shown: readonly InboxListSection[], latest: readonly InboxListSection[], threadIds: readonly string[]): InboxListSection[] {
+  const fresh = rowsById(latest);
+  const onScreen = rowsById(shown);
+  const adding = threadIds.map((id) => fresh.get(id)).filter((row): row is InboxListRow => row !== undefined && !onScreen.has(row.thread_id));
+  // The list always carries all six sections (empty ones included), so the row's section is on screen.
+  return shown.map((section) => {
+    const threads = [...section.threads];
+    for (const row of adding) {
+      if (row.section !== section.id) continue;
+      const at = threads.findIndex((other) => newestFirst(row, other) < 0);
+      threads.splice(at < 0 ? threads.length : at, 0, row);
+    }
     return { ...section, threads };
   });
 }

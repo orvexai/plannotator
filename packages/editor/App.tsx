@@ -26,6 +26,7 @@ import {
   type AnnotateBundleFile,
 } from '@plannotator/shared/annotate-bundle';
 import { setExtraMarkdownExtensions } from '@plannotator/ui/utils/markdownExtensions';
+import { installPlainTextPaste } from '@plannotator/ui/utils/pasteInsert';
 import { documentRendersHtml, htmlAssetRouteFromDocument, resolveHtmlLinkIntent } from '@plannotator/ui/utils/htmlLinkNavigation';
 import { ImageLightbox } from '@plannotator/ui/components/ImageLightbox';
 import { createPortal } from 'react-dom';
@@ -463,6 +464,9 @@ const RESIZE_HANDLE_TOOLTIP = 'Click to close · Drag to resize';
 
 const App: React.FC = () => {
   useViewportEnvironment();
+  // A plain-text paste into our text fields is inserted by the page: Chrome 155-156 on macOS drops
+  // dictated (synthetic ⌘V) text otherwise. Remove once Chrome 157 is stable (pasteInsert.ts).
+  useEffect(() => installPlainTextPaste(), []);
   const [markdown, setMarkdown] = useState(DEMO_PLAN_CONTENT);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const annotationsRef = useRef<Annotation[]>(annotations);
@@ -4037,7 +4041,7 @@ const App: React.FC = () => {
     const autoSavePromise = fetch('/api/save-notes', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(withServerSession(body)),
     })
       .then(res => res.json())
       .then(data => {
@@ -5628,8 +5632,12 @@ const App: React.FC = () => {
       const res = await fetch('/api/save-notes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(withServerSession(body)),
       });
+      if (await noteServerSessionMismatch(res)) {
+        toast.error('This review was replaced. Reload the page.');
+        return;
+      }
       const data = await res.json();
       const result = data.results?.[target];
       if (result?.success) {
@@ -7437,6 +7445,8 @@ const App: React.FC = () => {
                   <Viewer
                     key={viewerContentKey}
                     ref={viewerRef}
+                    // The light version of the Inbox's one viewer: the lightbox steps through the document's images (approval "inbox-image-viewer").
+                    imageLightboxStepping
                     onRestoreReport={handleRestoreReport}
                     blocks={blocks}
                     markdown={displayedMarkdown}

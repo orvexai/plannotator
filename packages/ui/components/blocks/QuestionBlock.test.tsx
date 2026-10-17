@@ -19,6 +19,7 @@ import type { Annotation } from '../../types';
 import { exportAnnotations, parseMarkdownToBlocks } from '../../utils/parser';
 import { buildQuestionPanelRows, collectQuestionAnswers, upsertQuestionAnswerAnnotation } from '../../utils/questionAnswers';
 import { BlockRenderer } from '../BlockRenderer';
+import type { QuestionBlockProps } from './QuestionBlock';
 
 const hasDom = typeof document !== 'undefined';
 
@@ -66,7 +67,7 @@ Transport?
 
 let latest: Annotation[] = [];
 
-function Harness({ markdown, readOnly = false, initial = [] }: { markdown: string; readOnly?: boolean; initial?: Annotation[] }) {
+function Harness({ markdown, readOnly = false, initial = [], statusLabel, footer }: { markdown: string; readOnly?: boolean; initial?: Annotation[]; statusLabel?: QuestionBlockProps['statusLabel']; footer?: QuestionBlockProps['renderFooter'] }) {
   const blocks = parseMarkdownToBlocks(markdown);
   const index = indexQuestionBlocks(blocks);
   const [annotations, setAnnotations] = useState<Annotation[]>(initial);
@@ -86,6 +87,8 @@ function Harness({ markdown, readOnly = false, initial = [] }: { markdown: strin
             questionTotal={index.length}
             questionAnswer={question ? answers.get(question.question.key) : undefined}
             onAnswerQuestion={readOnly ? undefined : onAnswer}
+            questionStatusLabel={statusLabel}
+            renderQuestionFooter={footer}
           />
         );
       })}
@@ -212,6 +215,85 @@ describe('QuestionBlock', () => {
     expect(answerOf(2)?.text).toBe('Two phones, one offline.');
     // A settled question has no Accept recommended.
     expect(button(cards(el)[3], 'Accept recommended')).toBeUndefined();
+  });
+
+  // The owner's 2026-10-14 report: ticking one box of a pick-any question
+  // hid "Accept recommended", so the rest of the recommendation took a click
+  // per box. It stays while the picks differ from the recommendation.
+  for (const [where, footer] of [
+    ['its own footer', undefined],
+    ['a host footer', () => <span>host action</span>],
+  ] as const) {
+    test.skipIf(!hasDom)(`multi: Accept recommended stays until the picks are exactly the recommendation (${where})`, async () => {
+      const el = await mount(<Harness markdown={DOC} footer={footer} />);
+      const card = () => cards(el)[1];
+      await click(rowText(card(), 'Toasts'));
+      expect(answerOf(1)?.selected).toEqual(['Toasts']);
+      expect(button(card(), 'Accept recommended')).toBeDefined();
+      await click(rowText(card(), 'Dot'));
+      expect(button(card(), 'Accept recommended')).toBeDefined();
+      await click(button(card(), 'Add note')!);
+      await type(card().querySelector<HTMLTextAreaElement>('textarea')!, 'banner can wait');
+      await type(card().querySelector<HTMLInputElement>('input[type="text"]')!, 'A sound');
+
+      // Accept sets exactly the recommendation: extra ticks and Other go, the note stays.
+      await click(button(card(), 'Accept recommended')!);
+      expect(answerOf(1)).toMatchObject({ selected: ['Dot', 'Banner'], note: 'banner can wait' });
+      expect(answerOf(1)?.other).toBeUndefined();
+      expect(button(card(), 'Accept recommended')).toBeUndefined();
+
+      // Unticking one brings it back.
+      await click(rowText(card(), 'Banner'));
+      expect(button(card(), 'Accept recommended')).toBeDefined();
+    });
+  }
+
+  test.skipIf(!hasDom)('multi recommending only a suggestion: a tick hides Accept recommended, as before', async () => {
+    // Once answered, the Suggested line is gone, so Accept would clear the
+    // ticks for text the card no longer shows.
+    const el = await mount(<Harness markdown={`:::question-multi\nWhich indicators ship?\n\n- [ ] Dot\n- [ ] Banner\n\nRecommended: a sound, nothing visual\n:::\n`} />);
+    const card = () => cards(el)[0];
+    expect(button(card(), 'Accept recommended')).toBeDefined();
+    await click(rowText(card(), 'Dot'));
+    expect(answerOf(0)?.selected).toEqual(['Dot']);
+    expect(button(card(), 'Accept recommended')).toBeUndefined();
+  });
+
+  test.skipIf(!hasDom)('after Accept recommended focus moves to the first checked choice, or the field it filled', async () => {
+    const el = await mount(<Harness markdown={DOC} />);
+    const accept = button(cards(el)[1], 'Accept recommended')!;
+    accept.focus();
+    await click(accept);
+    const first = cards(el)[1].querySelector<HTMLInputElement>('input:checked')!;
+    expect(first.closest('label')!.textContent).toContain('Dot');
+    // Compared as a boolean: printing a DOM node on failure crashes bun.
+    expect(document.activeElement === first).toBe(true);
+    await act(async () => root!.unmount());
+    host!.remove();
+
+    const suggested = await mount(<Harness markdown={`:::question\nPick\n\n- [ ] A\n- [ ] B\n\nRecommended: something else entirely\n:::\n`} />);
+    const use = button(cards(suggested)[0], 'Accept recommended')!;
+    use.focus();
+    await click(use);
+    expect(document.activeElement === cards(suggested)[0].querySelector('input[type="text"]')).toBe(true);
+    expect((document.activeElement as HTMLInputElement).value).toBe('something else entirely');
+  });
+
+  test.skipIf(!hasDom)('single: a pick of another choice still hides Accept recommended', async () => {
+    const el = await mount(<Harness markdown={DOC} />);
+    await click(rowText(cards(el)[0], 'Nowhere'));
+    expect(button(cards(el)[0], 'Accept recommended')).toBeUndefined();
+  });
+
+  test.skipIf(!hasDom)('multi: a read-only card offers no Accept recommended, whatever its answer', async () => {
+    const el = await mount(<Harness markdown={DOC} />);
+    await click(rowText(cards(el)[1], 'Toasts'));
+    const saved = latest;
+    await act(async () => root!.unmount());
+    host!.remove();
+    const ro = await mount(<Harness markdown={DOC} readOnly initial={saved} />);
+    expect(cards(ro)[1].getAttribute('data-question-status')).toBe('answered');
+    expect(button(cards(ro)[1], 'Accept recommended')).toBeUndefined();
   });
 
   test.skipIf(!hasDom)('Skip clears the answer but keeps a note; Unskip restores an open question', async () => {
@@ -395,5 +477,64 @@ describe('QuestionBlock', () => {
     expect(answerOf(0)?.selected).toEqual(['One per person']);
     await click(rowText(card, 'One per session'));
     expect(answerOf(0)?.selected).toEqual(['One per session']);
+  });
+
+  // Rows 37 and 38 of the Inbox stress test (the same cards in plan review and annotate).
+  const UNMATCHED = [
+    ':::question',
+    'Which store backs the cache?',
+    '',
+    '- [ ] Redis',
+    '- [ ] Memcached',
+    '',
+    'Recommended: SQLite on the box',
+    ':::',
+  ].join('\n');
+
+  test.skipIf(!hasDom)('a choice question whose recommendation names none of its choices shows it, and Use fills Other', async () => {
+    const el = await mount(<Harness markdown={UNMATCHED} />);
+    const card = cards(el)[0];
+    const line = card.querySelector<HTMLElement>('[data-question-suggested]');
+    expect(line?.textContent).toContain('SQLite on the box');
+    expect(card.getAttribute('aria-describedby')?.split(' ')).toContain(line!.id);
+    await click(button(card, 'Use')!);
+    expect(answerOf(0)).toMatchObject({ selected: [], other: 'SQLite on the box' });
+    // Answered, the line goes (as a text question's does).
+    expect(cards(el)[0].querySelector('[data-question-suggested]')).toBeNull();
+  });
+
+  test.skipIf(!hasDom)('a read-only card draws the Other row only when the answer used it', async () => {
+    const [q] = indexQuestionBlocks(parseMarkdownToBlocks(UNMATCHED));
+    const answer = (extra: Partial<QuestionAnswer>) =>
+      upsertQuestionAnswerAnnotation([], q.blockId, { v: 1, key: q.question.key, kind: 'single', prompt: q.question.prompt, selected: [], ...extra }, q.question.key);
+    const other = (el: HTMLElement) => cards(el)[0].querySelector<HTMLInputElement>('input[aria-label^="Other answer"]');
+
+    let el = await mount(<Harness markdown={UNMATCHED} readOnly initial={answer({ selected: ['Redis'] })} />);
+    expect(other(el)).toBeNull();
+    await act(async () => root!.unmount());
+    host!.remove();
+
+    el = await mount(<Harness markdown={UNMATCHED} readOnly initial={answer({ other: 'Postgres' })} />);
+    expect(other(el)?.value).toBe('Postgres');
+    await act(async () => root!.unmount());
+    host!.remove();
+
+    // An editable card keeps the row to type into.
+    el = await mount(<Harness markdown={UNMATCHED} />);
+    expect(other(el)).not.toBeNull();
+  });
+
+  test.skipIf(!hasDom)('a host status label replaces the card status tag; undefined keeps the card own', async () => {
+    const el = await mount(
+      <Harness
+        markdown={DOC}
+        statusLabel={(question, status) => (question.number === 1 && status === 'answered' ? { label: 'host-label-sentinel', tone: 'open' } : undefined)}
+      />,
+    );
+    await click(rowText(cards(el)[0], 'Nowhere'));
+    await click(rowText(cards(el)[1], 'Dot'));
+    expect(cards(el)[0].textContent).toContain('host-label-sentinel');
+    expect(cards(el)[0].textContent).not.toContain('Answered');
+    expect(cards(el)[1].textContent).toContain('Answered');
   });
 });

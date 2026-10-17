@@ -15,11 +15,12 @@
  */
 
 import type { QuestionAnswer, QuestionKind } from "./question-block";
-import type { InboxAnnotationRecord, InboxAttachment } from "./inbox-attachments";
+import type { InboxAnnotationRecord, InboxAttachment, InboxAttachmentKind, InboxInlineImage } from "./inbox-attachments";
 
 // The attachment shapes and file rules (step 2) live in their own module and
 // reach the Inbox through this published entry, so core's export map is unchanged.
 export * from "./inbox-attachments";
+export * from "./inbox-open-in";
 // The surface bridge's messages (the phone, PLAN step S1), the same way.
 export * from "./inbox-surface-bridge";
 
@@ -48,7 +49,8 @@ export function ulid(now: number = Date.now()): string {
   return timePart + randomPart;
 }
 
-export type InboxIdPrefix = "msg" | "prj" | "ses" | "dec" | "dev";
+/** `upl`: a file the person uploaded for a message; `drf`: a draft of one (compose). */
+export type InboxIdPrefix = "msg" | "prj" | "ses" | "dec" | "dev" | "upl" | "drf";
 
 export function inboxId(prefix: InboxIdPrefix, now?: number): string {
   return `${prefix}_${ulid(now)}`;
@@ -61,6 +63,8 @@ const ID_RE: Record<InboxIdPrefix, RegExp> = {
   dec: /^dec_[0-9A-HJKMNP-TV-Z]{26}$/,
   /** A paired phone (adr/implementation/inbox-mobile.md, section 2). */
   dev: /^dev_[0-9A-HJKMNP-TV-Z]{26}$/,
+  upl: /^upl_[0-9A-HJKMNP-TV-Z]{26}$/,
+  drf: /^drf_[0-9A-HJKMNP-TV-Z]{26}$/,
 };
 
 export function isInboxId(prefix: InboxIdPrefix, value: unknown): value is string {
@@ -72,12 +76,12 @@ export function isInboxId(prefix: InboxIdPrefix, value: unknown): value is strin
 /** The longest `thread` name send_message takes, in characters. */
 export const INBOX_THREAD_NAME_MAX = 120;
 
-const THREAD_NAME_CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+export const THREAD_NAME_CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 /**
  * Bidi controls (LRE..RLO, LRI..PDI, LRM, RLM, ALM) reorder the text around
  * them, so a name holding one can draw as another name in the list.
  */
-const THREAD_NAME_BIDI = /\p{Bidi_Control}/u;
+export const THREAD_NAME_BIDI = /\p{Bidi_Control}/u;
 /** Code points that draw as nothing (zero-width space and joiners, BOM, variation selectors...). */
 const THREAD_NAME_INVISIBLE = /\p{Default_Ignorable_Code_Point}/gu;
 
@@ -153,13 +157,22 @@ export type InboxAuthor =
 /** The hosts whose names the Inbox knows, keyed by `author.host`. */
 /**
  * One of the Inbox's own notes to the asking agent: Mark read's set-aside
- * note (`set_aside`) or a late Undo's reopened note (`reopened`). They are
- * stored as the person's messages so they reach the agent like any reply,
- * but they are not the person's reply and not a look: the list's `sent`,
- * `unseen`, the look boundary and "came back" all read past them.
+ * note (`set_aside`), a late Undo's reopened note (`reopened`), or the note
+ * that carries a 👍 Looks good to the agent (`ack_of`). They are stored as
+ * the person's messages so they reach the agent like any reply, but they are
+ * not the person's reply and not a look: the list's `sent`, `unseen`, the
+ * look boundary and "came back" all read past them.
  */
-export function isInboxNote(message: { author: { kind: string }; set_aside?: readonly string[] | null; reopened?: readonly string[] | null }): boolean {
-  return message.author.kind === "person" && ((message.set_aside?.length ?? 0) > 0 || (message.reopened?.length ?? 0) > 0);
+export function isInboxNote(message: {
+  author: { kind: string };
+  set_aside?: readonly string[] | null;
+  reopened?: readonly string[] | null;
+  ack_of?: string | null;
+}): boolean {
+  return (
+    message.author.kind === "person" &&
+    ((message.set_aside?.length ?? 0) > 0 || (message.reopened?.length ?? 0) > 0 || (typeof message.ack_of === "string" && message.ack_of !== ""))
+  );
 }
 
 export const INBOX_HOST_NAMES: Readonly<Record<string, string>> = {
@@ -232,6 +245,16 @@ export interface InboxMessage {
    */
   reopened?: string[];
   /**
+   * On the note that carries a 👍 Looks good to the agent (amended
+   * 2026-10-16): the agent message the person marked. Written once the
+   * ack's Undo window passed (its body is `inboxAckLine`), as a reply to
+   * that message, and delivered like any reply (the wake, wait_for_reply's
+   * `acknowledged`) while the ack still names it (`InboxAck.note_id`). The
+   * window and read_thread do not list it: the ack on the message says it.
+   * Absent on every other message.
+   */
+  ack_of?: string;
+  /**
    * On a root: the seq up to which the asking agent has read the person's
    * replies (wait_for_reply returned one, or read_thread read the thread),
    * and when. A Sent row moves to Quiet once its reply is checked.
@@ -245,6 +268,15 @@ export interface InboxMessage {
    */
   attachments?: InboxAttachment[];
   /**
+   * On an agent's message: the images its body shows, captured as files of
+   * the thread (`InboxInlineImage`), in the order the body shows them. Written
+   * when the message lands, or, for a message sent before images were
+   * captured, the first time its thread is read (each record then marked
+   * `captured: "on_open"`). Present (possibly empty) once capture ran; absent
+   * on a message whose body shows no local image, and on older records.
+   */
+  inline_images?: InboxInlineImage[];
+  /**
    * On a person's reply: it reached the asking agent's session as a turn
    * through an agent connection (the Claude Code mod), and when. Absent until
    * then; a reply the agent read through the MCP has none. "Replied" is not
@@ -252,6 +284,14 @@ export interface InboxMessage {
    * step 6: older records lack it.
    */
   delivery?: InboxDelivery | null;
+  /**
+   * On a person's reply or message not yet delivered: the person pressed
+   * Send now in the Inbox, and when. The session's connection then delivers
+   * it at once, into the running turn when one runs, instead of waiting for
+   * the session to go idle (the bridge command's `now`). Absent otherwise
+   * and on older records.
+   */
+  deliver_now_at?: string | null;
   /**
    * A guided review this message carries (submit_guide, PLAN step 5): the
    * snapshot is a content-addressed blob, `inbox/blobs/<sha256>`. Absent on
@@ -307,6 +347,135 @@ export interface InboxMessage {
    * equal to the root's first question's prompt counts as derived from it.
    */
   subject_question?: string | null;
+  /**
+   * On a thread's root the person wrote (compose: "send a new message to a
+   * connected agent"): the thread was started by the person, addressed to
+   * one live agent session (`to`), and is no session's default thread. The
+   * agent's answer lands in it by `reply_to`. Absent on every other message.
+   */
+  started_by_person?: true;
+  /**
+   * On the root of a thread the person started: who gave it its name, the
+   * thread chip (approval "inbox-agent-names-own-thread"). The person may name
+   * it in compose; otherwise the first reply from a session that may name it
+   * (`InboxStore.canNameThread`) carrying a valid `thread` names it, once, and
+   * the root is written again with the name and this field. Absent while the
+   * thread has no name, and on every other message. A name set here is never
+   * replaced, except compose's suggestion (`kind: "auto"`), which the first
+   * agent that may name the thread replaces.
+   */
+  named_by?: InboxThreadNamedBy;
+  /**
+   * On an agent's reply: the `thread` it carried, as given (trimmed), so a
+   * retry with the same idempotency key and another `thread` is told apart.
+   * Absent when it carried none, and on every other message.
+   */
+  reply_thread?: string;
+  /**
+   * On an agent's reply into a thread the person started that it could name:
+   * what the naming came to (`InboxThreadNaming`), so a retry answers the
+   * same. Absent everywhere else.
+   */
+  thread_naming?: InboxThreadNaming;
+  /**
+   * On an agent's message: the person's 👍 Looks good (design record
+   * "inbox-acknowledge", approved 2026-10-15, amended 2026-10-16). The thread
+   * is marked read; once the Undo window passes the Inbox sends it to the
+   * agent (a note, `note_id`), delivered like a reply. Null after Undo.
+   * Absent on every other message and on older records.
+   */
+  ack?: InboxAck | null;
+}
+
+/**
+ * Who named a thread the person started (`InboxMessage.named_by`): the person
+ * in compose (`thread_name` on the Send), compose's own suggestion the person
+ * left as it was (`thread_name_auto: true`), or the agent whose reply named it.
+ */
+export type InboxThreadNamedBy =
+  | { kind: "person"; at: string }
+  /**
+   * The name compose suggested from the message (`suggestPersonThreadName`)
+   * and the person sent without editing it: shown like any name, but the
+   * first agent that may name the thread (`InboxStore.canNameThread`) still
+   * replaces it, once.
+   */
+  | { kind: "auto"; at: string }
+  | {
+      kind: "agent";
+      host: string | null;
+      session: string;
+      /** The reply that carried the name. */
+      message_id: string;
+      at: string;
+    };
+
+/**
+ * What a reply's naming of a thread the person started came to (approval
+ * "inbox-agent-names-own-thread"), kept on the reply so a retry answers the
+ * same: `named` (the thread's `thread_name` is now `name`); `refused`, with a
+ * code (`invalid_thread_name`, or `thread_name_taken` when another open
+ * thread of the project already has the name) and one sentence saying why;
+ * `unnamed` when the reply gave no `thread`.
+ */
+export type InboxThreadNaming =
+  | { status: "named"; name: string }
+  | { status: "refused"; code: "invalid_thread_name" | "thread_name_taken"; reason: string }
+  | { status: "unnamed" };
+
+/**
+ * The one line an agent is handed while a thread the person started still
+ * has no name an agent gave and that agent may name it: in `wait_for_reply`
+ * and `read_thread` beside `name_this_thread: true`. The wake of the thread
+ * (INBOX_NAME_THREAD_LINE in shared/inbox/connection.ts) carries the same ask.
+ */
+export const INBOX_NAME_THIS_THREAD_HINT =
+  "Name this thread: pass `thread` (a few words saying what it is about) with your reply. The first name you give sets it, once.";
+
+/** The one acknowledgment the window offers (plan review's 👍 says the same words). */
+export const INBOX_ACK_LABEL = "Looks good";
+
+/**
+ * The person's 👍 on an agent message (`InboxMessage.ack`). The last line
+ * wins, as for every record: settling and the agent's read are new snapshot
+ * lines of the same message.
+ */
+export interface InboxAck {
+  label: string;
+  at: string;
+  /** The Mark read this ack stands on (the root's `person_read_seq`): Move back on that read withdraws the ack. */
+  read_seq: number | null;
+  /** This ack made that Mark read (the thread was not read before), so its Undo undoes the read too. */
+  made_read?: boolean;
+  /**
+   * Set once the Undo window passed with the ack standing (the seq of that
+   * line, and when): agents see it from then on (read_thread, and
+   * wait_for_reply's `acknowledged`). Null before.
+   */
+  settled_seq?: number | null;
+  settled_at?: string | null;
+  /**
+   * The note that carries this 👍 to the agent (`InboxMessage.ack_of`),
+   * written when it settled. The note is delivered only while the ack still
+   * names it, so a 👍 taken back before its delivery never arrives. Absent on
+   * acks settled before the amendment (they were never sent).
+   */
+  note_id?: string | null;
+  /**
+   * Set when the Undo window ended but the 👍 could no longer go: the person
+   * wrote back after the message (`replied`) or the agent wrote again
+   * (`wrote_again`) inside the window. No note is written and no agent sees
+   * it; the window says it was not sent. Absent on every other ack.
+   */
+  not_sent?: "replied" | "wrote_again" | null;
+  /** When an agent read it (read_thread, or wait_for_reply returned it). Null until then. */
+  seen_at?: string | null;
+  /**
+   * The window's thread only (`GET /api/inbox/threads/:id`): when the 👍
+   * reached the agent (its note delivered as a turn, or an agent read it),
+   * else null. Never stored.
+   */
+  delivered_at?: string | null;
 }
 
 /**
@@ -590,7 +759,17 @@ export interface InboxListRow extends InboxThreadSummary {
    * The person's reply is the last message, the Inbox's own notes read past:
    * when, and when the agent read it (null until it has).
    */
-  sent: { at: string; checked_at: string | null } | null;
+  sent: {
+    at: string;
+    checked_at: string | null;
+    /**
+     * It goes to a session whose connection delivers it as a turn by itself
+     * (the asking message came through a waking connection, or the person
+     * addressed it to a live session): "Queued for <agent>", not "Saved for".
+     * Absent from an older Inbox.
+     */
+    wakes?: boolean;
+  } | null;
   /**
    * When the latest agent message arrived (`last_at` also moves on the
    * person's messages and the Inbox's notes). The window's held list counts
@@ -600,11 +779,24 @@ export interface InboxListRow extends InboxThreadSummary {
   /** A message in the thread carries a guided review: the row's "Guided review" mark. */
   guide: boolean;
   /**
+   * On a thread the person started (`started_by_person`): the agent session
+   * it is addressed to now (the root's `to`, which "Send to another session"
+   * may change), so the row draws that agent's mark and "To <agent>". Absent
+   * on every other thread and from an older Inbox.
+   */
+  addressee?: InboxAddressee | null;
+  /**
    * When the person marked the thread read (Mark read), while it still holds:
    * no message but a set-aside note since. The row is Quiet. Null otherwise.
    * Absent from an older Inbox.
    */
   read_at?: string | null;
+  /**
+   * The person's 👍 on the latest agent message, while the Mark read it made
+   * still holds: the row says "👍 Looks good" in place of "Read". Null
+   * otherwise. Absent from an older Inbox.
+   */
+  ack?: { label: string; at: string } | null;
   /**
    * The thread is archived (resolved) and an agent wrote in it after the
    * archive line (a reply_to reply). Those later messages behave as an open
@@ -629,6 +821,28 @@ export interface InboxListSection {
   id: InboxSectionId;
   label: string;
   threads: InboxListRow[];
+}
+
+/** Something in the thread waits on the person: a question, or news they have not looked at. */
+export function inboxRowWaitsOnPerson(row: Pick<InboxListRow, "section" | "unseen" | "answered_not_sent">): boolean {
+  return (
+    row.section === "stopped" ||
+    row.section === "holding" ||
+    row.section === "waiting" ||
+    (row.section === "new" && (row.unseen > 0 || row.answered_not_sent))
+  );
+}
+
+/**
+ * Mark read is offered on the thread (the list row's hover action, and each
+ * thread a project's "Mark all as read" takes): something waits on the
+ * person, and the thread is open or came back from the archive (Mark read
+ * sends a came-back thread back to the archive).
+ */
+export function inboxRowOffersMarkRead(
+  row: Pick<InboxListRow, "section" | "unseen" | "answered_not_sent" | "resolved_at" | "back_from_archive">,
+): boolean {
+  return (row.resolved_at === null || row.back_from_archive === true) && inboxRowWaitsOnPerson(row);
 }
 
 export interface InboxThread {
@@ -735,6 +949,26 @@ export interface InboxHealth {
    * `available` and `version` keep the older `{ available, version }` shape.
    */
   update: InboxUpdate | null;
+  /** Whether a notification can reach the person now (additive; absent from an older Inbox). */
+  notify_reach?: InboxNotifyReach;
+}
+
+/** What an Inbox window reports about its browser's notification permission for its own origin. */
+export type InboxWindowPermission = 'granted' | 'default' | 'denied' | 'unsupported' | 'unknown';
+
+/**
+ * Whether a browser notification can reach the person now
+ * (packages/server/inbox-windows.ts): notifications come from an open Inbox
+ * tab, so with none open, or none the browser lets notify, nothing reaches
+ * them. `windows`: Inbox tabs holding an event stream; `allowed`: those whose
+ * browser reported `granted`; `allowed_origins`: their addresses.
+ */
+export interface InboxNotifyReach {
+  /** The Settings switch (config.json `inboxNotifications.enabled`). */
+  enabled: boolean;
+  windows: number;
+  allowed: number;
+  allowed_origins: string[];
 }
 
 /** The Inbox's update control: what the button says and does. */
@@ -915,11 +1149,26 @@ export interface InboxAgentRow {
     locked: boolean;
     reason: string | null;
   };
-  /** Claude Code, Pi and OpenCode only: their `plannotator_inbox` tool switch (`inboxTool`), shown whether or not the agent was found. */
-  tool?: { on: boolean; locked: boolean } | null;
+  /**
+   * Claude Code, Pi and OpenCode only: their `plannotator_inbox` tool switch (`inboxTool`), shown whether or not the agent was found.
+   * `chosen_off`: config.json turns it off by name (not the host's default), so the first-run screen never offers turning it on.
+   * `mod_off` (Claude Code): Plannotator's Claude Code mod is off (PLANNOTATOR_CLAUDE_MOD / claudeCodeMod), so there is no tool whatever inboxTool says.
+   */
+  tool?: { on: boolean; locked: boolean; chosen_off?: boolean; mod_off?: boolean } | null;
   /** Claude Code, Pi and OpenCode only. `needs_tool`: the tool is off, so there is no reminder. */
   reminder: { on: boolean; locked: boolean; needs_tool: boolean } | null;
   note: InboxAgentNoteStatus | null;
+  /**
+   * Claude Code, Pi and OpenCode only: whether Plannotator's own plugin or
+   * extension is installed (Claude Code's plugin enabled, Pi's settings
+   * `packages`, OpenCode's global `plugin`/`plugins`). Absent from an older
+   * Inbox; null for every other agent. `disabled` (Claude Code): installed and
+   * turned off by name (`claude plugin disable`), the person's choice;
+   * `managed`, turned off by managed (enterprise) settings.
+   * `generation` (OpenCode): the version on PATH (`opencode2`: 2, `opencode`
+   * alone: 1), for the plugin line that version reads.
+   */
+  plugin?: { installed: boolean; disabled?: boolean; managed?: boolean; generation?: "1" | "2" } | null;
 }
 
 export interface InboxAgentsModel {
@@ -942,7 +1191,107 @@ export interface InboxAgentsModel {
   error?: string | null;
 }
 
+/** The hosts whose every request carries the `plannotator_inbox` tool in full once it is on (Claude Code defers it behind tool search). */
+export type InboxToolCostHost = "pi" | "opencode";
+
+/**
+ * What turning the Inbox tool on adds to every request on Pi and OpenCode 2,
+ * measured on the real hosts: apps/pi-extension/inbox.test.ts and
+ * apps/opencode-plugin/inbox-v2.test.ts read the request the host sends a
+ * scripted model and fail when the tool's entry drifts more than 5% from
+ * `bytes`. Tokens depend on the model's tokenizer: the same entry counts
+ * 1,661 with o200k_base (GPT-4o and later), and Claude's tokenizer counts
+ * JSON and code higher, so `tokens` is a rounded, deliberately high estimate,
+ * stated as "roughly". The window states both (`inboxToolCostText`: the
+ * first-run screen, Settings → Agents), as does `plannotator inbox --help`.
+ * Before the long field descriptions were shortened
+ * (INBOX_AGENT_FIELD_DESCRIPTIONS) the entry was 11,736 bytes (2,796 tokens
+ * with o200k_base) on both hosts.
+ */
+export const INBOX_TOOL_COST: Readonly<Record<InboxToolCostHost, { bytes: number; tokens: number }>> = {
+  pi: { bytes: 7058, tokens: 2000 },
+  opencode: { bytes: 7058, tokens: 2000 },
+};
+
+/** "about 7 KB, roughly 2,000 tokens" for a host's measured cost. */
+export function inboxToolCostText(host: InboxToolCostHost): string {
+  const cost = INBOX_TOOL_COST[host];
+  return `about ${Math.round(cost.bytes / 1000)} KB, roughly ${cost.tokens.toLocaleString("en-US")} tokens`;
+}
+
 /** "Codex, Gemini CLI and Pi" for note agents. */
 export function inboxNoteAgentList(ids: readonly InboxNoteAgentId[]): string {
   return inboxAgentList(ids);
+}
+
+// ─────────────── Compose: a new thread the person starts with a live agent ───────────────
+
+/**
+ * A file the person uploaded from the window for a thread they start, not
+ * sent yet (`POST /api/inbox/uploads`). At send it becomes an
+ * `InboxAttachment`; a draft names it by `upload_id`.
+ */
+export interface InboxUpload {
+  upload_id: string;
+  name: string;
+  size: number;
+  kind: InboxAttachmentKind;
+  sha256: string;
+  created_at: string;
+  media_type?: string;
+  width?: number;
+  height?: number;
+}
+
+/** The session a draft was written for, with enough to name it after it has ended. */
+export interface InboxDraftTo {
+  host: string;
+  session: string;
+  project_root: string | null;
+  project_name: string | null;
+  started_at: string | null;
+}
+
+/**
+ * A message the person started and did not send (`inbox/drafts/<id>.json`):
+ * never in the event log, so never seen by agents, phones or search. A draft
+ * never sends itself and is never re-addressed on its own.
+ */
+export interface InboxDraft {
+  v: 1;
+  id: string;
+  created_at: string;
+  updated_at: string;
+  body: string;
+  to: InboxDraftTo | null;
+  /** The project it was written in (the chosen session's, or the one open in the list). */
+  project: { id: string | null; root: string; name: string } | null;
+  files: InboxUpload[];
+  /**
+   * The thread's name the person typed in compose (the chip), as typed.
+   * Absent while the chip follows the message (compose's suggestion, worked
+   * out again from the body when the draft opens).
+   */
+  thread_name?: string;
+}
+
+/** A draft's chip: its chosen session is live, has ended, or none was chosen. */
+export type InboxDraftStatus = "live" | "ended" | "none";
+
+/** One live session as compose lists it (`GET /api/inbox/sessions`). */
+export interface InboxComposeSession {
+  session: string;
+  host: string;
+  started_at: string;
+  last_seen_at: string;
+  busy: boolean | null;
+  idle_since: string | null;
+  /** The thread it last wrote in, or null when it has not written in the Inbox. */
+  last_thread: { id: string; subject: string | null; at: string } | null;
+}
+
+/** Live sessions grouped by the project they work in; `id` null for a folder the Inbox has not seen yet. */
+export interface InboxComposeProject {
+  project: { id: string | null; name: string; root: string };
+  sessions: InboxComposeSession[];
 }

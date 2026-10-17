@@ -31,6 +31,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync,
 import { join, resolve } from 'node:path';
 import { DEMO_MESSAGES, SimAgent, scratchProject } from '../../scripts/inbox-sim';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { cutInHeadRow } from './head-row';
 
 const repo = resolve(__dirname, '../..');
 const builtBinary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
@@ -154,9 +155,13 @@ function pageFrame(page: Page): FrameLocator {
   return page.frameLocator('[data-attachment-pane] iframe').first();
 }
 
-/** Plannotator's comment composer (CommentPopover), once it is open. */
+/**
+ * Plannotator's comment composer (CommentPopover), once it is open. Scoped to
+ * the popover: the reply box is the same composer textarea (ComposerTokenTextarea)
+ * and can come later in the DOM.
+ */
 function composer(page: Page) {
-  return page.locator('textarea[data-pn-mobile-editable="true"]').last();
+  return page.locator('[data-comment-popover] textarea[data-pn-mobile-editable="true"]').last();
 }
 
 /** Drag-select `text` inside the open markdown document with the real mouse. */
@@ -212,6 +217,10 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   writeFileSync(join(docs, 'install-flow.mmd'), FLOW);
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'light' });
   const page = await context.newPage();
+  // This spec proves full screen WITH the tools (header, panel, bar). An HTML file opens straight into full view
+  // while the shared hidden-tools choice says so (approval "inbox-full-view"); this person chose to keep the tools.
+  // Full view itself: inbox-full-view.spec.ts.
+  await context.addCookies([{ name: 'plannotator-html-chrome', value: encodeURIComponent(JSON.stringify({ sidebarOpen: false, panelOpen: false, toolsHidden: false, savedAt: Date.now() })), url }]);
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('console', (message) => {
@@ -460,6 +469,30 @@ test('the HTML prototype opens full screen: its image and frame load from its fo
   await expect(pane.locator('[data-strip-chip]')).toHaveText('3 annotations');
   await shot('2.4-html-full-screen-marker-pinned');
 
+  // "Open in" → Browser (the split button's left half on an HTML file): the page in
+  // a tab of its own, from its own folder, under the same sandbox. Only the new tab
+  // is driven here; no app is ever launched by this spec.
+  const [tab] = await Promise.all([world.context.waitForEvent('page'), pane.locator('[data-open-in-primary="browser"]').click()]);
+  await tab.waitForLoadState();
+  expect(new URL(tab.url()).pathname).toMatch(/^\/api\/html-assets\/[0-9a-f]{16}\/admin-view\.html$/);
+  await expect(tab.locator('#retry-all')).toHaveText('Retry all (40)');
+  await expect.poll(() => tab.locator('#badge').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(88);
+  await expect(tab.frameLocator('#detail').locator('#detail-text')).toHaveText("Charge detail from the attachment's own folder");
+  // Opaque origin, no network: the page still cannot read the Inbox.
+  await expect(tab.locator('#probe')).toHaveText('inbox api refused');
+  // Top-level, the page's response CSP is its only sandbox: navigating its own tab
+  // to a sibling SVG must not escape it. The SVG carries its own sandbox, so its
+  // script never runs and the Inbox API is never reached from this origin.
+  writeFileSync(
+    join(world.billing, 'proto', 'escape.svg'),
+    `<svg xmlns="http://www.w3.org/2000/svg"><text id="t" y="20">svg</text><script>document.documentElement.setAttribute('data-ran','yes');fetch('/api/inbox/threads').then(function(){document.documentElement.setAttribute('data-read','yes')})</script></svg>`,
+  );
+  const escape = await tab.goto(new URL('escape.svg', tab.url()).href);
+  expect(escape!.headers()['content-security-policy']).toBe("sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:");
+  await tab.waitForTimeout(300);
+  expect(await tab.evaluate(() => [document.documentElement.getAttribute('data-ran'), document.documentElement.getAttribute('data-read')])).toEqual([null, null]);
+  await tab.close();
+
   await pane.getByRole('button', { name: 'Exit full screen' }).click();
   await expect(pane).not.toHaveClass(/ib-full/);
   await pane.getByRole('button', { name: 'Close admin-view.html' }).click();
@@ -626,12 +659,13 @@ test('leaving full screen keeps the file beside the thread with ‹ Inbox leadin
   await exit.focus();
   await page.keyboard.press('Enter');
   await expect(pane).not.toHaveClass(/ib-full/);
-  // Focus stays on the toggle, now Full screen; the way back is in view at the top left, ahead of Archive.
+  // Focus stays on the toggle, now Full screen; the way back is in view at the top left, ahead of Mark read; Archive ends the header.
   await expect(pane.getByRole('button', { name: 'Full screen' })).toBeFocused();
   await expect(back).toBeVisible();
   await expect(back).toHaveAccessibleName('Back to Inbox');
   await expect(back).toHaveText('Inbox');
   await expect(thread.locator('.ib-phead > *').first()).toHaveAttribute('data-file-back', '');
+  await expect(thread.locator('.ib-phead > *').last()).toHaveAttribute('data-archive', '');
   await expect(thread.getByRole('button', { name: 'Close the thread' })).toHaveCount(0);
   await expect(nav).toBeHidden();
   await expect(page.locator('.ib-listcol')).toHaveCount(0);
@@ -841,10 +875,23 @@ test('the header says the message has files: its count opens the same tiles unde
   const pane = page.locator(`[data-attachment-pane="${world.attachments.plan}"]`);
   await expect(pane).toBeVisible();
   expect(page.url()).toContain(`file=${world.attachments.plan}`);
+  // The thread beside the file is 440 px: the head row goes to two lines, and the count is drawn whole (inbox-polish, item 5).
+  expect(Math.round((await page.locator('section.ib-pane').first().boundingBox())!.width)).toBe(440);
+  expect(await cutInHeadRow(count)).toBeNull();
+  expect(await cutInHeadRow(count.locator('.ib-hflag'))).toBeNull();
   await pane.getByRole('button', { name: 'Close retry-plan.md' }).click();
   await expect(pane).toHaveCount(0);
   await count.click();
   await expect(band).toBeHidden();
+  // A thread pane of about 568 px (a 1180 px window beside the list): still whole.
+  await page.setViewportSize({ width: 1180, height: 900 });
+  try {
+    await expect.poll(async () => Math.round((await page.locator('section.ib-pane').boundingBox())!.width)).toBeLessThan(600);
+    expect(await cutInHeadRow(count)).toBeNull();
+    expect(await cutInHeadRow(count.locator('.ib-hflag'))).toBeNull();
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 900 });
+  }
 });
 
 test('Send carries the picks and then the annotations as feedback; wait_for_reply returns both', async () => {

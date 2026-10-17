@@ -24,12 +24,24 @@
  */
 
 import { resolveReferenceLinks } from "./markdown-structure";
+import { cutText } from "./text-cut";
+// The grapheme-safe cuts, re-exported here: core's export map is checked against the published package, and the Inbox is what uses them.
+export { cutText, sliceText } from "./text-cut";
+// The subject of a thread the person starts: beside deriveInboxSubject, so the store and compose's preview share it.
+export {
+  derivePersonThreadSubject,
+  PERSON_THREAD_SUBJECT_COLUMNS,
+  suggestPersonThreadName,
+  PERSON_THREAD_NAME_COLUMNS,
+  PERSON_THREAD_NAME_WORDS,
+} from "./inbox-thread-subject";
 import {
   canonicalQuestionAnswer,
   findQuestionBlocks,
   formatQuestionAnswersSection,
   isQuestionAnswerEmpty,
   isQuestionAnswered,
+  capQuestionPrompt,
   MAX_QUESTION_PROMPT_CHARS,
   parseQuestionAnswer,
   parseQuestionBlock,
@@ -292,7 +304,8 @@ export function checkInboxAnswer(
   if (parsed === null) return invalid("not a valid QuestionAnswer v1 record");
   if (parsed.key !== record.key) return invalid("key does not match the question");
   if (parsed.kind !== record.kind) return invalid("kind does not match the question");
-  if (parsed.prompt !== record.prompt.slice(0, MAX_QUESTION_PROMPT_CHARS)) {
+  // The cut every build makes now, or the plain 400-unit cut a client from before it made (the phone app's, until it updates).
+  if (parsed.prompt !== capQuestionPrompt(record.prompt) && parsed.prompt !== record.prompt.slice(0, MAX_QUESTION_PROMPT_CHARS)) {
     return invalid("prompt does not match the question");
   }
   const answer = canonicalQuestionAnswer({ choices: storedChoices(record) }, parsed);
@@ -335,7 +348,8 @@ function exportItem(record: InboxQuestionRecord, number: number): QuestionExport
 /**
  * The body a Send writes: "Answered N questions.", "Skipped N questions." or
  * "Answered N questions, skipped M." when it carries answers or skips,
- * the person's words if any, then Plannotator's "Answers to your questions"
+ * the person's words if any (then, when it carries neither answers nor
+ * skips, the line saying the questions are still open), then Plannotator's "Answers to your questions"
  * section over every question of the message, with the answers this Send
  * carries and earlier sent answers that still stand. Empty when there is
  * nothing to send.
@@ -345,6 +359,13 @@ export function composeInboxReplyBody(input: {
   sent: readonly QuestionAnswer[];
   earlier: readonly QuestionAnswer[];
   words: string | undefined;
+  /**
+   * The questions the still-open line counts when the reply sends no answer
+   * and no skip. Default: `questions`. The Inbox passes every question the
+   * replied-to message's session asked in the thread, so words sent to its
+   * later plain update still tell it that its questions stay open.
+   */
+  stillOpen?: readonly InboxQuestionRecord[];
 }): string {
   // The same rule as the answers section's "x of y answered" line
   // (formatQuestionAnswersSection): a pick, Other or text answers; a note
@@ -367,8 +388,34 @@ export function composeInboxReplyBody(input: {
     .filter((item): item is QuestionExportItem => item !== null);
   const section = input.sent.length > 0 ? formatQuestionAnswersSection(items, [...input.sent, ...input.earlier]).trimEnd() : "";
   const words = input.words?.trim() ?? "";
-  return [sentence, words, section].filter((part) => part !== "").join("\n\n");
+  // A reply that answers and skips nothing (words, annotations, or both)
+  // leaves every question open, and says so: the agent must not ask again.
+  const stillOpen = input.sent.length === 0 ? inboxStillOpenLine(input.stillOpen ?? input.questions) : "";
+  return [sentence, words, stillOpen, section].filter((part) => part !== "").join("\n\n");
 }
+
+/**
+ * The line a reply that answers and skips nothing carries (approval
+ * "inbox-words-only-reply", 2026-10-13): the message's questions are still
+ * open and the person will answer them in the Inbox. Empty when none is left
+ * waiting on the person. `INBOX_STILL_OPEN_LINE` matches it, so the window
+ * can tell it from the person's own words.
+ */
+export function inboxStillOpenLine(questions: readonly InboxQuestionRecord[]): string {
+  const states = questions.map((q) => inboxQuestionState(q, false));
+  const open = states.filter((s) => s === "open" || s === "picked").length;
+  if (open === 0) return "";
+  // Some were answered in an earlier reply: "No questions answered yet" would not be true.
+  if (states.includes("sent")) {
+    return `No new answers in this reply; ${questionsWord(open)} ${open === 1 ? "is" : "are"} still open. Don't re-ask ${open === 1 ? "it" : "them"}; the person will answer in the Inbox.`;
+  }
+  if (open === 1) return "No question answered yet; it is still open. Don't re-ask it; the person will answer in the Inbox.";
+  return `No questions answered yet; all ${open} are still open. Don't re-ask them; the person will answer in the Inbox.`;
+}
+
+/** Matches `inboxStillOpenLine`'s line (one line of a reply body). */
+export const INBOX_STILL_OPEN_LINE =
+  /^(?:No questions? answered yet|No new answers in this reply); .* still open\. Don't re-ask (?:it|them); the person will answer in the Inbox\.$/;
 
 const questionsWord = (n: number): string => `${n} question${n === 1 ? "" : "s"}`;
 
@@ -395,7 +442,7 @@ export function inboxSkipAnswer(record: Pick<InboxQuestionRecord, "key" | "kind"
     v: 1,
     key: record.key,
     kind: record.kind,
-    prompt: record.prompt.slice(0, MAX_QUESTION_PROMPT_CHARS),
+    prompt: capQuestionPrompt(record.prompt),
     selected: [],
     skipped: true,
     ...(options.byReply ? { by_reply: true } : {}),
@@ -439,13 +486,17 @@ const SUBJECT_MAX = 120;
 /**
  * A thread's subject when the agent gave none: the first open question's
  * prompt, else the first heading or non-empty line of the body, plain.
+ * A thread the PERSON starts (compose) is named by
+ * `derivePersonThreadSubject` instead (./inbox-thread-subject, re-exported
+ * below): a short name, not the first 120 characters of a dictated paragraph.
  */
 export function deriveInboxSubject(body: string, questions: readonly Pick<ParsedInboxQuestion, "prompt">[]): string | null {
   const pick = questions[0]?.prompt ?? firstLine(body);
   if (!pick) return null;
   const plain = pick.replace(/^#+\s*/, "").replace(/[*_`]/g, "").replace(/\s+/g, " ").trim();
   if (!plain) return null;
-  return plain.length > SUBJECT_MAX ? `${plain.slice(0, SUBJECT_MAX - 1)}…` : plain;
+  // Never inside a character: a cut mid-emoji drew "�…" (cutText keeps whole graphemes).
+  return cutText(plain, SUBJECT_MAX);
 }
 
 function firstLine(body: string): string | null {

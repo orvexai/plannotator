@@ -72,6 +72,7 @@
  *   does not change the question key.
  */
 
+import { sliceText } from "./text-cut";
 import {
   DIRECTIVE_OPEN_RE,
   codeFenceCloseIndex,
@@ -410,6 +411,45 @@ const matchRecommendation = (
         return head !== -1 ? head : letteredHit(p);
       });
       if (hits.every((h) => h !== -1)) return [...new Set(hits)];
+    }
+    // A choice written whole in the list, `— description` included, whose
+    // description holds the separator (`Comments — one line of work, could
+    // ship first`): the split above cuts it in two and `could ship first`
+    // names nothing. Join neighbouring parts back, but only into a span that
+    // is EXACTLY a choice's full text, label or name (never its head alone,
+    // which would let `A — cheap, B` swallow B), and only when every part
+    // ends up covered.
+    for (const sep of [/(\s*;\s*)/, /(\s*,\s*|\s+(?:and|&|\+)\s+)/i]) {
+      const pieces = text.split(sep);
+      const parts = pieces.filter((_, i) => i % 2 === 0).map((p) => p.trim());
+      if (parts.length < 2 || parts.some((p) => !p)) continue;
+      const span = (from: number, to: number) => pieces.slice(from * 2, to * 2 + 1).join('');
+      const single = (i: number): number => {
+        const hit = match(parts[i]);
+        if (hit !== -1) return hit;
+        const head = match(splitLabel(parts[i]).label);
+        return head !== -1 ? head : letteredHit(parts[i]);
+      };
+      const memo = new Map<number, number[] | null>();
+      const cover = (from: number): number[] | null => {
+        if (from === parts.length) return [];
+        if (memo.has(from)) return memo.get(from)!;
+        let found: number[] | null = null;
+        for (let to = parts.length - 1; to > from && !found; to--) {
+          const hit = match(span(from, to));
+          const rest = hit !== -1 ? cover(to + 1) : null;
+          if (rest) found = [hit, ...rest];
+        }
+        if (!found) {
+          const hit = single(from);
+          const rest = hit !== -1 ? cover(from + 1) : null;
+          if (rest) found = [hit, ...rest];
+        }
+        memo.set(from, found);
+        return found;
+      };
+      const hits = cover(0);
+      if (hits) return [...new Set(hits)];
     }
   }
   const lettered = letteredHit(text);
@@ -833,6 +873,15 @@ export interface QuestionAnswer {
 const cap = (value: string, max: number): string => (value.length > max ? value.slice(0, max) : value);
 
 /**
+ * An answer's copy of its question's prompt, cut at `MAX_QUESTION_PROMPT_CHARS`
+ * between characters (never inside an emoji). The Plannotator Inbox compares
+ * a posted answer's prompt with its question's through this same cut.
+ */
+export function capQuestionPrompt(prompt: string): string {
+  return sliceText(prompt, MAX_QUESTION_PROMPT_CHARS);
+}
+
+/**
  * Fail-closed validator: returns a normalized copy holding only the known
  * fields (strings truncated to their caps, empty optionals dropped), or null
  * for anything malformed. Every reader of `questionAnswer` goes through it,
@@ -864,7 +913,7 @@ export const parseQuestionAnswer = (value: unknown): QuestionAnswer | null => {
     v: 1,
     key: v.key,
     kind: v.kind,
-    prompt: cap(v.prompt, MAX_QUESTION_PROMPT_CHARS),
+    prompt: capQuestionPrompt(v.prompt),
     selected,
     ...(other.trim() ? { other } : {}),
     ...(text.trim() ? { text } : {}),
@@ -975,7 +1024,7 @@ export const emptyQuestionAnswer = (indexed: Pick<IndexedQuestion, 'line' | 'que
   v: 1,
   key: indexed.question.key,
   kind: indexed.question.kind,
-  prompt: cap(indexed.question.prompt, MAX_QUESTION_PROMPT_CHARS),
+  prompt: capQuestionPrompt(indexed.question.prompt),
   selected: [],
   sourceLine: indexed.line,
 });

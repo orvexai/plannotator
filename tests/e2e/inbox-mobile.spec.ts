@@ -25,6 +25,7 @@ import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { DEMO_MESSAGES, SimAgent, scratchProject } from '../../scripts/inbox-sim';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { NO_BROWSER } from '../helpers/no-browser';
 
 const repo = resolve(__dirname, '../..');
 const binary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
@@ -80,7 +81,7 @@ test.beforeAll(async () => {
   // Nothing here may reach the real tailscale CLI.
   writeFileSync(join(trap, 'tailscale'), '#!/bin/sh\necho "inbox-mobile: tailscale must not run" >&2\nexit 97\n');
   chmodSync(join(trap, 'tailscale'), 0o755);
-  const env = { PATH: `${trap}:${process.env.PATH ?? ''}`, HOME: home, PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9' };
+  const env = { PATH: `${trap}:${process.env.PATH ?? ''}`, HOME: home, PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: NO_BROWSER, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9' };
   expect(env.PLANNOTATOR_DATA_DIR.startsWith(root)).toBe(true);
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
@@ -383,7 +384,7 @@ for (const phone of [
       await shot(page, '4-thread');
       expect(await sideways(page)).toEqual([]);
       expect(await overlaps(page, '.ib-phead', '.ib-pback, .ib-phsubj[data-on], .ib-iconbtn, .ib-ptool')).toEqual([]);
-      expect(await overlaps(page, '.ib-sender', '.ib-mk, .ib-whobox, .ib-tm')).toEqual([]);
+      expect(await overlaps(page, '.ib-fline.ib-is-open', '.ib-mk, .ib-fl-nm, .ib-fl-meta, .ib-fl-tm')).toEqual([]);
       const back = pane.getByRole('button', { name: 'Back to Inbox' });
       await expect(back).toBeVisible();
       await expect(back).toHaveText('Inbox');
@@ -425,9 +426,9 @@ for (const phone of [
       expect(await sideways(page)).toEqual([]);
       expect(await overlaps(page, '.ib-fline', '.ib-mk, .ib-fl-nm, .ib-fl-sn, .ib-fl-tm, .ib-fl-chip')).toEqual([]);
       await pane.locator('[data-expand-all]').click();
-      await expect(pane.locator('.ib-fline')).toHaveCount(0);
+      await expect(pane.locator('button.ib-fline')).toHaveCount(0);
       expect(await sideways(page)).toEqual([]);
-      expect(await overlaps(page, '.ib-sender', '.ib-mk, .ib-whobox, .ib-tm')).toEqual([]);
+      expect(await overlaps(page, '.ib-fline.ib-is-open', '.ib-mk, .ib-fl-nm, .ib-fl-meta, .ib-fl-tm')).toEqual([]);
     });
 
     test('a file opens over the thread, its comments are a sheet, and Back returns to the thread', async () => {
@@ -490,7 +491,7 @@ for (const phone of [
       await pane.locator('.ib-att-t', { hasText: 'retry-policy.md' }).click();
       const view = page.locator('section.ib-view');
       await expect(view.getByText('Failed refunds are retried with exponential backoff')).toBeVisible();
-      await view.getByRole('button', { name: /^Next attachment/ }).click();
+      await view.getByRole('button', { name: /^Next file/ }).click();
       await expect(view.getByText('The on-call is paged once per refund')).toBeVisible();
       expect(await page.evaluate(() => (window.history.state as { ibFrom?: string } | null)?.ibFrom)).toBe(`#thread=${world.threads.attach}`);
       await view.getByRole('button', { name: 'Back to the thread' }).click();
@@ -633,20 +634,33 @@ for (const phone of [
       const toast = page.locator('[data-inbox-toast]');
       await expect(toast).toBeVisible();
       await expect(toast.getByRole('button', { name: 'Undo' })).toBeVisible();
+      // A phone's short form: "Read", no Reply (the foot has it), no Z hint.
+      await expect(toast.locator('.ib-tlead')).toHaveText('Read');
+      await expect(toast.getByRole('button')).toHaveCount(1);
+      await expect(toast.locator('kbd')).toHaveCount(0);
       await shot(page, '14-toast');
-      const [toastBox, footBox, lines] = await Promise.all([
+      const [toastBox, footBox, lines, undoTarget] = await Promise.all([
         toast.boundingBox(),
         pane.locator('.ib-pfoot').boundingBox(),
-        // The text's line boxes (one rect per line).
-        toast.locator('.ib-tline').evaluate((el) => {
+        // The text's line boxes: the lead and the detail sit on one baseline, so their tops lie within a
+        // few pixels of each other (a wrapped second line would start a whole line lower).
+        toast.locator('.ib-tsay').evaluate((el) => {
           const range = document.createRange();
           range.selectNodeContents(el);
-          return new Set([...range.getClientRects()].map((r) => Math.round(r.top))).size;
+          const tops = [...range.getClientRects()].map((r) => r.top);
+          return Math.max(...tops) - Math.min(...tops) < 8 ? 1 : 2;
+        }),
+        // Undo's hit area: the button grown by its ::after box.
+        toast.locator('[data-toast-undo]').evaluate((el) => {
+          const box = el.getBoundingClientRect();
+          const after = getComputedStyle(el, '::after');
+          return Math.min(box.height - parseFloat(after.top) - parseFloat(after.bottom), box.width - parseFloat(after.left) - parseFloat(after.right));
         }),
       ]);
       // One line (44 px, not the 171 px of three wrapped lines), clear of the foot.
       expect(toastBox!.height).toBeLessThanOrEqual(48);
       expect(lines).toBe(1);
+      expect(undoTarget).toBeGreaterThanOrEqual(44);
       expect(toastBox!.y + toastBox!.height).toBeLessThanOrEqual(footBox!.y);
       // The thread's banner says the rest; Undo puts it back.
       await expect(pane.locator('[data-read-line]')).toBeVisible();
@@ -707,7 +721,7 @@ for (const side of [
         expect(await overlaps(page, '[data-view-foot]', '.ib-stepbig, .ib-stepmid, .ib-rchip, .ib-vfoot-row .ib-sp, .ib-vfoot-row .ib-btn')).toEqual([]);
         expect(await smallTargets(page, '[data-view-foot] .ib-stepbig, [data-view-foot] .ib-stepmid, [data-view-foot] .ib-btn')).toEqual([]);
         // Previous and Next keep their names for a screen reader.
-        await expect(foot.getByRole('button', { name: /^Next attachment/ })).toBeVisible();
+        await expect(foot.getByRole('button', { name: /^Next file/ })).toBeVisible();
         await view.locator('[data-annotations-sheet]').click();
         const sheet = view.getByRole('region', { name: 'Comments' });
         await expect(sheet).toBeVisible();
@@ -758,7 +772,7 @@ for (const narrow of [
         expect(Math.abs(paneBox!.width - mainBox!.width)).toBeLessThan(2);
         await page.screenshot({ path: join(proofDir, `${tag}-2-thread.png`) });
         expect(await sideways(page)).toEqual([]);
-        expect(await overlaps(page, '.ib-sender', '.ib-mk, .ib-whobox, .ib-tm')).toEqual([]);
+        expect(await overlaps(page, '.ib-fline.ib-is-open', '.ib-mk, .ib-fl-nm, .ib-fl-meta, .ib-fl-tm')).toEqual([]);
         expect(await overlaps(page, '.ib-phead', '.ib-pback, .ib-hbtn, .ib-phsubj[data-on], .ib-ptool')).toEqual([]);
         expect(await cardFits(page)).toEqual([]);
         // A pick: the foot gains "Not sent" and the skip chip, and wraps rather than running past the pane.

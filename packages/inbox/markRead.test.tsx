@@ -3,7 +3,9 @@
  * "inbox-mark-read", approved 2026-10-11): the whole window (InboxApp) over a
  * REAL Inbox server in a temp data dir (its own process,
  * tests/helpers/inbox-dom-server.ts), the window's fetches carried to it over
- * loopback. What is proved: the reply box's skip chip and Keep open, the
+ * loopback. What is proved: the reply box's skip chip (Keep open by default
+ * for words alone, skip once the Send carries a pick: approval
+ * "inbox-words-only-reply"), the
  * header's Mark read button and its pressed "Read" state, `E` and `Z`, the
  * Undo toast, the warning (with Reply) when an agent is stopped on the
  * thread, the row's hover action, that the person's own action never
@@ -80,7 +82,7 @@ async function serverSection(threadId: string): Promise<string | undefined> {
   return model.sections.find((s) => s.threads.some((t) => t.thread_id === threadId))?.id;
 }
 
-const TESTS = 11;
+const TESTS = 15;
 
 beforeAll(async () => {
   if (!hasDom) return;
@@ -202,15 +204,18 @@ function type(el: HTMLElement, words: string) {
   });
 }
 
-test.skipIf(!hasDom)('the reply box says what a Send skips; a words-only Send skips them, and the row moves only after the thread is left', async () => {
+test.skipIf(!hasDom)('the reply box says what a Send does with the questions; switched to skip, a words-only Send skips them, and the row moves only after the thread is left', async () => {
   const el = await renderApp(`#thread=${ids.stopped}`);
   act(() => button(el, 'Reply').click());
   await settle();
+  // No pick in this Send: the questions stay open unless the person says otherwise.
   const chip = el.querySelector('[data-skip-chip]') as HTMLElement;
-  expect(chip.getAttribute('data-skip-chip')).toBe('skip');
-  expect(chip.textContent).toContain('2 unanswered questions will be skipped');
-  act(() => button(chip, 'Keep open').click());
-  expect(el.querySelector('[data-skip-chip]')?.textContent).toContain('2 unanswered questions stay open');
+  expect(chip.getAttribute('data-skip-chip')).toBe('keep');
+  expect(chip.textContent).toContain('2 unanswered questions stay open');
+  act(() => button(chip, 'Skip them').click());
+  expect(el.querySelector('[data-skip-chip]')?.textContent).toContain('2 unanswered questions will be skipped');
+  act(() => button(el.querySelector('[data-skip-chip]')!, 'Keep open').click());
+  expect(el.querySelector('[data-skip-chip]')?.getAttribute('data-skip-chip')).toBe('keep');
   act(() => button(el.querySelector('[data-skip-chip]')!, 'Skip them').click());
   expect(el.querySelector('[data-skip-chip]')?.getAttribute('data-skip-chip')).toBe('skip');
 
@@ -232,16 +237,42 @@ test.skipIf(!hasDom)('the reply box says what a Send skips; a words-only Send sk
   expect(order.indexOf('sent')).toBeGreaterThan(order.indexOf('waiting'));
 });
 
-test.skipIf(!hasDom)('Keep open: the Send leaves the questions open', async () => {
+test.skipIf(!hasDom)('words only: Keep open by default; the Send leaves the questions open and tells the agent so', async () => {
   const el = await renderApp(`#thread=${ids.stopped}`);
   act(() => button(el, 'Reply').click());
   await settle();
-  act(() => button(el.querySelector('[data-skip-chip]')!, 'Keep open').click());
   type(el, 'Thinking about it.');
+  expect(el.querySelector('[data-skip-chip]')?.getAttribute('data-skip-chip')).toBe('keep');
   act(() => button(el, 'Send').click());
   await until(() => el.querySelector('textarea') === null, 'the Send');
   expect(posted.find((p) => p.path.endsWith('/reply'))!.body.skip_unanswered).toBe(false);
   expect((await questionStates(ids.stopped)).map((q) => q.state)).toEqual(['open', 'open']);
+  const mine = await personMessages(ids.stopped);
+  expect(mine.map((m) => m.body)).toEqual([
+    "Thinking about it.\n\nNo questions answered yet; all 2 are still open. Don't re-ask them; the person will answer in the Inbox.",
+  ]);
+  // Nothing was answered: the thread still waits on the person.
+  expect(await serverSection(ids.stopped)).toBe('stopped');
+});
+
+test.skipIf(!hasDom)('a pick in the Send turns the default to skip; the person can still keep the rest open', async () => {
+  const el = await renderApp(`#thread=${ids.stopped}`);
+  act(() => button(el, 'Reply').click());
+  await settle();
+  expect(el.querySelector('[data-skip-chip]')?.getAttribute('data-skip-chip')).toBe('keep');
+  // Pick the first question's first choice.
+  act(() => (el.querySelector('fieldset[data-question-key] [data-question-option] input') as HTMLInputElement).click());
+  await settle();
+  await until(() => el.querySelector('[data-skip-chip]')?.getAttribute('data-skip-chip') === 'skip', 'the chip turned to skip');
+  expect(el.querySelector('[data-skip-chip]')?.textContent).toContain('1 unanswered question will be skipped');
+  act(() => button(el.querySelector('[data-skip-chip]')!, 'Keep open').click());
+  expect(el.querySelector('[data-skip-chip]')?.textContent).toContain('1 unanswered question stays open');
+  act(() => button(el, 'Send').click());
+  await until(() => el.querySelector('textarea') === null, 'the Send');
+  const reply = posted.find((p) => p.path.endsWith('/reply'))!;
+  expect(reply.body.skip_unanswered).toBe(false);
+  expect((reply.body.questions as unknown[]).length).toBe(1);
+  expect((await questionStates(ids.stopped)).map((q) => q.state)).toEqual(['sent', 'open']);
 });
 
 test.skipIf(!hasDom)('E marks the open thread read; a stopped thread warns with Reply; E is not taken while typing; Z undoes', async () => {
@@ -258,9 +289,12 @@ test.skipIf(!hasDom)('E marks the open thread read; a stopped thread warns with 
   expect(head().textContent).toContain('Read');
   expect(el.querySelector('[data-read-line]')?.textContent).toContain('2 questions were closed unanswered');
   const toast = document.querySelector('[data-inbox-toast]') as HTMLElement;
-  expect(toast.textContent).toContain('will move to Quiet');
-  expect(toast.textContent).toContain('Claude Code was stopped on it.');
+  expect(toast.querySelector('.ib-tlead')?.textContent).toBe('Marked read');
+  expect(toast.querySelector('.ib-tdetail')?.textContent).toBe('Claude Code was stopped');
   expect(toast.querySelector('[data-toast-reply]')).not.toBeNull();
+  // The window's live region says it once, as sentences (the toast itself is not a live region).
+  await until(() => document.querySelector('[data-inbox-live]')?.textContent === 'Marked read. Claude Code was stopped. Press Z to undo.', 'the live region');
+  expect(toast.getAttribute('role')).toBeNull();
   expect((await questionStates(ids.stopped)).map((q) => q.state)).toEqual(['closed', 'closed']);
   expect(await serverSection(ids.stopped)).toBe('quiet');
   // The row keeps its place while the thread is open.
@@ -280,6 +314,27 @@ test.skipIf(!hasDom)('E marks the open thread read; a stopped thread warns with 
   expect(head().getAttribute('aria-pressed')).toBe('false');
   expect(document.querySelector('[data-inbox-toast]')).toBeNull();
   expect((await questionStates(ids.stopped)).map((q) => q.state)).toEqual(['open', 'open']);
+});
+
+test.skipIf(!hasDom)('the header leads with Mark read; Archive sits beside the close at the right, with nothing between them', async () => {
+  // Owner, 2026-10-16: "the archive button needs to move next to the close button. Mark read should be the furthest."
+  const el = await renderApp(`#thread=${ids.stopped}`);
+  await until(() => el.querySelector('section.ib-pane .ib-phead [data-mark-read]') !== null, 'the header');
+  const head = el.querySelector('section.ib-pane .ib-phead')!;
+  const buttons = [...head.querySelectorAll('button')];
+  const markRead = head.querySelector('[data-mark-read]')!;
+  const archive = head.querySelector('[data-archive]')!;
+  const close = head.querySelector('button[aria-label="Close the thread"]');
+  // DOM order is the tab order: Mark read first, Archive then the close last.
+  expect(buttons[0]).toBe(markRead as HTMLButtonElement);
+  if (close) {
+    expect(buttons.at(-1)).toBe(close as HTMLButtonElement);
+    expect(archive.nextElementSibling).toBe(close);
+  } else {
+    expect(buttons.at(-1)).toBe(archive as HTMLButtonElement);
+  }
+  expect(archive.getAttribute('aria-label')).toBe('Archive the thread');
+  expect(head.querySelectorAll('.ib-vsep').length).toBe(0);
 });
 
 test.skipIf(!hasDom)('the pressed button moves it back; the toast Undo does the same', async () => {
@@ -308,12 +363,42 @@ test.skipIf(!hasDom)('the row hover action marks read without opening the thread
   expect(el.querySelector('[data-section-id="quiet"] .ib-n')?.textContent).toBe('1');
   // A plain toast: no warning, no Reply.
   const toast = document.querySelector('[data-inbox-toast]') as HTMLElement;
-  expect(toast.textContent).toContain('It comes back when Claude Code writes again.');
+  expect(toast.textContent).toContain('Moved to Quiet');
   expect(toast.querySelector('[data-toast-reply]')).toBeNull();
   // Quiet is folded: open it, and the row says why it is there, with no action of its own.
   act(() => (el.querySelector('[data-section-id="quiet"] .ib-band') as HTMLButtonElement).click());
   expect(el.querySelector(`[data-row="${ids.waiting}"] .ib-c`)?.textContent).toBe('Read');
   expect(el.querySelector(`[data-row="${ids.waiting}"] [data-row-mark-read]`)).toBeNull();
+});
+
+test.skipIf(!hasDom)('with another thread open, marking a row read names that row, never words that read as the open thread', async () => {
+  const el = await renderApp(`#thread=${ids.stopped}`);
+  await until(() => el.querySelector(`[data-row="${ids.waiting}"] [data-row-mark-read]`) !== null, 'the row action');
+  // The row action names its row: "Mark read: <subject>".
+  const subject = el.querySelector(`[data-row="${ids.waiting}"] [data-row-mark-read]`)?.getAttribute('aria-label')?.replace(/^Mark read: /, '');
+  expect(subject).toBeTruthy();
+  const toastSays = () => {
+    const toast = document.querySelector('[data-inbox-toast]');
+    return toast ? [toast.querySelector('.ib-tlead')?.textContent, toast.querySelector('.ib-tdetail')?.textContent] : null;
+  };
+
+  // The row's hover action.
+  act(() => (el.querySelector(`[data-row="${ids.waiting}"] [data-row-mark-read]`) as HTMLButtonElement).click());
+  await until(() => toastSays() !== null, 'the toast');
+  expect(posted.at(-1)!.path).toBe(`/api/inbox/threads/${ids.waiting}/read`);
+  expect(toastSays()).toEqual(['Marked read', `“${subject}”`]);
+  // The open thread was not marked.
+  expect((el.querySelector('[data-mark-read]') as HTMLButtonElement).getAttribute('aria-pressed')).toBe('false');
+  press('z');
+  await until(() => posted.at(-1)!.path === `/api/inbox/threads/${ids.waiting}/unread` && toastSays() === null, 'Undo');
+
+  // E on the row the keyboard is on says the same.
+  const rowButton = el.querySelector(`.ib-listcol [data-row="${ids.waiting}"] button:not([data-row-mark-read])`) as HTMLButtonElement;
+  act(() => rowButton.focus());
+  press('e', rowButton);
+  await until(() => toastSays() !== null, 'the toast after E');
+  expect(posted.at(-1)!.path).toBe(`/api/inbox/threads/${ids.waiting}/read`);
+  expect(toastSays()).toEqual(['Marked read', `“${subject}”`]);
 });
 
 test.skipIf(!hasDom)("the warning toast's Reply moves the thread back and opens the reply box", async () => {
@@ -331,6 +416,7 @@ test.skipIf(!hasDom)('session A asked, session B posted a later update: the skip
   const el = await renderApp(`#thread=${ids.mixed}`);
   act(() => button(el, 'Reply').click());
   await settle();
+  act(() => button(el.querySelector('[data-skip-chip]')!, 'Skip it').click());
   type(el, 'Thanks, carry on.');
   act(() => button(el, 'Send').click());
   await until(() => el.querySelector('textarea') === null, 'the Send');
@@ -349,10 +435,12 @@ type ThreadMessages = { thread: { messages: { id: string; author: { kind: string
 const personMessages = async (threadId: string) =>
   (await api<ThreadMessages>(`/api/inbox/threads/${threadId}`)).thread.messages.filter((m) => m.author.kind === 'person');
 
-test.skipIf(!hasDom)('one session asked, then posted a later update: a words-only Send is ONE reply, carrying the skip and the words', async () => {
+test.skipIf(!hasDom)('one session asked, then posted a later update: a words-only Send switched to skip is ONE reply, carrying the skip and the words', async () => {
   const el = await renderApp(`#thread=${ids.same}`);
   act(() => button(el, 'Reply').click());
   await settle();
+  expect(el.querySelector('[data-skip-chip]')?.textContent).toContain('1 unanswered question stays open');
+  act(() => button(el.querySelector('[data-skip-chip]')!, 'Skip it').click());
   expect(el.querySelector('[data-skip-chip]')?.textContent).toContain('1 unanswered question will be skipped');
   type(el, 'Ship it as it is.');
   act(() => button(el, 'Send').click());
@@ -382,11 +470,11 @@ test.skipIf(!hasDom)('one session, a pick waiting: a picks-only Send is one repl
   expect((await questionStates(ids.picked)).map((q) => q.state)).toEqual(['sent']);
 });
 
-test.skipIf(!hasDom)('one session, Keep open: the words alone go to the latest message, the question stays open', async () => {
+test.skipIf(!hasDom)('one session, words only (Keep open by default): the words alone go to the latest message, the question stays open', async () => {
   const el = await renderApp(`#thread=${ids.same}`);
   act(() => button(el, 'Reply').click());
   await settle();
-  act(() => button(el.querySelector('[data-skip-chip]')!, 'Keep open').click());
+  expect(el.querySelector('[data-skip-chip]')?.getAttribute('data-skip-chip')).toBe('keep');
   type(el, 'Still deciding.');
   act(() => button(el, 'Send').click());
   await until(() => el.querySelector('textarea') === null, 'the Send');
@@ -394,6 +482,26 @@ test.skipIf(!hasDom)('one session, Keep open: the words alone go to the latest m
   expect(replies.map((p) => p.path)).toEqual([`/api/inbox/messages/${ids.sameUpdate}/reply`]);
   expect(replies[0]!.body).toMatchObject({ words: 'Still deciding.', questions: [], skip_unanswered: false });
   expect((await questionStates(ids.same)).map((q) => q.state)).toEqual(['open']);
+  // The reply the session gets (on its update) still says its question is open.
+  const mine = await personMessages(ids.same);
+  expect(mine.map((m) => [m.reply_to, m.body])).toEqual([
+    [ids.sameUpdate, "Still deciding.\n\nNo question answered yet; it is still open. Don't re-ask it; the person will answer in the Inbox."],
+  ]);
+});
+
+test.skipIf(!hasDom)('two sessions, words only (Keep open by default): the words go to B, and B is told nothing about A\'s questions', async () => {
+  const el = await renderApp(`#thread=${ids.mixed}`);
+  act(() => button(el, 'Reply').click());
+  await settle();
+  expect(el.querySelector('[data-skip-chip]')?.getAttribute('data-skip-chip')).toBe('keep');
+  type(el, 'Thanks, carry on.');
+  act(() => button(el, 'Send').click());
+  await until(() => el.querySelector('textarea') === null, 'the Send');
+  const replies = posted.filter((p) => p.path.endsWith('/reply'));
+  expect(replies.map((p) => p.path)).toEqual([`/api/inbox/messages/${ids.update}/reply`]);
+  const mine = await personMessages(ids.mixed);
+  expect(mine.map((m) => [m.reply_to, m.body])).toEqual([[ids.update, 'Thanks, carry on.']]);
+  expect((await questionStates(ids.mixed)).map((q) => q.state)).toEqual(['open']);
 });
 
 test.skipIf(!hasDom)('with a file open beside the thread, E stands down in the viewer and on the page; aimed at the thread it still marks read', async () => {

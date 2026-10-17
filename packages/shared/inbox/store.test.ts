@@ -23,11 +23,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { questionKey, type QuestionAnswer } from "@plannotator/core/question-block";
 import { parseInboxQuestionBlocks } from "@plannotator/core/inbox-questions";
-import { INBOX_SECTIONS, inboxThreadNameKey, type InboxListRow, type InboxListSection, type InboxSectionId } from "@plannotator/core/inbox-types";
+import { INBOX_SECTIONS, inboxRowOffersMarkRead, inboxThreadNameKey, type InboxListRow, type InboxListSection, type InboxSectionId } from "@plannotator/core/inbox-types";
 // The sidebar's counts and the decisions the Send route records, from the code that computes them.
 import { waitingCount } from "../../inbox/held";
 import { recordDecisionsForReply, waitingDecisionCount } from "../../server/inbox-decisions";
 import { inboxArchivedRows, inboxListSections, inboxRowArchived } from "./list";
+import { archiveProject, markProjectRead, unarchiveProject, unmarkProjectRead } from "./project-batch";
 import { InboxError, parseInboxLine } from "./schema";
 import { InboxStore } from "./store";
 
@@ -111,7 +112,16 @@ type Op =
   // An agent read the thread (read_thread, or wait_for_reply handed it the reply).
   | { op: "agentRead"; target: number }
   // The Undo window passed: the server tells the asking agent what a Mark read set aside.
-  | { op: "tell"; target: number };
+  | { op: "tell"; target: number }
+  // The person starts a thread addressed to a live session (compose, POST /api/inbox/messages).
+  | { op: "personStart"; root: number; key: string; session: string; body: string }
+  // The addressed session's connection delivered what the person sent it in the thread (bridge `delivered`).
+  | { op: "deliver"; target: number }
+  // 👍 Looks good on a message, or its Undo (POST /api/inbox/messages/:id/ack): silent, and a Mark read.
+  | { op: "ack"; target: number; on: boolean };
+
+/** What the person writes when they start a thread (compose). */
+const PERSON_BODIES = ["Idea: group the list by session.", "Add a retry budget to the relay."] as const;
 
 const opArb: fc.Arbitrary<Op> = fc.oneof(
   fc.record({ op: fc.constant("send" as const), root: fc.nat(2), body: bodyArb, key: fc.option(fc.constantFrom("a", "b", "c"), { nil: null }) }),
@@ -125,14 +135,26 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
   fc.record({ op: fc.constant("read" as const), target: fc.nat(), read: fc.boolean() }),
   fc.record({ op: fc.constant("agentRead" as const), target: fc.nat() }),
   fc.record({ op: fc.constant("tell" as const), target: fc.nat() }),
+  fc.record({
+    op: fc.constant("personStart" as const),
+    root: fc.nat(2),
+    key: fc.constantFrom("p1", "p2", "p3"),
+    session: fc.constantFrom("ses_a", "ses_b"),
+    body: fc.constantFrom(...PERSON_BODIES),
+  }),
+  fc.record({ op: fc.constant("deliver" as const), target: fc.nat() }),
+  fc.record({ op: fc.constant("ack" as const), target: fc.nat(), on: fc.boolean() }),
 );
 
 /** What one op did: wrote, wrote nothing (no target, or no question to pick), replayed a key, or was refused with a code. */
 type Outcome = "ok" | "noop" | "replayed" | `refused:${string}`;
 
-/** The message an op aims at (every op but `send`): the n-th message an agent wrote, wrapping. */
+/**
+ * The message an op aims at (every op but `send` and `personStart`): the n-th
+ * message an agent wrote or the person started a thread with, wrapping.
+ */
 function targetOf(op: Op, messageIds: readonly string[]): string | undefined {
-  return op.op === "send" ? undefined : messageIds[op.target % Math.max(1, messageIds.length)];
+  return op.op === "send" || op.op === "personStart" ? undefined : messageIds[op.target % Math.max(1, messageIds.length)];
 }
 
 /**
@@ -230,6 +252,23 @@ function run(store: InboxStore, op: Op, messageIds: string[]): Outcome {
       case "tell":
         if (!target) return "noop";
         store.tellSetAside(threadOf(target), 0);
+        return "ok";
+      case "personStart": {
+        const project = store.ensureProject({ name: `repo${op.root}`, root: `/work/repo${op.root}` });
+        const result = store.startPersonThread({ project_id: project.id, body: op.body, to: { host: "test", session: op.session }, idempotency_key: op.key });
+        if (result.replayed) return "replayed";
+        messageIds.push(result.message.id);
+        return "ok";
+      }
+      case "deliver": {
+        if (!target) return "noop";
+        const waiting = store.thread(threadOf(target))!.messages.filter((m) => m.author.kind === "person" && m.to && !m.delivery);
+        for (const message of waiting) store.recordDelivery(message.id, message.to!);
+        return waiting.length > 0 ? "ok" : "noop";
+      }
+      case "ack":
+        if (!target) return "noop";
+        store.ackMessage(target, op.on);
         return "ok";
     }
   } catch (error) {
@@ -413,7 +452,9 @@ describe("InboxStore invariants", () => {
       | { op: "reply"; target: number; session: string | null; thread: string | null }
       | { op: "resolve"; target: number; resolved: boolean }
       | { op: "seen"; target: number }
-      | { op: "personReply"; target: number; key: string };
+      | { op: "personReply"; target: number; key: string }
+      | { op: "personStart"; project: number; key: string; session: string; name: string | null; auto: boolean }
+      | { op: "name"; target: number; session: string; thread: string };
     const routeOpArb: fc.Arbitrary<RouteOp> = fc.oneof(
       {
         arbitrary: fc.record({
@@ -430,6 +471,19 @@ describe("InboxStore invariants", () => {
       { arbitrary: fc.record({ op: fc.constant("resolve" as const), target: fc.nat(), resolved: fc.boolean() }), weight: 2 },
       fc.record({ op: fc.constant("seen" as const), target: fc.nat() }),
       fc.record({ op: fc.constant("personReply" as const), target: fc.nat(), key: fc.constantFrom("p1", "p2", "p3") }),
+      // A thread the person starts (compose): it must never become a session's default thread.
+      // It may carry a name the person gave (compose), which routes named sends to it.
+      fc.record({
+        op: fc.constant("personStart" as const),
+        project: fc.nat(1),
+        key: fc.constantFrom("c1", "c2", "c3"),
+        session: fc.constantFrom("ses_a", "ses_b"),
+        name: fc.constantFrom(null, null, "alpha", "BETA"),
+        // Compose's suggestion (thread_name_auto): dropped when taken, and an agent's name replaces it.
+        auto: fc.boolean(),
+      }),
+      // An agent's reply that names a thread the person started (approval "inbox-agent-names-own-thread").
+      fc.record({ op: fc.constant("name" as const), target: fc.nat(), session: fc.constantFrom("ses_a", "ses_b"), thread: fc.constantFrom("alpha", "Beta", "gamma") }),
     );
 
     fc.assert(
@@ -467,6 +521,21 @@ describe("InboxStore invariants", () => {
             } else if (op.op === "seen") {
               const target = pick(op.target);
               if (target) store.markSeen(store.message(target)!.thread_id);
+            } else if (op.op === "personStart") {
+              const project = store.ensureProject({ name: `repo${op.project}`, root: `/work/repo${op.project}` });
+              const r = store.startPersonThread({ project_id: project.id, body: "an idea", to: { host: "test", session: op.session }, idempotency_key: op.key, thread_name: op.name, thread_name_auto: op.auto });
+              if (!r.replayed) ids.push(r.message.id);
+            } else if (op.op === "name") {
+              const target = pick(op.target);
+              if (!target) continue;
+              const r = store.sendMessage({
+                project_id: store.message(target)!.project_id,
+                author: { kind: "agent", host: "test", session: op.session, name: null },
+                body: "named",
+                reply_to: target,
+                thread: op.thread,
+              });
+              ids.push(r.message.id);
             } else {
               const target = pick(op.target);
               if (target) store.sendReply(target, { words: "ok", idempotency_key: op.key });
@@ -484,24 +553,43 @@ describe("InboxStore invariants", () => {
         const bySession = new Map<string, string>();
         // Every root of a name, oldest first: a name joins its newest OPEN one.
         const byName = new Map<string, string[]>();
+        // Each root's name now (an agent's name replaces compose's suggestion). Only agent-started roots and
+        // roots an AGENT named route by name; a compose name (typed or suggested) is only "taken".
+        const current = new Map<string, string>();
+        const agentNamed = new Set<string>();
         const nameKey = inboxThreadNameKey;
+        const rootsNamed = (key: string) => (byName.get(key) ?? []).filter((root) => current.get(root) === key);
+        const holders = (key: string) => [...current].filter(([, k]) => k === key).map(([root]) => root);
         for (const line of lines) {
           if (line.kind !== "message") continue;
           const m = line.record;
           if (threadOf.has(m.id)) {
             if (m.id === m.thread_id) resolved.set(m.id, m.resolved_at !== null);
+            // A thread the person started gains a name when an agent names it: from that line on, the name routes to it.
+            if (m.id === m.thread_id && m.started_by_person && m.thread_name != null && m.named_by?.kind === "agent" && !agentNamed.has(m.id)) {
+              const key = `${m.project_id}\0${nameKey(m.thread_name)}`;
+              // Only compose's suggestion is ever replaced, and only by an agent's name.
+              if (current.has(m.id)) expect(m.named_by?.kind).toBe("agent");
+              // Naming never takes a name another open thread has (it would pull that thread's sends in).
+              expect(holders(key).filter((root) => root !== m.id && !resolved.get(root))).toEqual([]);
+              current.set(m.id, key);
+              agentNamed.add(m.id);
+              byName.set(key, [...(byName.get(key) ?? []), m.id]);
+            }
             continue;
           }
           let expected: string;
           if (m.reply_to) {
             expected = threadOf.get(m.reply_to)!;
           } else if (m.author.kind === "person") {
-            throw new Error("a person's message always replies");
+            // Only a thread the person started has no reply_to: it is its own root.
+            expect(m.started_by_person).toBe(true);
+            expected = m.id;
           } else {
             const name = m.thread_name ?? null;
             const candidate =
               name !== null
-                ? (byName.get(`${m.project_id}\0${nameKey(name)}`) ?? []).filter((root) => !resolved.get(root)).at(-1)
+                ? rootsNamed(`${m.project_id}\0${nameKey(name)}`).filter((root) => !resolved.get(root)).at(-1)
                 : m.author.session
                   ? bySession.get(`${m.project_id}\0${m.author.session}`)
                   : undefined;
@@ -513,6 +601,11 @@ describe("InboxStore invariants", () => {
             resolved.set(m.id, m.resolved_at !== null);
             if (m.thread_name != null) {
               const key = `${m.project_id}\0${nameKey(m.thread_name)}`;
+              // A name the person gave in compose (or compose's suggestion) is never one another open thread has,
+              // and it routes nothing.
+              if (m.started_by_person) expect(holders(key).filter((root) => !resolved.get(root))).toEqual([]);
+              current.set(m.id, key);
+              if (m.started_by_person) continue;
               byName.set(key, [...(byName.get(key) ?? []), m.id]);
             }
             else if (m.author.kind === "agent" && m.author.session) bySession.set(`${m.project_id}\0${m.author.session}`, m.id);
@@ -659,6 +752,25 @@ function stateOpArbOf(body: fc.Arbitrary<string>, agentKeys: boolean): fc.Arbitr
     { arbitrary: fc.record({ op: fc.constant("resolve" as const), target: fc.nat(), resolved: fc.boolean() }), weight: 3 },
     { arbitrary: fc.record({ op: fc.constant("agentRead" as const), target: fc.nat() }), weight: 2 },
     { arbitrary: fc.record({ op: fc.constant("tell" as const), target: fc.nat() }), weight: 2 },
+    // Threads the person starts and their delivery, in the property runs only
+    // (the generated trace fixtures were drawn without them).
+    ...(agentKeys
+      ? [
+          {
+            arbitrary: fc.record({
+              op: fc.constant("personStart" as const),
+              root: fc.nat(1),
+              key: fc.constantFrom("p1", "p2", "p3"),
+              session: fc.constantFrom("ses_a", "ses_b"),
+              body: fc.constantFrom(...PERSON_BODIES),
+            }),
+            weight: 1,
+          },
+          { arbitrary: fc.record({ op: fc.constant("deliver" as const), target: fc.nat() }), weight: 1 },
+          // 👍 Looks good and its Undo, in the property runs only (the trace fixtures were drawn without it).
+          { arbitrary: fc.record({ op: fc.constant("ack" as const), target: fc.nat(), on: fc.boolean() }), weight: 2 },
+        ]
+      : []),
   );
 }
 
@@ -696,6 +808,10 @@ interface ModelMessage {
   questions: ModelQuestion[];
   /** The person's Send keys on this message (a replayed key writes nothing). */
   replyKeys: Set<string>;
+  /** A thread the person started: addressed to a session, until that session's connection delivers it. */
+  addressed?: { delivered: boolean };
+  /** The person's 👍 on this agent message: the step of the Mark read it stands on, and whether the 👍 made it. */
+  ack?: { readTick: number | null; made: boolean } | null;
 }
 
 interface ModelThread {
@@ -724,6 +840,8 @@ class ThreadStateModel {
   private readonly byMessage = new Map<string, { thread: ModelThread; message: ModelMessage }>();
   /** An agent's idempotency key per project, and the body it was first sent with. */
   private readonly keyed = new Map<string, string>();
+  /** The person's compose keys (one namespace across projects), and the body each first sent. */
+  private readonly personKeyed = new Map<string, string>();
   /** The newest unnamed thread each agent session started, per project. */
   private readonly sessionRoots = new Map<string, string>();
   private created: readonly string[] = [];
@@ -919,6 +1037,22 @@ class ThreadStateModel {
   }
 
   private event(op: Op, target: string | undefined, store: InboxStore, tick: number): Outcome {
+    if (op.op === "personStart") {
+      // Compose: a new thread, the person's root, addressed to a session. It
+      // is no session's default thread, so routing never joins it.
+      const body = this.personKeyed.get(op.key);
+      if (body !== undefined) return body === op.body ? "replayed" : "refused:idempotency_key_reused";
+      const id = this.created[this.used]!;
+      const thread: ModelThread = { id, messages: [], seen: 0, read: null, seenBeforeRead: undefined, resolved: false, archive: 0, checked: 0, told: new Set() };
+      this.threads.set(id, thread);
+      this.addPerson(thread, tick, null);
+      const root = thread.messages[0]!;
+      root.addressed = { delivered: false };
+      // An op can aim at it, as at an agent message.
+      this.agentMessages.push(root);
+      this.personKeyed.set(op.key, op.body);
+      return "ok";
+    }
     if (op.op === "send") {
       const project = `repo${op.root}`;
       const key = op.key?.trim() || null;
@@ -989,6 +1123,9 @@ class ThreadStateModel {
         }
         message.replyKeys.add(op.key);
         this.addPerson(thread, tick, null);
+        // More words on the person's own root (a thread they started) go where
+        // it is addressed: the store stamps its `to`, so only a delivery settles them.
+        if (message.addressed) thread.messages[thread.messages.length - 1]!.addressed = { delivered: false };
         return "ok";
       }
       case "resolve":
@@ -1044,6 +1181,8 @@ class ThreadStateModel {
         const own = (q: ModelQuestion) => q.setAside !== null && q.setAside.by === ownRead;
         const closed = live.flatMap((m) => m.questions).filter(own);
         if (ownRead === null && closed.length === 0) return "ok";
+        // Move back withdraws a 👍 standing on this Mark read.
+        if (ownRead !== null) for (const m of thread.messages) if (m.ack && m.ack.readTick === ownRead) m.ack = null;
         if (ownRead !== null) {
           if (this.readHolds(thread) && thread.seenBeforeRead !== undefined) thread.seen = thread.seenBeforeRead;
           thread.read = null;
@@ -1082,6 +1221,49 @@ class ThreadStateModel {
           for (const q of qs) thread.told.add(q.id);
         }
         return "ok";
+      case "deliver": {
+        // A delivery counts as the agent having read the thread up to that message.
+        const waiting = thread.messages.filter((m) => m.addressed && !m.addressed.delivered);
+        for (const m of waiting) {
+          m.addressed!.delivered = true;
+          thread.checked = Math.max(thread.checked, m.tick);
+        }
+        return waiting.length > 0 ? "ok" : "noop";
+      }
+      case "ack": {
+        if (!op.on) {
+          const ack = message.ack;
+          if (!ack) return "ok";
+          message.ack = null;
+          // Undo the Mark read the ack made, while it is still the thread's.
+          if (ack.made && ack.readTick !== null && thread.read === ack.readTick && !thread.resolved) {
+            this.event({ op: "read", target: op.target, read: false }, target, store, tick);
+          }
+          return "ok";
+        }
+        if (message.author !== "agent") return "refused:ack_not_allowed";
+        if (thread.resolved) return "refused:thread_resolved";
+        const latest = [...thread.messages].reverse().find((m) => m.author === "agent");
+        if (latest !== message) return "refused:ack_stale";
+        // The person already wrote back after it (the Inbox's own notes aside).
+        if (thread.messages.some((m) => m.tick > message.tick && m.author === "person" && m.note === null)) return "refused:ack_after_reply";
+        const waiting = thread.messages
+          .filter((m) => m.author === "agent")
+          .flatMap((m) => m.questions)
+          .some((q) => {
+            const s = this.recordState(q);
+            return s === "open" || s === "picked";
+          });
+        if (waiting) return "refused:question_open";
+        if (message.ack) return "ok";
+        const before = thread.read;
+        this.event({ op: "read", target: op.target, read: true }, target, store, tick);
+        message.ack = { readTick: thread.read, made: thread.read !== before };
+        return "ok";
+      }
+      case "personStart":
+      case "send":
+        return "noop";
     }
   }
 }
@@ -1117,6 +1299,8 @@ interface StateWorld {
   timeOf: Map<number, number>;
   /** The last successful Mark read, for the Mark read then Undo check. */
   lastRead: { threadId: string; before: ReturnType<typeof readSnapshot> } | null;
+  /** The last successful 👍 that made a Mark read, for the 👍 then Undo check. */
+  lastAck?: { threadId: string; before: ReturnType<typeof readSnapshot> } | null;
   /** Rows the tie-break ordered: equal `last_at` in a section, equal `resolved_at` in the archived list. */
   ties: { sections: number; archived: number };
 }
@@ -1199,6 +1383,7 @@ function checkThreadState(world: StateWorld): void {
       last_agent_at: row.last_agent_at ?? null,
       waiting_on_person: row.waiting_on_person,
       messages: row.message_count,
+      ack: (row.ack ?? null) !== null,
     }).toEqual({
       section: model.section(t),
       archived: model.archived(t),
@@ -1210,6 +1395,7 @@ function checkThreadState(world: StateWorld): void {
       last_agent_at: lastAgent ? new Date(world.timeOf.get(lastAgent.tick)!).toISOString() : null,
       waiting_on_person: model.waitingOnPerson(t),
       messages: t.messages.length,
+      ack: model.readHolds(t) && (lastAgent?.ack ?? null) !== null,
     });
     // ...on where each message landed and on every question's state.
     for (const m of t.messages) {
@@ -1278,6 +1464,8 @@ function stateStep(world: StateWorld, op: Op, sameTick = false): StepResult {
 
   const lastRead = world.lastRead;
   world.lastRead = null;
+  const lastAck = world.lastAck ?? null;
+  world.lastAck = null;
   if (outcome !== "ok" || !thread) return { outcome, target, created };
   const row = world.store.listRow(thread.id)!;
   const inList = () => placedIds(listViews(world.store.listRows()).exclude).includes(thread.id);
@@ -1311,6 +1499,14 @@ function stateStep(world: StateWorld, op: Op, sameTick = false): StepResult {
     // Mark read then Undo, back to back, gives the thread back exactly as it was.
     if (lastRead?.threadId === thread.id) expect(readSnapshot(world, thread.id)).toEqual(lastRead.before);
   }
+  if (op.op === "ack" && op.on && readBefore && readBefore.read_at === null) {
+    // 👍 then its Undo, back to back, gives the thread back exactly as it was (as Mark read's does).
+    world.lastAck = { threadId: thread.id, before: readBefore };
+  }
+  if (op.op === "ack" && !op.on) {
+    expect(world.store.message(target!)!.ack ?? null).toBeNull();
+    if (lastAck?.threadId === thread.id) expect(readSnapshot(world, thread.id)).toEqual(lastAck.before);
+  }
   if (op.op === "resolve" && !op.resolved && readAfterArchive) {
     // Unarchive clears a read made while archived, in the same root line.
     expect(world.store.message(thread.id)!.person_read_seq ?? null).toBeNull();
@@ -1337,6 +1533,38 @@ describe("the thread-state model", () => {
     );
     // The sections' tie-break on the thread id was exercised, not only defined.
     expect(ties.sections).toBeGreaterThan(0);
+  });
+
+  test("a message's images captured on first read (one more line for it) change nothing the model sees, and replay the same", () => {
+    fc.assert(
+      fc.property(fc.array(fc.tuple(stateOpArb, fc.nat(4)), { minLength: 15, maxLength: 40, size: "max" }), (steps) => {
+        const world = stateWorld();
+        let captures = 0;
+        for (const [op, roll] of steps) {
+          stateStep(world, op);
+          if (roll !== 0) continue;
+          // The first read of a thread whose agent message was sent before capture existed.
+          const message = world.ids.map((id) => world.store.message(id)!).find((m) => m.author.kind === "agent" && m.inline_images === undefined);
+          if (!message) continue;
+          const rows = JSON.stringify(world.store.listRows());
+          const cursor = world.store.messageCursor(message.id);
+          const image = { id: `att_${"0".repeat(25)}${captures % 10}`, path: "/p/a.png", named_path: null, name: "a.png", kind: "image" as const, sent_sha256: "a".repeat(64), size: 1, sent_at: message.created_at, sent_mtime: message.created_at, ref: "a.png", captured: "on_open" as const };
+          world.store.addCapturedImages(message.id, [image]);
+          captures += 1;
+          // Written once; the message keeps its place and every row reads the same.
+          expect(world.store.message(message.id)!.inline_images).toHaveLength(1);
+          world.store.addCapturedImages(message.id, []);
+          expect(world.store.message(message.id)!.inline_images).toHaveLength(1);
+          expect(world.store.messageCursor(message.id)).toBe(cursor);
+          expect(JSON.stringify(world.store.listRows())).toBe(rows);
+        }
+        // Read back from disk: the same view, the captures included.
+        const reopened = InboxStore.open(world.dir);
+        expect(JSON.stringify(reopened.listRows())).toBe(JSON.stringify(world.store.listRows()));
+        for (const id of world.ids) expect(reopened.message(id)).toEqual(world.store.message(id));
+      }),
+      { numRuns: 120, seed: 20261015 },
+    );
   });
 
   test("the archived list breaks ties on the thread id: every open thread archived in one clock tick", () => {
@@ -1396,6 +1624,167 @@ describe("the thread-state model", () => {
   });
 });
 
+// ─────────────────────────── the project menu's batches ───────────────────────────
+//
+// Mark all as read and Archive all (packages/shared/inbox/project-batch.ts)
+// are loops over the single actions. The model decides on its own which
+// threads each takes (Mark all: every listed thread waiting on the person;
+// Archive all: every listed thread, Mark read for one that came back), then
+// applies the single rules thread by thread; the store runs the real batch.
+// Every invariant holds after every batch and every Undo, between generated
+// steps, and a batch undone back to back gives the project back as it was.
+
+type BatchItem =
+  | { kind: "op"; op: Op }
+  | { kind: "batch"; action: "read" | "archive"; root: number }
+  // The Undo of the last batch, whatever happened since.
+  | { kind: "undo" };
+
+const batchItemArb: fc.Arbitrary<BatchItem> = fc.oneof(
+  { arbitrary: stateOpArb.map((op) => ({ kind: "op" as const, op })), weight: 8 },
+  { arbitrary: fc.record({ kind: fc.constant("batch" as const), action: fc.constantFrom("read" as const, "archive" as const), root: fc.nat(1) }), weight: 2 },
+  { arbitrary: fc.constant({ kind: "undo" as const }), weight: 1 },
+);
+
+interface BatchDone {
+  projectId: string;
+  action: "read" | "archive";
+  read: string[];
+  resolved: string[];
+}
+
+/** Each thread of the project, as the store's routing placed it (the model checks routing step by step). */
+function modelThreadsOf(world: StateWorld, projectId: string): ModelThread[] {
+  return [...world.model.threads.values()].filter((t) => world.store.message(t.id)!.project_id === projectId);
+}
+
+/** A project's rows as a batch then its Undo must give them back (revisions move; nothing else may). */
+function projectSnapshot(world: StateWorld, projectId: string) {
+  return world.store
+    .listRows({ projectId })
+    .map((row) => ({ id: row.thread_id, resolved: row.resolved_at !== null, back: row.back_from_archive === true, ...readSnapshot(world, row.thread_id) }));
+}
+
+/** Apply one thread's single action to the model, with the messages the store wrote for that thread. */
+function modelSingle(world: StateWorld, op: Op, threadId: string, created: readonly string[], tick: number): void {
+  const mine = created.filter((id) => world.store.message(id)!.thread_id === threadId);
+  expect(world.model.apply(op, threadId, mine, world.store, tick)).toBe("ok");
+}
+
+function batchStep(world: StateWorld, item: Exclude<BatchItem, { kind: "op" }>, last: BatchDone | null): BatchDone | null {
+  const tick = ++world.tick;
+  world.clock.now += STATE_STEP_MS;
+  world.timeOf.set(tick, world.clock.now);
+  world.lastRead = null;
+  const created: string[] = [];
+  const stop = world.store.subscribe((line) => {
+    if (line.kind === "message" && world.store.messageCursor(line.id) === line.seq) created.push(line.id);
+  });
+  let done: BatchDone | null = null;
+  // What the model must skip on Undo: a thread the single action now refuses (archived, and no agent wrote after the line).
+  const refusesUnread = (id: string) => {
+    const t = world.model.threads.get(id)!;
+    return t.resolved && !world.model.agentAfter(t);
+  };
+  const skipRead = item.kind === "undo" && last ? new Set(last.read.filter(refusesUnread)) : new Set<string>();
+  try {
+    if (item.kind === "undo") {
+      if (!last) return null;
+      if (last.action === "read") {
+        expect(new Set(unmarkProjectRead(world.store, last.projectId, last.read).skipped)).toEqual(skipRead);
+      } else {
+        const result = unarchiveProject(world.store, last.projectId, { resolved: last.resolved, read: last.read });
+        expect(new Set(result.skipped)).toEqual(skipRead);
+      }
+    } else {
+      const project = world.store.listProjects().find((p) => p.name === `repo${item.root}`);
+      if (!project) return null;
+      if (item.action === "read") done = { projectId: project.id, action: "read", resolved: [], ...markProjectRead(world.store, project.id) };
+      else done = { projectId: project.id, action: "archive", ...archiveProject(world.store, project.id) };
+    }
+  } finally {
+    stop();
+  }
+
+  if (item.kind === "undo") {
+    // The model, thread by thread, in the order the store wrote (resolved before read).
+    for (const id of last!.resolved) modelSingle(world, { op: "resolve", target: 0, resolved: false }, id, created, tick);
+    for (const id of last!.read) if (!skipRead.has(id)) modelSingle(world, { op: "read", target: 0, read: false }, id, created, tick);
+  } else {
+    // The model decides which threads the batch takes, by its own rules.
+    const threads = modelThreadsOf(world, done!.projectId).filter((t) => !world.model.archived(t));
+    if (item.action === "read") {
+      const waits = threads.filter((t) => SHWN.includes(world.model.section(t))).map((t) => t.id);
+      expect(new Set(done!.read)).toEqual(new Set(waits));
+      for (const id of done!.read) modelSingle(world, { op: "read", target: 0, read: true }, id, created, tick);
+    } else {
+      expect(new Set(done!.resolved)).toEqual(new Set(threads.filter((t) => !t.resolved).map((t) => t.id)));
+      expect(new Set(done!.read)).toEqual(new Set(threads.filter((t) => t.resolved).map((t) => t.id)));
+      for (const id of done!.resolved) modelSingle(world, { op: "resolve", target: 0, resolved: true }, id, created, tick);
+      for (const id of done!.read) modelSingle(world, { op: "read", target: 0, read: true }, id, created, tick);
+    }
+    // A batch never writes a message (the set-aside notes go later, thread by thread).
+    expect(created).toEqual([]);
+  }
+  checkThreadState(world);
+  if (done) {
+    const rows = world.store.listRows({ projectId: done.projectId });
+    // Mark all as read leaves nothing waiting on the person; Archive all leaves nothing listed (the project hides).
+    if (done.action === "read") expect(rows.filter((r) => inboxRowOffersMarkRead(r))).toEqual([]);
+    else expect(rows.filter((r) => !inboxRowArchived(r))).toEqual([]);
+  }
+  return done;
+}
+
+describe("the thread-state model: the project menu's batches", () => {
+  test("generated histories with batches and their Undo between the steps: the store agrees with the model after every step", () => {
+    let batches = 0;
+    let undone = 0;
+    fc.assert(
+      fc.property(fc.array(batchItemArb, { minLength: 15, maxLength: 50, size: "max" }), (items) => {
+        const world = stateWorld();
+        let last: BatchDone | null = null;
+        for (const item of items) {
+          if (item.kind === "op") {
+            stateStep(world, item.op);
+            continue;
+          }
+          const done = batchStep(world, item, last);
+          if (item.kind === "undo") {
+            if (last) undone += 1;
+            last = null;
+          } else if (done) {
+            last = done;
+            batches += 1;
+          }
+        }
+      }),
+      { numRuns: 200, seed: 20261014 },
+    );
+    expect(batches).toBeGreaterThan(0);
+    expect(undone).toBeGreaterThan(0);
+  });
+
+  test("a batch undone back to back gives the project back exactly as it was", () => {
+    let touched = 0;
+    fc.assert(
+      fc.property(fc.array(stateOpArb, { minLength: 10, maxLength: 35, size: "max" }), fc.constantFrom("read" as const, "archive" as const), (ops, action) => {
+        const world = stateWorld();
+        for (const op of ops) stateStep(world, op);
+        for (const project of world.store.listProjects()) {
+          const before = projectSnapshot(world, project.id);
+          const done = batchStep(world, { kind: "batch", action, root: Number(project.name.slice(4)) }, null)!;
+          touched += done.read.length + done.resolved.length;
+          batchStep(world, { kind: "undo" }, done);
+          expect(projectSnapshot(world, project.id)).toEqual(before);
+        }
+      }),
+      { numRuns: 100, seed: 20261016 },
+    );
+    expect(touched).toBeGreaterThan(0);
+  });
+});
+
 // ─────────────────────────── trace fixtures ───────────────────────────
 //
 // fixtures/thread-state/v1/ holds JSON traces a phone kit replays in a unit
@@ -1411,7 +1800,10 @@ type TraceEvent =
   // `through` (seen only, optional): the look stops at that agent message (`through_seq`).
   | { type: "seen" | "mark_read" | "unread" | "archive" | "unarchive" | "agent_read" | "set_aside_note"; thread: string; through?: string }
   | { type: "pick"; message: string; key: string; choice?: string; text?: string }
-  | { type: "send"; message: string; words: string; skip_unanswered: boolean };
+  | { type: "send"; message: string; words: string; skip_unanswered: boolean }
+  // The person starts a thread addressed to a session (compose), and its delivery.
+  | { type: "person_thread"; project: string; session: string; body: string }
+  | { type: "delivered"; thread: string };
 
 interface TraceDef {
   name: string;
@@ -1459,7 +1851,7 @@ class TraceLabels {
 function traceOp(event: TraceEvent, world: StateWorld, labels: TraceLabels, step: number): Op {
   const at = (label: string) => {
     const i = world.ids.indexOf(labels.id(label));
-    if (i < 0) throw new Error(`${label} is not an agent message`);
+    if (i < 0) throw new Error(`${label} is not an agent message or a thread the person started`);
     return i;
   };
   switch (event.type) {
@@ -1502,12 +1894,20 @@ function traceOp(event: TraceEvent, world: StateWorld, labels: TraceLabels, step
       return { op: "agentRead", target: at(event.thread) };
     case "set_aside_note":
       return { op: "tell", target: at(event.thread) };
+    case "person_thread": {
+      const root = /^repo(\d)$/.exec(event.project);
+      if (!root) throw new Error(`project ${event.project}: repo0 or repo1`);
+      return { op: "personStart", root: Number(root[1]), key: `person-${step}`, session: event.session, body: event.body };
+    }
+    case "delivered":
+      return { op: "deliver", target: at(event.thread) };
   }
 }
 
 /** The trace event a generated op is, before it runs (null for an op that aims at nothing). */
 function traceEventOf(op: Op, world: StateWorld, labels: TraceLabels): TraceEvent | null {
   if (op.op === "send") return { type: "agent_message", project: `repo${op.root}`, session: op.session ?? null, reply_to: null, body: op.body };
+  if (op.op === "personStart") return { type: "person_thread", project: `repo${op.root}`, session: op.session, body: op.body };
   const target = targetOf(op, world.ids);
   if (!target) return null;
   const message = world.store.message(target)!;
@@ -1541,6 +1941,10 @@ function traceEventOf(op: Op, world: StateWorld, labels: TraceLabels): TraceEven
       return { type: "agent_read", thread };
     case "tell":
       return { type: "set_aside_note", thread };
+    case "deliver":
+      return { type: "delivered", thread };
+    case "ack":
+      return { type: op.on ? "ack" : "unack", message: labels.label(target) };
   }
 }
 
@@ -1624,6 +2028,7 @@ const REPLY = (reply_to: string, body: string, supersedes?: string[]): TraceEven
 const ON = (type: Extract<TraceEvent, { thread: string }>["type"], thread: string): TraceEvent => ({ type, thread });
 const SEEN_THROUGH = (thread: string, through: string): TraceEvent => ({ type: "seen", thread, through });
 const PICK = (message: string, key: string, choice: string): TraceEvent => ({ type: "pick", message, key, choice });
+const PERSON = (body: string, session = "ses_a", project = "repo0"): TraceEvent => ({ type: "person_thread", project, session, body });
 const SEND = (message: string, words: string, skip_unanswered: boolean): TraceEvent => ({ type: "send", message, words, skip_unanswered });
 
 const HAND_TRACES: TraceDef[] = [
@@ -1788,6 +2193,22 @@ const HAND_TRACES: TraceDef[] = [
       REPLY("m1", STATE_BODIES.news),
       ROOT(STATE_BODIES.news, null, "repo1"),
       SEEN_THROUGH("t1", "m5"),
+    ],
+  },
+  {
+    name: "hand-19-person-started-thread",
+    description:
+      "The person starts a thread addressed to a session (Sent); its delivery moves it to Quiet; the agent's reply_to answer lands in it (New), and a look makes it Quiet. The session's message without reply_to starts its own thread: a thread the person started is no session's default thread. A second person thread waits in Sent until delivered.",
+    events: [
+      PERSON(PERSON_BODIES[0]),
+      ON("delivered", "t1"),
+      REPLY("m1", STATE_BODIES.news),
+      ON("seen", "t1"),
+      ROOT(STATE_BODIES.ask, "ses_a"),
+      PERSON(PERSON_BODIES[1], "ses_b"),
+      REPLY("m4", STATE_BODIES.ask),
+      ON("mark_read", "t3"),
+      ON("delivered", "t3"),
     ],
   },
 ];

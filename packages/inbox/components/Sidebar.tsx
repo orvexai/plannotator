@@ -1,16 +1,22 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { InboxHealth } from '@plannotator/core/inbox-types';
 import { copyTextToClipboard } from '@plannotator/ui/utils/clipboard';
+import { ClaudeIcon, CodexIcon, OpenCodeIcon, PiIcon } from '@plannotator/ui/components/icons/AgentIcons';
 import type { ProjectFolder } from '../api';
 import { connectPrompt } from '../connectPrompt';
+import { formatCount } from '../format';
 import { Icon } from '../icons';
 import { useSidebar } from '../shell/sidebar';
+import { usePhone } from '../phone';
+import { shownProjects, type ProjectAction } from '../projectMenu';
+import { ProjectRow } from './ProjectRow';
 import { useInboxTheme } from '../theme';
 import { TaterMark } from './TaterMark';
 import { UpdateButton } from './Updates';
+import { openSearchAriaKeys, openSearchHint } from '../search/searchShortcut';
 
 export interface SidebarProps {
-  page: 'inbox' | 'settings' | 'decisions' | 'whats-new';
+  page: 'inbox' | 'settings' | 'decisions' | 'whats-new' | 'drafts';
   projectId: string | null;
   /** Rows waiting on the person, all projects. */
   inboxCount: number;
@@ -19,11 +25,27 @@ export interface SidebarProps {
   projects: readonly ProjectFolder[];
   /** Rows waiting on the person, per project id. */
   projectCounts: ReadonlyMap<string, number>;
+  /**
+   * The project menu (design record "inbox-project-menu"): the projects where
+   * Mark all as read has something to do, and the action. Absent: no menu.
+   */
+  projectsReadable?: ReadonlySet<string>;
+  onProjectAction?: (projectId: string, action: ProjectAction) => void;
   /** The update control's model (packages/server/inbox-updates.ts): the Update button above Settings. */
   update: InboxHealth['update'];
   restarting: boolean;
   /** This run started on a newer version: "What's new in X" above Settings. */
   updated: string | null;
+  /**
+   * Opens search (the approved "inbox-search" design): the field-shaped entry
+   * under the Tater mark. No key hint, because no key opens it. Absent: no entry.
+   */
+  onSearch?: (opener: HTMLElement) => void;
+  /** Compose (a new message to a connected agent): the icon button beside Search. Absent: no button. */
+  onCompose?: (opener: HTMLElement) => void;
+  /** Drafts not sent: the Drafts row shows only while there are some. */
+  draftsCount?: number;
+  onDrafts?: () => void;
   onInbox: () => void;
   onProject: (projectId: string) => void;
   onSettings: () => void;
@@ -31,16 +53,33 @@ export interface SidebarProps {
   onUpdate: () => void;
   onWhatsNew: (version: string) => void;
   /**
-   * The question sound is on and the tab has had no click yet, so Chrome
-   * would keep it silent: a quiet line above Settings. Any click in the tab
-   * (this one too) turns the sound on, and the line goes.
-   */
-  soundNeedsClick?: boolean;
-  /**
    * `GET /api/inbox/settings` `mcp_command`, for the absolute `plannotator`
    * the connect prompt names; null until the settings load.
    */
   mcpCommand?: readonly string[] | null;
+}
+
+/**
+ * Whether a scroll area has more below what it shows: the project list fades
+ * at its foot while it does, so a list cut mid-name says it scrolls.
+ */
+function useMoreBelow<T extends HTMLElement>(deps: unknown) {
+  const ref = useRef<T>(null);
+  const [more, setMore] = useState(false);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const read = () => setMore(el.scrollTop + el.clientHeight < el.scrollHeight - 1);
+    read();
+    el.addEventListener('scroll', read, { passive: true });
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(read);
+    observer?.observe(el);
+    return () => {
+      el.removeEventListener('scroll', read);
+      observer?.disconnect();
+    };
+  }, [deps]);
+  return [ref, more] as const;
 }
 
 /**
@@ -51,6 +90,21 @@ export interface SidebarProps {
 export function Sidebar(props: SidebarProps) {
   const firstRun = props.projects.length === 0;
   const { setOpenMobile } = useSidebar();
+  const phone = usePhone();
+  // A project with nothing in the list leaves the sidebar (automatic hiding); the one the list shows stays until the person leaves it.
+  const held = props.page === 'inbox' ? props.projectId : null;
+  const shown = shownProjects(props.projects, held);
+  const [projsRef, moreProjects] = useMoreBelow<HTMLDivElement>(shown.length);
+  const inboxRef = useRef<HTMLButtonElement>(null);
+  /** The project a menu action ran on: once its row is gone (Archive all hid it), focus goes to Inbox, never the page. */
+  const actedOn = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const id = actedOn.current;
+    if (!id || shown.some((p) => p.id === id)) return;
+    actedOn.current = null;
+    const active = document.activeElement;
+    if (!active || active === document.body || !active.isConnected) inboxRef.current?.focus({ preventScroll: true });
+  });
   const pick = (go: () => void) => () => {
     setOpenMobile(false);
     go();
@@ -62,7 +116,49 @@ export function Sidebar(props: SidebarProps) {
         <b>Plannotator</b>
         <span>Inbox</span>
       </div>
+      {props.onSearch && (
+        <div className="ib-sp-entryrow">
+        <button
+          type="button"
+          className="ib-sp-entry"
+          data-open-search=""
+          aria-haspopup="dialog"
+          aria-keyshortcuts={openSearchAriaKeys()}
+          onClick={(event) => {
+            const opener = event.currentTarget;
+            // On a phone the sheet closes first; the search sheet takes the screen.
+            setOpenMobile(false);
+            props.onSearch?.(opener);
+          }}
+        >
+          <Icon name="search" />
+          Search
+          {/* The Inbox's one shortcut (search/searchShortcut.ts); the button's aria-keyshortcuts names it for a screen reader. */}
+          <kbd className="ib-kbd ib-sp-hint" aria-hidden="true" data-search-hint="">
+            {openSearchHint()}
+          </kbd>
+        </button>
+        {props.onCompose && (
+          <button
+            type="button"
+            className="ib-compose-btn"
+            data-open-compose=""
+            aria-label="New message"
+            title="New message"
+            aria-haspopup="dialog"
+            onClick={(event) => {
+              const opener = event.currentTarget;
+              setOpenMobile(false);
+              props.onCompose?.(opener);
+            }}
+          >
+            <Icon name="compose" />
+          </button>
+        )}
+        </div>
+      )}
       <button
+        ref={inboxRef}
         type="button"
         className={`ib-nav${props.page === 'inbox' && props.projectId === null ? ' ib-on' : ''}`}
         onClick={pick(props.onInbox)}
@@ -70,7 +166,7 @@ export function Sidebar(props: SidebarProps) {
       >
         <Icon name="inbox" />
         Inbox
-        {!firstRun && props.inboxCount > 0 && <span className="ib-n">{props.inboxCount}</span>}
+        {!firstRun && props.inboxCount > 0 && <span className="ib-n">{formatCount(props.inboxCount)}</span>}
       </button>
       <button
         type="button"
@@ -81,40 +177,73 @@ export function Sidebar(props: SidebarProps) {
       >
         <Icon name="diamond" />
         Decisions
-        {props.decisionsCount > 0 && <span className="ib-n">{props.decisionsCount}</span>}
+        {props.decisionsCount > 0 && <span className="ib-n">{formatCount(props.decisionsCount)}</span>}
       </button>
+      {(props.draftsCount ?? 0) > 0 && props.onDrafts && (
+        <button
+          type="button"
+          className={`ib-nav${props.page === 'drafts' ? ' ib-on' : ''}`}
+          onClick={pick(props.onDrafts)}
+          aria-current={props.page === 'drafts' ? 'page' : undefined}
+          data-drafts-nav=""
+        >
+          <Icon name="doc" />
+          Drafts
+          <span className="ib-n">{formatCount(props.draftsCount ?? 0)}</span>
+        </button>
+      )}
       <div className="ib-side-label">Projects</div>
-      <div className="ib-projs">
+      <div className="ib-projs" ref={projsRef} data-more={moreProjects ? '' : undefined}>
         {firstRun ? (
           <div className="ib-side-empty">Projects appear here when an agent writes from one.</div>
+        ) : shown.length === 0 ? (
+          <div className="ib-side-empty" data-projects-hidden="">
+            {/* Projects whose threads were deleted rather than archived are not in Settings → Archived. */}
+            {props.projects.some((project) => (project.archived ?? 0) > 0) ? 'Nothing open. Archived projects are in Settings → Archived.' : 'Nothing open.'}
+          </div>
         ) : (
-          props.projects.map((project) => {
+          shown.map((project) => {
             const n = props.projectCounts.get(project.id) ?? 0;
             const on = props.page === 'inbox' && props.projectId === project.id;
+            if (!props.onProjectAction) {
+              return (
+                <button
+                  key={project.id}
+                  type="button"
+                  className={`ib-proj${n === 0 ? ' ib-proj-quiet' : ''}${on ? ' ib-on' : ''}`}
+                  onClick={pick(() => props.onProject(project.id))}
+                  aria-current={on ? 'page' : undefined}
+                  title={project.root}
+                >
+                  <span className="ib-name" dir="auto">{project.name}</span>
+                  {n > 0 && <span className="ib-n">{formatCount(n)}</span>}
+                </button>
+              );
+            }
             return (
-              <button
+              <ProjectRow
                 key={project.id}
-                type="button"
-                className={`ib-proj${n === 0 ? ' ib-proj-quiet' : ''}${on ? ' ib-on' : ''}`}
-                onClick={pick(() => props.onProject(project.id))}
-                aria-current={on ? 'page' : undefined}
-                title={project.root}
-              >
-                <span className="ib-name">{project.name}</span>
-                {n > 0 && <span className="ib-n">{n}</span>}
-              </button>
+                project={project}
+                count={n}
+                on={on}
+                held={project.listed === 0}
+                readable={props.projectsReadable?.has(project.id) ?? false}
+                phone={phone}
+                onOpen={pick(() => props.onProject(project.id))}
+                onAction={(action) => {
+                  actedOn.current = project.id;
+                  // On a phone the navigation sheet closes, so the toast and the list are in view.
+                  setOpenMobile(false);
+                  props.onProjectAction?.(project.id, action);
+                }}
+              />
             );
           })
         )}
       </div>
       <div className="ib-side-foot">
-        {props.soundNeedsClick && (
-          // The click itself is what allows sound (sound.ts listens for the first one anywhere in the tab).
-          <button type="button" className="ib-sound-hint" data-sound-hint="">
-            <Icon name="clickHere" />
-            Click to turn on sound
-          </button>
-        )}
+        {/* Copy prompt first, then the Update button or "What's new in X", then the Settings row. */}
+        <CopyConnectPrompt mcpCommand={props.mcpCommand ?? null} />
         <UpdateButton
           update={props.update}
           restarting={props.restarting}
@@ -122,7 +251,6 @@ export function Sidebar(props: SidebarProps) {
           onPress={pick(props.onUpdate)}
           onWhatsNew={(version) => pick(() => props.onWhatsNew(version))()}
         />
-        <CopyConnectPrompt mcpCommand={props.mcpCommand ?? null} />
         {/* Two controls side by side, never one inside the other: the row opens Settings, the icon flips light and dark. */}
         <div className="ib-setrow">
           <button
@@ -150,12 +278,17 @@ export const CONNECT_COPY_FAILED_ANNOUNCEMENT = "Couldn't copy the connect promp
 
 /**
  * "Copy connect prompt" (owner approval 2026-10-13, design record
- * `inbox-sidebar-connect-prompt`): one plain row above Settings that copies
- * the prompt an agent on this computer needs to connect itself
- * (connectPrompt.ts). Only a copy button: no preview, no tooltip, no
- * shortcut. The row says "Copied" for 2 s (or "Couldn't copy"), focus stays
- * on it, and a polite live region says the same. Not navigation, so the
- * phone sheet stays open to show it. Shown everywhere, the tailnet included.
+ * `inbox-sidebar-connect-prompt`; its look amended 2026-10-15 by
+ * `inbox-connect-row`, option 1b): an outlined pill above the Update button
+ * (or "What's new in X") and Settings, with the four agent marks and "Copy
+ * prompt", which copies the prompt an agent on this computer needs to
+ * connect itself (connectPrompt.ts). Only a copy
+ * button: no preview, no tooltip, no shortcut. The label says "Copied" for
+ * 2 s (or "Couldn't copy"), the marks stay, focus stays on it, and a polite
+ * live region says the same. Its name reads "Copy prompt to connect an
+ * agent": the visible words first, then what they are for. Not navigation,
+ * so the phone sheet stays open to show it. Shown everywhere, the tailnet
+ * included.
  */
 function CopyConnectPrompt({ mcpCommand }: { mcpCommand: readonly string[] | null }) {
   const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
@@ -180,12 +313,26 @@ function CopyConnectPrompt({ mcpCommand }: { mcpCommand: readonly string[] | nul
     <>
       <button
         type="button"
-        className="ib-nav ib-cp"
+        className="ib-cpill"
         data-connect-prompt={state}
         onClick={() => void copy()}
       >
-        <Icon name={state === 'copied' ? 'check' : state === 'failed' ? 'warn' : 'copy'} />
-        <span className="ib-cp-l">{state === 'copied' ? 'Copied' : state === 'failed' ? "Couldn't copy" : 'Copy connect prompt'}</span>
+        <span className="ib-cpill-ags" aria-hidden="true">
+          <ClaudeIcon className="ib-cpill-ag" />
+          <CodexIcon className="ib-cpill-ag" />
+          <PiIcon className="ib-cpill-ag" />
+          <OpenCodeIcon className="ib-cpill-ag" />
+        </span>
+        {state === 'idle' ? (
+          <span className="ib-cpill-l">
+            Copy prompt<span className="ib-sr"> to connect an agent</span>
+          </span>
+        ) : (
+          <>
+            <Icon name={state === 'copied' ? 'check' : 'warn'} />
+            <span className="ib-cpill-l">{state === 'copied' ? 'Copied' : "Couldn't copy"}</span>
+          </>
+        )}
       </button>
       <div className="ib-sr" role="status" aria-live="polite" data-connect-prompt-live="">
         {announcement}

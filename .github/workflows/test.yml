@@ -116,6 +116,7 @@ jobs:
           packages/ui/utils/inputMethod.test.ts
           packages/ui/utils/vimNavigation.test.ts
           packages/ui/utils/clipboard.test.ts
+          packages/ui/utils/pasteInsert.test.ts
           apps/vscode-extension/src/vscode-theme.test.ts
           packages/ui/utils/vimScroll.test.ts
           packages/ui/components/InlineMarkdown.resolveLinkedDoc.test.tsx
@@ -128,35 +129,59 @@ jobs:
           packages/ui/components/Viewer.askAISelectionLine.test.tsx
           packages/ui/components/ImageLightbox.test.tsx
           packages/inbox/images.test.tsx
+          packages/inbox/inlineImages.test.tsx
           packages/inbox/codeAttachment.test.tsx
           packages/inbox/links.test.tsx
           packages/inbox/issueRefs.test.tsx
           packages/inbox/attachmentKinds.test.tsx
           packages/inbox/updates.test.tsx
+          packages/inbox/whatsNewLink.test.tsx
+          packages/inbox/whatsNewHeader.test.tsx
           packages/inbox/replaced.test.tsx
           packages/inbox/threadFolding.test.tsx
+          packages/inbox/pasteTarget.test.ts
           packages/inbox/seenOnSight.test.tsx
           packages/inbox/projectList.test.tsx
           packages/inbox/sidebarQuiet.test.tsx
           packages/inbox/connectPromptRow.test.tsx
           packages/inbox/soundIntro.test.tsx
           packages/inbox/soundSettings.test.tsx
+          packages/inbox/notifyHook.test.tsx
+          packages/inbox/notificationStates.test.tsx
           packages/inbox/attachmentStepping.test.tsx
+          packages/inbox/fullView.test.tsx
+          packages/inbox/fullViewRemembered.test.tsx
           packages/inbox/attachmentSteppingSave.test.tsx
           packages/inbox/listColumn.test.tsx
           packages/inbox/endedSession.test.tsx
+          packages/inbox/compose.test.tsx
+          packages/inbox/composeThread.test.tsx
+          packages/inbox/sendNow.test.tsx
+          packages/inbox/pasteFiles.test.tsx
           packages/inbox/markRead.test.tsx
+          packages/inbox/ack.test.tsx
+          packages/inbox/wordsOnlyTwoAsks.test.tsx
+          packages/inbox/projectMenu.test.tsx
           packages/inbox/fileBack.test.tsx
           packages/inbox/archived.test.tsx
           packages/inbox/decisionsPicker.test.tsx
           packages/inbox/openStaysPut.test.tsx
           packages/inbox/phoneList.test.tsx
-          packages/inbox/toastPhone.test.tsx
+          packages/inbox/listLabels.test.tsx
+          packages/inbox/toast.test.tsx
           packages/inbox/attachmentsHeader.test.tsx
+          packages/inbox/sentQuestionLocked.test.tsx
           packages/inbox/themeToggle.test.tsx
           packages/inbox/agentNoteDialog.test.tsx
           packages/inbox/agentsSettings.test.tsx
+          packages/inbox/connectNextStep.test.tsx
           packages/inbox/settingsSections.test.tsx
+          packages/inbox/searchPalette.test.tsx
+          packages/inbox/searchShortcut.test.tsx
+          packages/inbox/openIn.test.tsx
+          packages/inbox/videoAttachment.test.tsx
+          packages/inbox/skillReferences.test.tsx
+          packages/ui/components/HumanOnlySkillNotice.test.tsx
           packages/ui/components/MenuVersionSection.test.tsx
           packages/ui/components/blocks/QuestionBlock.test.tsx
           packages/ui/components/blocks/QuestionBlock.host.test.tsx
@@ -203,6 +228,7 @@ jobs:
           packages/review-editor/components/MarkdownViewMenu.test.tsx
           packages/review-editor/components/DiffViewer.compactTouchSelection.test.tsx
           packages/guide-viewer/GuideSectionCard.test.tsx
+          packages/guide-viewer/GuideSectionCard.fileKinds.test.tsx
           packages/guide-viewer/GuideView.test.tsx
           packages/guide-viewer/GuideViewportManager.test.tsx
           packages/review-editor/components/guide/GuideExportButton.test.tsx
@@ -222,6 +248,8 @@ jobs:
           packages/review-editor/components/CallFlowTreeView.interaction.test.tsx
           packages/review-editor/components/PanelChrome.test.tsx
           packages/review-editor/components/FileTree.search-placement.test.tsx
+          packages/review-editor/components/FileTree.fileKinds.test.tsx
+          packages/review-editor/components/FileHeader.fileKind.test.tsx
           packages/review-editor/components/FileTreeNode.controls.test.tsx
           packages/ui/components/Settings.analysis.test.tsx
           packages/ui/components/AnnotationPanel.props.test.tsx

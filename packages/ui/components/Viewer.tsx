@@ -1,7 +1,7 @@
 import { generateId } from '../utils/generateId';
 import React, { useRef, useState, useEffect, useLayoutEffect, useMemo, forwardRef, useImperativeHandle, useCallback, lazy, Suspense } from 'react';
 import { createPortal } from 'react-dom';
-import { ImageLightbox } from './ImageLightbox';
+import { collectDocumentImages, ImageLightbox, type LightboxImage } from './ImageLightbox';
 import { AnnotationType, type Block, type Annotation, type EditorMode, type InputMethod, type ImageAttachment, type ActionsLabelMode, type HostDraft } from '../types';
 import { applyHighlight, codeBlockClassName, onCodeHighlightSwap } from '../utils/codeHighlight';
 import { paintCodeBlockMark } from '../utils/codeBlockMark';
@@ -11,6 +11,7 @@ import { buildHeadingSlugMap } from '../utils/slugify';
 import { copyTextToClipboard } from '../utils/clipboard';
 import { BlockRenderer } from './BlockRenderer';
 import { indexQuestionBlocks, type IndexedQuestion, type ParsedQuestion, type QuestionAnswer } from '@plannotator/core/question-block';
+import type { QuestionBlockProps } from './blocks/QuestionBlock';
 import { resolveQuestionAnswers } from '../utils/questionAnswers';
 import { CodeBlock } from './blocks/CodeBlock';
 import { TableBlock } from './blocks/TableBlock';
@@ -162,6 +163,18 @@ export interface ViewerProps {
    */
   resolveLocalLink?: LocalLinkResolver;
   imageBaseDir?: string;
+  /**
+   * A click on an image in the document. Given: the host handles it (the
+   * Inbox opens a message's image in its own viewer) and no lightbox opens.
+   * Absent: the lightbox, as always.
+   */
+  onImageClick?: (src: string, alt: string) => void;
+  /**
+   * The lightbox steps through every image the document shows (← →, the
+   * peek; approval "inbox-image-viewer": plan review and annotate's light
+   * version). Absent or false: the single image overlay, as always.
+   */
+  imageLightboxStepping?: boolean;
   /** Directory the active document lives in — used by the code-path validator
    *  so out-of-tree relative references (e.g. `../foo.ts` in a linked doc)
    *  resolve against the doc's own directory rather than only cwd. */
@@ -264,10 +277,20 @@ export interface ViewerProps {
    *  (a host whose message holds one sent and one open question). Absent:
    *  every question follows `readOnly`. */
   questionDecisionLocked?: (question: IndexedQuestion) => boolean;
+  /** Per question, true draws that card read-only, as under `readOnly` (no
+   *  picks, no Other, no note, no Skip, no Accept recommended, and its
+   *  decision tag a plain tag), while the other questions stay answerable (a
+   *  host whose message holds one sent and one open question). Absent: every
+   *  question follows `readOnly`. */
+  questionReadOnly?: (question: IndexedQuestion) => boolean;
   /** `'none'` hides each question card's own status tag (Open / Answered /
    *  Settled / Skipped) so the host can draw its own; the decision tags stay.
    *  Default `'card'`. */
   questionStatusTag?: 'card' | 'none';
+  /** The host's own words for a question's status tag (ui seam, see
+   *  `QuestionBlock` `statusLabel`): the Plannotator Inbox says "Not sent" for
+   *  a saved, unsent pick. Absent: the card's own tags. */
+  questionStatusLabel?: QuestionBlockProps['statusLabel'];
   /** A host's own card in place of a question's (ui seam for a question the
    *  host no longer lets anyone answer, such as the Plannotator Inbox's
    *  replaced questions). Called per question; a returned node is drawn
@@ -670,6 +693,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   resolveLocalLink,
   linkedDocInfo,
   imageBaseDir,
+  onImageClick: hostImageClick,
+  imageLightboxStepping = false,
   codePathBaseDir,
   disableCodePathValidation,
   onRestoreReport,
@@ -691,7 +716,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   onToggleQuestionDecisionRecording,
   onOpenQuestionDecision,
   questionDecisionLocked,
+  questionReadOnly,
   questionStatusTag,
+  questionStatusLabel,
   renderQuestionCard,
   renderQuestionBelowPrompt,
   onAskAI,
@@ -713,7 +740,16 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   // Where `#123` / `@user` link: `refRepo` when the host gave one, else `repoInfo`.
   const linkRepo = refRepo ?? repoInfo;
   const [copied, setCopied] = useState(false);
-  const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null);
+  const [lightbox, setLightboxState] = useState<{ src: string; alt: string; images?: LightboxImage[] } | null>(null);
+  // A host that handles image clicks (the Inbox) gets them; otherwise the lightbox opens, stepping through
+  // the document's images when the host asked for it.
+  const setLightbox = (image: { src: string; alt: string }) => {
+    if (hostImageClick) {
+      hostImageClick(image.src, image.alt);
+      return;
+    }
+    setLightboxState(imageLightboxStepping ? { ...image, images: collectDocumentImages(containerRef.current) } : image);
+  };
   const [locationHash, setLocationHash] = useState(() => window.location.hash);
   const globalCommentButtonRef = useRef<HTMLButtonElement>(null);
   // Read through a ref: only the imperative removeHighlight path below needs
@@ -1677,15 +1713,16 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                   question={question}
                   questionTotal={questionIndex.total}
                   questionAnswer={question ? answersByKey.get(question.question.key) : undefined}
-                  onAnswerQuestion={readOnly ? undefined : onAnswerQuestion}
-                  onSaveQuestionAnswer={readOnly ? undefined : onSaveQuestionAnswer}
+                  onAnswerQuestion={readOnly || (question && questionReadOnly?.(question)) ? undefined : onAnswerQuestion}
+                  onSaveQuestionAnswer={readOnly || (question && questionReadOnly?.(question)) ? undefined : onSaveQuestionAnswer}
                   saveQuestionAnswerLabel={saveQuestionAnswerLabel}
                   renderQuestionFooter={renderQuestionFooter}
                   questionDecisionRecording={question ? questionDecisionRecording?.(question) : undefined}
                   questionDecisionScope={questionDecisionScope}
-                  onToggleQuestionDecisionRecording={readOnly || (question && questionDecisionLocked?.(question)) ? undefined : onToggleQuestionDecisionRecording}
-                  onOpenQuestionDecision={readOnly || (question && questionDecisionLocked?.(question)) ? undefined : onOpenQuestionDecision}
+                  onToggleQuestionDecisionRecording={readOnly || (question && (questionDecisionLocked?.(question) || questionReadOnly?.(question))) ? undefined : onToggleQuestionDecisionRecording}
+                  onOpenQuestionDecision={readOnly || (question && (questionDecisionLocked?.(question) || questionReadOnly?.(question))) ? undefined : onOpenQuestionDecision}
                   questionStatusTag={questionStatusTag}
+                  questionStatusLabel={questionStatusLabel}
                   renderQuestionBelowPrompt={renderQuestionBelowPrompt}
                 />
               );
@@ -1917,7 +1954,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
 
       {/* Image lightbox */}
       {lightbox && createPortal(
-        <ImageLightbox src={lightbox.src} alt={lightbox.alt} onClose={() => setLightbox(null)} />,
+        <ImageLightbox src={lightbox.src} alt={lightbox.alt} images={lightbox.images} onClose={() => setLightboxState(null)} />,
         document.body
       )}
     </div>

@@ -16,6 +16,7 @@ Where the rules live: the store (`packages/shared/inbox/store.ts`: `listRow`, `r
 - **Archive.** Resolve (`POST /api/inbox/messages/:id/resolve`, `resolved: true`). The root's `resolved_at` is set. **The archive line** is the seq of the root line that set the current `resolved_at`; it is derived from the log, never written. Messages before the line are **closed by the archive**: their questions read `closed`, and picks, Send and the decision switch on them are refused (`409 thread_resolved`).
 - **Came back.** An agent wrote in an archived thread after the line (`agent_after_archive`), and something there still waits on someone (`back_from_archive`): an agent message after the line the person has not looked at, a live question open or picked, or the person's real reply after the line that no agent has read (notes do not count), unless a Mark read made after it still stands. A Mark read made after the latest post-archive agent message ends "came back": the thread is Archived again at once, even while the person's reply there waits on the agent. The thread stays resolved.
 - **Agent read.** `read_thread` read the thread, or `wait_for_reply` returned the person's reply. The root's `agent_checked_seq` becomes the seq of the latest person message it covered.
+- **A thread the person started.** Compose (`POST /api/inbox/messages`): the root is the person's message (`started_by_person`), addressed to one live session (`to`). It is no session's default thread (routing indexes agent roots only), so only a `reply_to` answer lands in it. Its addressed session's **delivery** (the connection put it into the session as a turn) counts as an agent read up to it.
 - **Waiting on the person** (the summary's `waiting_on_person`, Workspaces' wire). The thread is not resolved, its last message (the Inbox's notes read past) is an agent's, and no Mark read stands: a standing Mark read means nothing waits on the person. The model checks it after every step.
 
 ## Question states
@@ -77,6 +78,11 @@ A came-back thread is in the sections in both views and is not in the archived l
 | Archive | `POST /api/inbox/messages/:id/resolve` `{ resolved: true }` | `resolved_at`. No write when already resolved |
 | Unarchive | the same, `{ resolved: false }` | `resolved_at` cleared; a Mark read made after the archive line is cleared in the same root line |
 | Agent read your reply | `read_thread`, `wait_for_reply` | `agent_checked_seq` |
+| Mark all as read (a project) | `POST /api/inbox/projects/:id/read` | Mark read on every thread of the project single Mark read is offered on (open or come back, something waiting on the person): exactly the lines each single Mark read writes. Each thread's set-aside note goes on its own |
+| Archive all (a project) | `POST /api/inbox/projects/:id/resolve` `{ resolved: true }` | Archive on every listed open thread of the project; Mark read on one that came back. Exactly the single actions' lines |
+| Their Undo | `…/unread` `{ threads }`, `…/resolve` `{ resolved: false, threads }` | Undo or Unarchive on exactly the threads the batch named, as the single actions write them |
+| Person starts a thread | `POST /api/inbox/messages` | A person root with `to` and `started_by_person`; no question records, whatever the body says. Idempotent on its key. Refused (`session_not_live`) when the session is not live, nothing written |
+| Delivered | the bridge's `delivered` event | `delivery` on the person's message, and `agent_checked_seq` up to it |
 
 ## Transition table
 
@@ -97,6 +103,8 @@ Columns are the state before the event: **Asks** (Stopped, Holding or Waiting), 
 | Unarchive | no write | no write | no write | no write | no write | Placed as an open thread; a Mark read made before the archive is kept (Read) | Placed as an open thread; a Mark read made after the line is dropped |
 | Agent read your reply | Asks | New | Quiet | Read | Quiet | Archived | Archived when the unread reply was all that kept it back |
 | Set-aside note | Asks (an open question still places it; unseen unchanged) | New, unseen unchanged: the note is neither a reply nor a look | Sent | Read: the note never ends the read | Quiet | Archived; a note goes only for questions asked after the line | as for an open thread |
+| Person starts a thread | a new thread: Sent | | | | | | |
+| Delivered | Asks | New | Quiet (the delivery is the agent's read) | Read | Quiet | Archived | as Agent read your reply |
 
 ## Invariants
 
@@ -115,6 +123,8 @@ Checked after every step of every sequence, on the store's own output:
 Invariant 7 is mostly circular for the first two counts: `waitingCount` counts the rows in Stopped, Holding and Waiting, and `unread` is defined from the section, so they check the counting code rather than the rules. The Decisions count is the real check: the model keeps its own account of which questions record a decision and which have one.
 
 The model also predicts every event's outcome (written, nothing to do, a replayed key, or the refusal code), which thread every message lands in, every question's state and every row's section, unseen count, read and came-back flags, `last_at` and `last_agent_at`. The store must match it exactly on every field after every step. (Until A, B and C below were fixed, the model derived each row under two look rules, the store's and the intended one, and recorded the difference; they are one rule now.)
+
+The project menu's batches (design record "inbox-project-menu", approved 2026-10-14; `packages/shared/inbox/project-batch.ts`) add no rule: each is a loop over the single actions above, run synchronously. `store.test.ts` ("the project menu's batches") has the model decide on its own which threads a batch takes, apply the single rules thread by thread, and check every invariant after every batch and every Undo between generated steps; a batch undone back to back gives the project's rows back exactly (invariants 4 and 5, per project). After Mark all as read nothing in the project waits on the person; after Archive all nothing of it is listed, which is what hides the project in the window's sidebar (derived from the folders' `listed`, never stored).
 
 ## Counts
 
@@ -151,4 +161,4 @@ Old stores replay unchanged: nothing already written is rewritten or read differ
 
 ## Trace fixtures
 
-`packages/shared/inbox/fixtures/thread-state/v1/`: one JSON file per trace and `index.json`. The folder's README gives the format, the event vocabulary, the generator, the seeds and how to regenerate. The files are generated by `store.test.ts` through the same checked steps, and the test fails when they differ from what the store does, so they cannot drift from the code. A generated trace's events were drawn from its seed once and are kept in its file as data; the test replays them, so a new fast-check version changes nothing. A change of the format makes `v2`; a change of behaviour (a fixed violation) regenerates `v1` in place, as the fix of A, B and C did. The look's cap (`through_seq`) is additive: the `seen` event gained an optional `through`, `hand-18-look-capped-by-through` was added, and no existing trace changed; the format stays `v1`.
+`packages/shared/inbox/fixtures/thread-state/v1/`: one JSON file per trace and `index.json`. The folder's README gives the format, the event vocabulary, the generator, the seeds and how to regenerate. The files are generated by `store.test.ts` through the same checked steps, and the test fails when they differ from what the store does, so they cannot drift from the code. A generated trace's events were drawn from its seed once and are kept in its file as data; the test replays them, so a new fast-check version changes nothing. A change of the format makes `v2`; a change of behaviour (a fixed violation) regenerates `v1` in place, as the fix of A, B and C did. The look's cap (`through_seq`) is additive: the `seen` event gained an optional `through`, `hand-18-look-capped-by-through` was added, and no existing trace changed; the format stays `v1`. Threads the person starts are additive the same way: the `person_thread` and `delivered` events and `hand-19-person-started-thread` were added (the property runs draw both; the generated fixtures were drawn without them), no existing trace changed, and the format stays `v1`.

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildQuestionAnswerAnnotation,
+  capQuestionPrompt,
+  MAX_QUESTION_PROMPT_CHARS,
   canonicalQuestionAnswer,
   formatQuestionAnswerText,
   formatQuestionAnswersSection,
@@ -73,6 +75,46 @@ iOS background execution is unreliable.
     )!;
     expect(q.kind).toBe("multi");
     expect(q.choices.map((c) => c.recommended)).toEqual([true, true, false]);
+  });
+
+  test("a multi recommendation naming a choice whole, its description holding a comma, matches every choice", () => {
+    const body = [
+      "What should the first Inbox release carry?",
+      "",
+      "- [ ] Reply box",
+      "- [ ] Mark read",
+      "- [ ] Comments on attached files — about one line of work, could ship first",
+      "- [ ] Search",
+      "",
+      "Recommended: Reply box, Mark read, Comments on attached files — about one line of work, could ship first",
+    ].join("\n");
+    const q = parseQuestionBlock("question-multi", body)!;
+    expect(q.choices.map((c) => c.recommended)).toEqual([true, true, true, false]);
+    expect(q.suggestedText).toBeUndefined();
+    // The same with `;` between items.
+    const semi = parseQuestionBlock("question-multi", body.replace(/Recommended: .*/, "Recommended: Search; Comments on attached files — about one line of work, could ship first"))!;
+    expect(semi.choices.map((c) => c.recommended)).toEqual([false, false, true, true]);
+  });
+
+  test("parts are joined back only into a choice's full text, and only when every part is covered", () => {
+    const choices = `Which?\n- [ ] Alpha — cheap, fast\n- [ ] Beta\n- [ ] Gamma`;
+    const rec = (line: string) => parseQuestionBlock("question-multi", `${choices}\nRecommended: ${line}`)!;
+    // `Alpha — cheap, fast` is joined back because it is that choice's full text.
+    expect(rec("Beta, Alpha — cheap, fast").choices.map((c) => c.recommended)).toEqual([true, true, false]);
+    // `Beta — sure` is not a full text: it stays its own part (named by its head).
+    expect(rec("Gamma, Alpha — cheap, fast, Beta — sure").choices.map((c) => c.recommended)).toEqual([true, true, true]);
+    // A part naming nothing still names nothing: the whole line is a suggestion.
+    const none = rec("Beta, Alpha — cheap, fast, Delta");
+    expect(none.choices.every((c) => !c.recommended)).toBe(true);
+    expect(none.suggestedText).toBe("Beta, Alpha — cheap, fast, Delta");
+  });
+
+  test("lettered plain bullets: a whole lettered choice with a comma in its description is joined back too", () => {
+    // Before the join, the split failed (`steady` names nothing) and the final
+    // lettered fallback named only `a.`; now both are named.
+    const q = parseQuestionBlock("question-multi", "Which?\n\n- a. Alpha\n- b. Beta — slow, steady\n\nRecommended: a. Alpha first, b. Beta — slow, steady")!;
+    expect(q.choices.map((c) => [c.label, c.recommended])).toEqual([["a. Alpha", true], ["b. Beta", true]]);
+    expect(q.suggestedText).toBeUndefined();
   });
 
   test("a recommendation that names no choice becomes a suggested answer", () => {
@@ -503,6 +545,17 @@ describe("parseQuestionAnswer", () => {
     expect(parsed.prompt.length).toBe(400);
     expect(parsed.text!.length).toBe(4000);
     expect(parsed.selected.length).toBe(20);
+  });
+
+  test("never cuts a prompt inside an emoji, and the Inbox's check cuts it the same way", () => {
+    // The 400th code unit is the first half of a surrogate pair.
+    const prompt = `${"p".repeat(399)}😀 and more`;
+    const capped = capQuestionPrompt(prompt);
+    expect(capped).toBe("p".repeat(399));
+    expect(parseQuestionAnswer(answer({ prompt }))!.prompt).toBe(capped);
+    expect(capped.length).toBeLessThanOrEqual(MAX_QUESTION_PROMPT_CHARS);
+    // A prompt that fits is kept whole.
+    expect(capQuestionPrompt("Ship it? 😀")).toBe("Ship it? 😀");
   });
 });
 

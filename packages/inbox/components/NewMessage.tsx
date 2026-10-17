@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { INBOX_HOST_NAMES, type InboxThread } from '@plannotator/core/inbox-types';
 import { InboxApiError, inboxApi, type LiveSession, type LiveSessionsModel } from '../api';
-import { clockTime, tildePath } from '../format';
+import { whenTime, tildePath } from '../format';
 import { HostMark, Icon } from '../icons';
+import { INBOX_MESSAGE_SKILL_AUDIENCE, inboxSkillsBlock, withSkillsBlock } from '../skills';
+import { InboxComposerField } from './ComposerField';
 
 /**
  * New message (record 5.x, PLAN step 8; owner Q4: "just another button next
@@ -34,8 +36,8 @@ export function sessionWords(session: LiveSession): string {
   const parts: string[] = [];
   if (session.wrote_thread) parts.push('Wrote this thread.');
   if (session.busy === true) parts.push('Working now; takes it when the turn ends.');
-  else if (session.busy === false && session.idle_since) parts.push(`Idle since ${clockTime(session.idle_since)}.`);
-  else if (!session.wrote_thread) parts.push(`Seen ${clockTime(session.last_seen_at)}.`);
+  else if (session.busy === false && session.idle_since) parts.push(`Idle since ${whenTime(session.idle_since)}.`);
+  else if (!session.wrote_thread) parts.push(`Seen ${whenTime(session.last_seen_at)}.`);
   return parts.join(' ');
 }
 
@@ -46,7 +48,7 @@ export type NewMessageMode = { kind: 'pick' } | { kind: 'none' } | { kind: 'comp
  * while it stays open, and on demand. With `asker` (the session that asked,
  * for a host whose sessions poll), also whether that session is still there.
  */
-export function useLiveSessions(threadId: string, asker: string | null = null) {
+export function useLiveSessions(threadId: string, asker: string | null = null, enabled = true, refreshMs = REFRESH_MS) {
   const [model, setModel] = useState<LiveSessionsModel | null>(null);
   const load = useCallback(async (): Promise<LiveSessionsModel | null> => {
     try {
@@ -59,10 +61,12 @@ export function useLiveSessions(threadId: string, asker: string | null = null) {
   }, [threadId, asker]);
   useEffect(() => {
     setModel(null);
+    // `enabled` false: nothing to watch (compose's "Not delivered" asks only while a message waits).
+    if (!enabled) return;
     void load();
-    const timer = setInterval(() => void load(), REFRESH_MS);
+    const timer = setInterval(() => void load(), refreshMs);
     return () => clearInterval(timer);
-  }, [load]);
+  }, [load, enabled, refreshMs]);
   return { model, load };
 }
 
@@ -139,7 +143,7 @@ export function NewMessagePopover({
           >
             <HostMark host={session.host} />
             <span>
-              <span className="ib-t">Started {clockTime(session.started_at)}</span>
+              <span className="ib-t">Started {whenTime(session.started_at)}</span>
               <span className="ib-d">{sessionWords(session)}</span>
             </span>
           </button>
@@ -201,7 +205,9 @@ export function NewMessageComposer({
     setSending(true);
     setError(null);
     try {
-      await inboxApi.newMessage(thread.thread_id, { session: target.session, body, idempotency_key: key.current });
+      // The skills the words reference ride at the end, as one block (skills.ts).
+      const skills = await inboxSkillsBlock([body], INBOX_MESSAGE_SKILL_AUDIENCE);
+      await inboxApi.newMessage(thread.thread_id, { session: target.session, body: withSkillsBlock(body, skills), idempotency_key: key.current });
       await onSent();
     } catch (cause) {
       setError(cause instanceof InboxApiError ? cause.message : 'The message was not sent. Send again to retry.');
@@ -217,14 +223,13 @@ export function NewMessageComposer({
         <span className="ib-mut">(live session, {target.busy ? 'working' : 'idle'})</span>
       </div>
       <div className="ib-rbox">
-        <textarea
-          ref={textRef}
-          className="ib-rtext"
-          aria-label={`New message to ${name}`}
+        <InboxComposerField
+          textareaRef={textRef}
+          ariaLabel={`New message to ${name}`}
           placeholder="Write a message"
+          destination="your message"
           value={text}
-          rows={2}
-          onChange={(event) => setText(event.target.value)}
+          onChange={setText}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
               event.preventDefault();

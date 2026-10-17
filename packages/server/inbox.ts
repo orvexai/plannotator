@@ -37,9 +37,9 @@
  * No CORS headers anywhere, so another site cannot read an answer.
  */
 
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import {
@@ -56,7 +56,6 @@ import {
   type InboxProjectRepo,
 } from "@plannotator/core/inbox-types";
 import { checkServerSession, createServerSessionNonce, INBOX_SERVER_SESSION_MISMATCH_ERROR, serverSessionMismatchBody } from "@plannotator/core/server-session";
-import { extractDirName, extractRepoName } from "@plannotator/core/project";
 import {
   INBOX_TOOL_HOSTS,
   loadConfig,
@@ -78,15 +77,20 @@ import {
 import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
 import { normalizeStableVersion, readUpdateState } from "@plannotator/shared/update-check";
 import { isLoopbackHostHeader } from "@plannotator/shared/loopback-host";
+import type { InboxSearchIndex, InboxSearchIndexOptions } from "@plannotator/shared/inbox/search";
+import { createInboxSearchRoutes } from "./inbox-search";
+import { inboxSkillsRoute } from "./inbox-skills";
 import { isSameOriginOrNoOrigin } from "@plannotator/shared/request-origin";
 import { InboxError } from "@plannotator/shared/inbox/schema";
 import { InboxStore } from "@plannotator/shared/inbox/store";
 import { inboxArchivedRows, inboxListSections, inboxRowArchived } from "@plannotator/shared/inbox/list";
+import { archiveProject, markProjectRead, unarchiveProject, unmarkProjectRead } from "@plannotator/shared/inbox/project-batch";
 import {
   INBOX_BRIDGE_EVENT_PATH,
   INBOX_BRIDGE_POLL_MAX_MS,
   INBOX_BRIDGE_POLL_PATH,
   INBOX_MAX_REQUEST_BYTES,
+  INBOX_SEND_NOW_POLL_FIELD,
   type InboxReplyCommand,
 } from "@plannotator/shared/inbox/connection";
 import {
@@ -110,25 +114,33 @@ import {
 } from "./inbox-decisions";
 import { inboxGuideRoute } from "./inbox-guides";
 import { createInboxRepoCache } from "./inbox-repos";
+import { createInboxProjectRoots, nearestProjectHolding, type InboxGitRunner } from "./inbox-project-root";
 import { handleFavicon } from "./shared-handlers";
 import { createInboxAttachmentRoutes } from "./inbox-attachments";
-import { inboxMessageImageRoute } from "./inbox-message-images";
+import { createInboxImageCapture, inboxMessageImageRoute, type InboxImageCapture } from "./inbox-message-images";
+import { createInboxOpenInRoute, systemOpenInLauncher, type InboxOpenInLauncher } from "./inbox-open-in";
 import { recordInboxAttachments, sweepStaleInboxSendTemps } from "@plannotator/shared/inbox/attachments";
+import { inboxBodyForAgent, inboxUploadAttachments, removeInboxAttachmentFiles, removeInboxUploads } from "@plannotator/shared/inbox/uploads";
 import { createInboxLiveSessions } from "./inbox-sessions";
+import { createInboxCompose, INBOX_UPLOAD_SWEEP_MS } from "./inbox-compose";
 import { createInboxDevices, DOOR_PREFIX } from "./inbox-devices";
 import type { PairingProbes } from "./inbox-pairing-checks";
 import { createInboxRelay } from "./inbox-relay";
 import type { TailscaleRunner } from "@plannotator/shared/tailscale";
 import { createInboxTailscale, PHONES_TAILNET_HTTPS_PORT, type InboxTailscale } from "./inbox-tailscale";
 import { createInboxUpdates, type InboxUpdatesOptions } from "./inbox-updates";
+import { inboxCanonicalBaseUrl, inboxCanonicalRedirect } from "./inbox-canonical";
+import { createInboxWindows, parseWindowId, parseWindowOrigin, parseWindowPermission } from "./inbox-windows";
 import {
   agentSpec,
+  claudeCodeModOn,
   connectInboxAgents,
   createAgentEnvironment,
   createAgentEnvironmentFor,
   displayPath,
   inboxAgentReach,
   inboxConnectDisabled,
+  inboxPluginStatus,
   readInboxAgents,
   setInboxAgentReach,
   setInboxTool,
@@ -198,6 +210,8 @@ export interface InboxServerOptions {
   onDataGone?: (reason: string) => void;
   /** How often that is checked. Default `INBOX_DATA_CHECK_MS`. Tests shorten it. */
   dataCheckMs?: number;
+  /** How long a streamed attachment answer may go unread before its file handle closes (inbox-byte-range.ts). Default `STREAM_IDLE_CLOSE_MS`; tests shorten it. */
+  streamIdleMs?: number;
   /**
    * Called after the window's Restart (the "A new version is ready" line),
    * once this server has stopped listening: the caller starts the binary on
@@ -209,13 +223,18 @@ export interface InboxServerOptions {
    * release fetch, the installer, whether the binary is the install script's,
    * the sessions list and the clock. Defaults: the real ones. Tests inject.
    */
-  updates?: Pick<InboxUpdatesOptions, "fetchRelease" | "launchInstaller" | "isManaged" | "listSessions" | "now" | "probeVersion">;
+  updates?: Pick<
+    InboxUpdatesOptions,
+    "fetchRelease" | "fetchReleaseTag" | "whatsNewWaitMs" | "launchInstaller" | "isManaged" | "listSessions" | "now" | "probeVersion"
+  >;
   /**
    * The window: the built single-file app (`apps/hook/dist/inbox.html`, which
    * the binary embeds). Absent (a source run before `build:hook`, the server
    * tests): `/` answers a one-line page saying so.
    */
   htmlContent?: string;
+  /** Tests: how long a window's record outlives its last event stream (default `WINDOW_GRACE_MS`). */
+  windowGraceMs?: number;
   /**
    * The argv that runs this CLI (the compiled binary's absolute path, or bun
    * plus the entry script), so the window's connect snippets name a command
@@ -243,8 +262,15 @@ export interface InboxServerOptions {
    * (packages/server/inbox-tailscale.ts). Default false.
    */
   publishTailnet?: boolean;
+  /**
+   * How "Open in" launches an attachment's app (packages/server/inbox-open-in.ts).
+   * Default: this host's launcher. Tests pass a recording one, so no real app starts.
+   */
+  openInLauncher?: InboxOpenInLauncher;
   /** Tests: how a project root's `origin` is read (default `readInboxProjectRepo`, inbox-repos.ts). */
   readProjectRepo?: (root: string) => Promise<InboxProjectRepo | null>;
+  /** Tests: the git that decides a path's project (default `inboxGitRunner`, inbox-project-root.ts). */
+  projectRootGit?: InboxGitRunner;
   /**
    * How long after a Mark read the asking agents are told what it closed (the
    * window's Undo lasts 7 s). Default `INBOX_SET_ASIDE_DELAY_MS`. Tests shorten it.
@@ -256,6 +282,8 @@ export interface InboxServerOptions {
    * Tests give temp folders and fake CLIs.
    */
   agentEnvironment?: AgentEnvironment;
+  /** Tests: how the search index slices its build (packages/shared/inbox/search.ts). Default: 5 ms slices that yield. */
+  searchIndex?: InboxSearchIndexOptions;
 }
 
 /**
@@ -285,6 +313,10 @@ export interface InboxServer {
    * run at a time; a call while one runs gets that run's report.
    */
   connectAgents: () => Promise<InboxConnectReport>;
+  /** The search index (built on the first search): tests and the benchmark read its build stats. */
+  search: InboxSearchIndex;
+  /** The background capture of images messages show (inbox-message-images.ts): tests wait on its `idle`. */
+  imageCapture: InboxImageCapture;
   stop: () => void;
 }
 
@@ -300,6 +332,7 @@ function json(body: unknown, status = 200): Response {
 
 const ERROR_STATUS: Record<string, number> = {
   validation_error: 422,
+  project_unresolved: 503,
   message_not_found: 404,
   thread_not_found: 404,
   project_not_found: 404,
@@ -313,7 +346,14 @@ const ERROR_STATUS: Record<string, number> = {
   // A pick on a question a Mark read closed: Move back first.
   question_set_aside: 409,
   thread_resolved: 409,
+  // 👍 Looks good: refused on a person's message, on an older agent message, and while a question is open.
+  ack_not_allowed: 422,
+  ack_stale: 409,
+  ack_after_reply: 409,
+  question_open: 409,
   idempotency_key_reused: 409,
+  // The project menu: a batch_id already answered another project or action.
+  batch_id_reused: 409,
   config_not_saved: 500,
   ...INBOX_DECISION_ERROR_STATUS,
   // Attachments and annotations (step 2).
@@ -322,6 +362,11 @@ const ERROR_STATUS: Record<string, number> = {
   attachment_changed_type: 409,
   attachment_not_text: 415,
   attachment_not_image: 415,
+  attachment_not_video: 415,
+  attachment_not_html: 415,
+  // "Open in" (packages/server/inbox-open-in.ts): an app the per-kind policy refuses, or one not installed.
+  open_not_allowed: 422,
+  app_not_available: 422,
   attachment_too_large: 413,
   annotation_not_allowed: 422,
   annotation_not_found: 404,
@@ -330,6 +375,18 @@ const ERROR_STATUS: Record<string, number> = {
   guide_not_found: 404,
   // New message (step 8).
   session_not_live: 409,
+  // Send now: the session's connection does not poll now, or cannot deliver into a running turn.
+  send_now_unavailable: 409,
+  // Compose: a new thread the person starts (packages/server/inbox-compose.ts).
+  already_delivered: 409,
+  not_addressed: 422,
+  // A thread name another open thread of the project already has.
+  thread_name_taken: 409,
+  draft_conflict: 409,
+  upload_refused: 422,
+  upload_too_large: 413,
+  markup_too_large: 413,
+  upload_not_found: 404,
   // Over your tailnet (packages/server/inbox-tailscale.ts).
   tailscale_env_decides: 409,
   tailscale_unavailable: 409,
@@ -377,29 +434,8 @@ function tokensEqual(a: string, b: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-/** The project root for a path an agent named: realpath, then its git toplevel. */
-export async function resolveInboxProjectRoot(path: string): Promise<{ root: string; name: string }> {
-  if (typeof path !== "string" || !isAbsolute(path)) {
-    throw new InboxError("validation_error", "project_path: must be an absolute path.", { field: "project_path" });
-  }
-  let real: string;
-  try {
-    real = realpathSync(path);
-    if (!statSync(real).isDirectory()) throw new Error("not a directory");
-  } catch {
-    throw new InboxError("validation_error", "project_path: no such folder.", { field: "project_path" });
-  }
-  let root = real;
-  try {
-    const proc = Bun.spawn(["git", "-C", real, "rev-parse", "--show-toplevel"], { stdout: "pipe", stderr: "ignore", stdin: "ignore" });
-    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    if (code === 0 && out.trim()) root = realpathSync(out.trim());
-  } catch {
-    // No git: the folder is the project.
-  }
-  const name = extractRepoName(root) ?? extractDirName(root) ?? "project";
-  return { root, name };
-}
+/** The project root for a path an agent named (the rules: packages/server/inbox-project-root.ts). */
+export { resolveInboxProjectRoot } from "./inbox-project-root";
 
 function startOnLoopback(fetch: Parameters<typeof Bun.serve>[0]["fetch"], preferred: number | null): { server: ReturnType<typeof Bun.serve>; portChanged: boolean } {
   const serve = (port: number) =>
@@ -457,6 +493,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   // A send a crash interrupted leaves a temp blob; the next start removes it once it is stale.
   sweepStaleInboxSendTemps(store.dir);
   const serverSession = createServerSessionNonce();
+  // Search (packages/server/inbox-search.ts): the index is built on the first search, not here.
+  const search = createInboxSearchRoutes({ store, serverSession, index: options.searchIndex });
   // Mark read: the note to the asking agents goes once the Undo window has passed.
   const setAsideDelayMs = options.setAsideDelayMs ?? INBOX_SET_ASIDE_DELAY_MS;
   const setAsideTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -475,6 +513,22 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     (timer as { unref?: () => void }).unref?.();
     setAsideTimers.add(timer);
   };
+  // 👍 Looks good: once the same Undo window has passed with it standing, the ack is sent to the agent (a note, delivered like a reply).
+  const settleAcks = () => {
+    try {
+      store.settleAcks(setAsideDelayMs);
+    } catch (error) {
+      process.stderr.write(`Inbox: an acknowledgment was not settled: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  };
+  const scheduleAckSettle = () => {
+    const timer = setTimeout(() => {
+      setAsideTimers.delete(timer);
+      settleAcks();
+    }, setAsideDelayMs + 50);
+    (timer as { unref?: () => void }).unref?.();
+    setAsideTimers.add(timer);
+  };
   const token = createInboxToken();
   // Read once per start: the phone surface stays hidden until the iPhone app ships.
   const phonesOn = options.phones ?? resolveInboxPhones(loadConfig());
@@ -484,6 +538,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   let baseUrl = "";
   let portChanged = false;
   const statusListeners = new Set<() => void>();
+  // The Inbox windows open now and whether any can show a notification (inbox-windows.ts).
+  const windows = createInboxWindows({ graceMs: options.windowGraceMs });
   const binaryPath = options.binaryPath !== undefined ? options.binaryPath : version !== "dev" ? process.execPath : null;
   // The sidebar's Update button (packages/server/inbox-updates.ts): the daily
   // release check, the binary on disk, Update now, Remind me tomorrow.
@@ -503,11 +559,34 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   // when a project is first seen, never while a request waits (inbox-repos.ts).
   const repos = createInboxRepoCache(options.readProjectRepo ? { read: options.readProjectRepo } : {});
 
+  // Where a path an agent named files its messages: its repository (a linked
+  // worktree folds into its main repository's project) or the folder, cached
+  // per folder (packages/server/inbox-project-root.ts). One cache for sends
+  // and live sessions, so they always agree.
+  const projectRoots = createInboxProjectRoots(options.projectRootGit ? { git: options.projectRootGit } : {});
+  // Images messages show that have no captured file yet: copied in the background after a read of their thread (inbox-message-images.ts).
+  const imageCapture = createInboxImageCapture(store);
   const projectLocks = new Map<string, Promise<InboxProject>>();
   const resolveProject = async (path: string): Promise<InboxProject> => {
-    const { root, name } = await resolveInboxProjectRoot(path);
+    const { root, name, folder, settled } = await projectRoots.resolve(path);
     const existing = store.projectByRoot(root);
     if (existing) return existing;
+    if (!settled) {
+      // git ran past its time limit, so `root` is a guess. A project the
+      // store would keep forever is never made from it: the nearest existing
+      // REPOSITORY project holding the folder (its root has a `.git`; read
+      // from disk, no git), else the agent is told to try again. A folder
+      // project (`~`, a notes folder) never takes a guess: a new worktree or
+      // repository under it would be filed there for good.
+      const repositories = store.listProjects().filter((project) => existsSync(join(project.root, ".git")));
+      const holder = nearestProjectHolding(repositories, folder);
+      if (holder) return holder;
+      throw new InboxError(
+        "project_unresolved",
+        `Could not tell which project ${folder} belongs to: git did not answer in time. Nothing was sent or saved; try the same call again.`,
+        { field: "project_path" },
+      );
+    }
     void repos.refresh(root);
     // One creation per root even when two calls race through the await above.
     let pending = projectLocks.get(root);
@@ -525,6 +604,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         store,
         baseUrl: () => baseUrl,
         resolveProject,
+        projectRootOf: (path) => projectRoots.resolve(path),
         recordAttachments: (paths, project, base) =>
           recordInboxAttachments(store.dir, paths, { base, at: new Date().toISOString() }),
         // An open wait_for_reply keeps its session present (never "ended").
@@ -533,14 +613,57 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     { legacy: "stateless", maxRequestBodySize: INBOX_MAX_REQUEST_BYTES },
   );
 
-  const health = (): InboxHealth => ({ ok: true, app: INBOX_APP_ID, version, serverSession, pid: process.pid, update: updates.current() });
+  const health = (): InboxHealth => ({
+    ok: true,
+    app: INBOX_APP_ID,
+    version,
+    serverSession,
+    pid: process.pid,
+    update: updates.current(),
+    notify_reach: windows.reach(notificationsState().enabled),
+  });
 
-  /** The sidebar's folders: every project, with its thread and unread counts. */
+  /**
+   * The sidebar's folders: every project, with its thread and unread counts,
+   * and (additive) `listed`, the threads the window's list holds, and
+   * `archived`, the rest. The window leaves out a project with nothing listed
+   * (the project menu's automatic hiding); an older window ignores both.
+   */
   const projectFolders = (rows: readonly InboxListRow[] = store.listRows()) => {
     return store.listProjects().map((project) => {
       const mine = rows.filter((row) => row.project.id === project.id);
-      return { ...project, threads: mine.length, unread: mine.filter((row) => row.unread).length };
+      const archived = mine.filter((row) => inboxRowArchived(row)).length;
+      return { ...project, threads: mine.length, unread: mine.filter((row) => row.unread).length, listed: mine.length - archived, archived };
     });
+  };
+
+  /**
+   * The project menu's batches remember their answer by `batch_id` (the
+   * last 50, in memory), so a retried request answers what the first one did
+   * and its Undo still names the threads it touched.
+   */
+  const batches = new Map<string, { route: string; answer: unknown }>();
+  const BATCH_MEMORY = 50;
+  const batchIdOf = (body: Record<string, unknown>): string | null => {
+    const id = body.batch_id;
+    if (id === undefined || id === null) return null;
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) {
+      throw new InboxError("validation_error", "batch_id: 1 to 128 letters, digits, _ or -.", { field: "batch_id" });
+    }
+    return id;
+  };
+  const rememberBatch = (id: string | null, route: string, answer: unknown) => {
+    if (id === null) return;
+    batches.set(id, { route, answer });
+    while (batches.size > BATCH_MEMORY) batches.delete(batches.keys().next().value!);
+  };
+  /** Thread ids a body names: a list of msg_ ids (an Undo). */
+  const threadIdList = (value: unknown, field: string): string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.length > 10_000 || !value.every((id) => isInboxId("msg", id))) {
+      throw new InboxError("validation_error", `${field}: a list of thread ids (msg_).`, { field });
+    }
+    return value as string[];
   };
 
   /**
@@ -643,8 +766,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       ? createAgentEnvironmentFor({ platform: process.platform, homeDir: join(dataDir, "agents-home"), env: { HOME: join(dataDir, "agents-home"), PATH: "" } })
       : createAgentEnvironment());
   let connecting: Promise<InboxConnectReport> | null = null;
+  // The Inbox's stop ends a run still going: its agent CLIs are killed, never left running.
+  const connectStop = new AbortController();
   const connectAgents = (): Promise<InboxConnectReport> => {
-    connecting ??= connectInboxAgents({ dataDir, selfCommand, environment: agentEnvironment }).finally(() => {
+    connecting ??= connectInboxAgents({ dataDir, selfCommand, environment: agentEnvironment, signal: connectStop.signal }).finally(() => {
       connecting = null;
     });
     return connecting;
@@ -666,12 +791,25 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         const reach = await inboxAgentReach(id, options);
         const host = (INBOX_TOOL_HOSTS as readonly string[]).includes(id) ? (id as InboxToolHost) : null;
         // The Inbox tool switch of the three Plannotator hosts stays reachable whether or not the agent was found.
-        const tool = host ? { on: resolveInboxTool(config, env, host), locked: toolEnv !== undefined } : null;
-        const reminder = host ? { on: resolveInboxReminder(config, env, host), locked: toolEnv !== undefined, needs_tool: !resolveInboxTool(config, env, host) } : null;
+        // chosen_off: config.json turns it off by name (the person's choice, e.g. Settings' switch), not the host default.
+        // Claude Code's tool comes from its plugin's mod: with the mod off (PLANNOTATOR_CLAUDE_MOD / claudeCodeMod) there is none.
+        const modOff = id === "claude-code" && !claudeCodeModOn(agentEnvironment);
+        const tool = host
+          ? {
+              on: !modOff && resolveInboxTool(config, env, host),
+              locked: toolEnv !== undefined,
+              chosen_off: toolEnv === undefined && configuredInboxTool(config, host) === false,
+              ...(modOff ? { mod_off: true } : {}),
+            }
+          : null;
+        // No tool (the inboxTool switch, or Claude Code's mod off): no reminder.
+        const reminder = host
+          ? { on: !modOff && resolveInboxReminder(config, env, host), locked: toolEnv !== undefined, needs_tool: modOff || !resolveInboxTool(config, env, host) }
+          : null;
         // With PLANNOTATOR_INBOX_NOTES=0 only a note already written is listed, so it can still be turned off.
         const status = (INBOX_NOTE_AGENT_IDS as readonly string[]).includes(id) ? noteStatus(id as InboxNoteAgentId, dataDir, agentEnvironment) : null;
         const note = status && (!notesOff || status.state === "added" || status.state === "edited") ? status : null;
-        return { id, label: INBOX_AGENT_LABELS[id], detected, reach, tool, reminder, note };
+        return { id, label: INBOX_AGENT_LABELS[id], detected, reach, tool, reminder, note, plugin: inboxPluginStatus(id, agentEnvironment) };
       }),
     );
     return {
@@ -1008,6 +1146,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     data_dir: dataDir,
     inbox_tool: inboxToolState(),
     notifications: notificationsState(),
+    /** Whether a notification can reach the person now: the windows open and how many may notify. */
+    notify_reach: windows.reach(notificationsState().enabled),
     /** The question sound: the Settings row, and whether the one-time dialog was shown. */
     sound: soundState(),
     /** Settings → About: update notices and automatic updates. */
@@ -1053,9 +1193,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   const eventPayload = (line: InboxLine) => {
     switch (line.kind) {
       case "project":
-        return { seq: line.seq, kind: line.kind, id: line.id, project: line.record };
+        // The display name (the folder's real name), as every other read gives it.
+        return { seq: line.seq, kind: line.kind, id: line.id, project: { ...line.record, name: store.project(line.id)?.name ?? line.record.name } };
       case "message":
-        return { seq: line.seq, kind: line.kind, id: line.id, message: line.record };
+        // `first` (additive): this line is the message's first, not a later rewrite (a look, a resolve, an Unarchive).
+        return { seq: line.seq, kind: line.kind, id: line.id, first: store.messageCursor(line.id) === line.seq, message: line.record };
       case "question":
         // The store's one question state: a question an agent asked after the archive line is live (notifications, the sound).
         return { seq: line.seq, kind: line.kind, id: line.id, question: store.questionWire(line.record) };
@@ -1066,10 +1208,20 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     }
   };
 
-  const eventStream = (req: Request, url: URL): Response => {
-    const raw = url.searchParams.get("cursor") ?? req.headers.get("last-event-id");
-    const parsed = raw === null ? null : Number(raw);
-    const cursor = parsed !== null && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+  const eventStream = (req: Request, url: URL, via: RequestVia): Response => {
+    // A reconnect: EventSource sends the last id it saw, while its URL still
+    // carries the cursor it first opened with. The last id wins, so a tab that
+    // slept or lost its connection catches up from where it was (and raises
+    // what it missed) instead of replaying everything since it loaded.
+    // Only a usable id counts (a non-negative whole number): an empty or
+    // malformed header falls back to the URL's cursor, never to a full replay
+    // or to none.
+    const seqOf = (raw: string | null): number | null => {
+      if (raw === null || !/^\d+$/.test(raw.trim())) return null;
+      const value = Number(raw.trim());
+      return Number.isSafeInteger(value) ? value : null;
+    };
+    const cursor = seqOf(req.headers.get("last-event-id")) ?? seqOf(url.searchParams.get("cursor"));
     const encoder = new TextEncoder();
     let cleanup = () => {};
     const stream = new ReadableStream<Uint8Array>({
@@ -1085,13 +1237,30 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         send(`retry: 2000\nevent: hello\ndata: ${JSON.stringify({ serverSession, cursor: store.cursor() })}\n\n`);
         if (cursor !== null) for (const line of store.changesSince(cursor)) sendLine(line);
         const unsubscribe = store.subscribe(sendLine);
-        const onStatus = () => send(`event: status\ndata: ${JSON.stringify({ update: updates.current() })}\n\n`);
+        // `updated` (additive): the "What's new in X" link appears or goes once its notes are fetched or cannot be.
+        const onStatus = () => send(`event: status\ndata: ${JSON.stringify({ update: updates.current(), updated: updates.updated() })}\n\n`);
         statusListeners.add(onStatus);
+        // An Inbox window (not the phone's door): counted while its stream is open, with what it reported.
+        const windowId = parseWindowId(url.searchParams.get("window"));
+        const leave = windowId
+          ? windows.connect(windowId, {
+              permission: parseWindowPermission(url.searchParams.get("permission")),
+              origin: parseWindowOrigin(url.searchParams.get("origin")),
+              via,
+            })
+          : () => {};
+        // Whether a notification can reach the person: every window's Settings shows it live.
+        // Windows only: the phone's door (contract 7.9) gets hello, record, status and the heartbeat.
+        const sendReach = () => send(`event: reach\ndata: ${JSON.stringify(windows.reach(notificationsState().enabled))}\n\n`);
+        const stopReach = windowId ? windows.subscribe(sendReach) : () => {};
+        if (windowId) sendReach();
         const heartbeat = setInterval(() => send(": ping\n\n"), SSE_HEARTBEAT_MS);
         cleanup = () => {
           clearInterval(heartbeat);
           unsubscribe();
           statusListeners.delete(onStatus);
+          stopReach();
+          leave();
         };
         req.signal.addEventListener("abort", () => {
           cleanup();
@@ -1125,7 +1294,13 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   // out again on every poll until it is delivered or an agent read it, and it
   // survives an Inbox restart.
   const threadPageUrl = (base: string, threadId: string) => `${base}#thread=${threadId}`;
-  const replyCommand = (reply: InboxMessage): InboxReplyCommand => {
+  /** The session a person's message without `to` goes to: the author of the message it answers. */
+  const recipientOf = (reply: InboxMessage): string | null => {
+    const parent = reply.reply_to ? store.message(reply.reply_to) : null;
+    return parent?.author.kind === "agent" ? parent.author.session : null;
+  };
+  /** `sendNow`: the polling connection said it can deliver into a running turn; only then does a Send now reply carry `now`. */
+  const replyCommand = (reply: InboxMessage, sendNow = false): InboxReplyCommand => {
     // A reply the person sent to another session because the one that asked
     // had ended: the wake says so, naming the agent that asked.
     const asked = reply.to && reply.reply_to ? store.message(reply.reply_to) : null;
@@ -1137,15 +1312,35 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
           ? inboxAgentName({ kind: "agent", host: asked.author.host, name: null })
           : "agent"
         : null;
+    // More words in a thread the person started, handed to a session that has
+    // seen nothing of it (the person moved them there): read the thread first.
+    const root = store.message(reply.thread_id);
+    const continues =
+      !!reply.to &&
+      reply.thread_id !== reply.id &&
+      !!root?.started_by_person &&
+      root.delivery?.session !== reply.to.session &&
+      // The root goes to this session too (not taken yet, maybe in the same poll): it opens the thread.
+      root.to?.session !== reply.to.session &&
+      !store.thread(reply.thread_id)?.messages.some((m) => m.author.kind === "agent" && m.author.session === reply.to!.session);
     return {
       type: reply.to && !reply.reply_to ? "message" : "reply",
       id: reply.id,
       thread_id: reply.thread_id,
       reply_to: reply.reply_to,
       subject: store.threadSubject(reply.thread_id),
-      body: reply.body,
+      body: inboxBodyForAgent(reply),
       url: threadPageUrl(baseUrl, reply.thread_id),
       ...(redirected ? { redirected_from: redirected } : {}),
+      // A thread the person started: the wake says so (INBOX_NEW_THREAD_INSTRUCTION).
+      ...(reply.started_by_person && reply.thread_id === reply.id ? { new_thread: true } : {}),
+      ...(continues && !redirected ? { continues_thread: true } : {}),
+      // Send now: the connection delivers it at once, into the running turn when one runs.
+      ...(reply.deliver_now_at && sendNow ? { now: true } : {}),
+      // A thread the person started with no name yet, handed to a session that may name it: the wake asks it to.
+      ...(!reply.ack_of && store.canNameThread(reply.thread_id, reply.to?.session ?? recipientOf(reply)) ? { name_thread: true } : {}),
+      // The person's 👍 Looks good (amended 2026-10-16): the wake is the one ack line.
+      ...(reply.ack_of ? { ack_of: reply.ack_of } : {}),
     };
   };
 
@@ -1163,7 +1358,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     const waitMs = Math.min(Math.max(requested, 0), INBOX_BRIDGE_POLL_MAX_MS);
     // Step 8: a polling session is live (New message can reach it) while its poll is held.
     const answered = await live.pollStarted(session, bridgeHost(body), body);
-    const commands = () => store.pendingReplies(session).map(replyCommand);
+    const sendNow = body[INBOX_SEND_NOW_POLL_FIELD] === true;
+    const commands = () => store.pendingReplies(session).map((reply) => replyCommand(reply, sendNow));
     const now = commands();
     if (now.length > 0 || waitMs === 0) {
       answered();
@@ -1203,6 +1399,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       live.stateChanged(session, host, body);
       return json({ ok: true });
     }
+    // Send now could not go into the running turn: the reply reads as queued again and waits for idle.
+    if (body.type === "send_now_failed" && typeof body.id === "string") {
+      store.clearDeliverNow(body.id, session);
+      return json({ ok: true });
+    }
     if (body.type !== "delivered" || typeof body.id !== "string") {
       throw new InboxError("validation_error", 'type: "delivered" with the reply id, or "state" with busy.', { field: "type" });
     }
@@ -1228,8 +1429,21 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   const live = createInboxLiveSessions({
     store,
     serverSession,
-    resolveRoot: async (path) => (await resolveInboxProjectRoot(path)).root,
+    resolveRoot: async (path) => (await projectRoots.resolve(path)).root,
   });
+
+  // Compose: a new thread the person starts with a live agent, drafts and uploads (packages/server/inbox-compose.ts).
+  const compose = createInboxCompose({
+    store,
+    serverSession,
+    live,
+    resolveProject,
+    readBody: (req) => readBody(req),
+    json,
+  });
+  compose.sweep();
+  const uploadSweep = setInterval(() => compose.sweep(), INBOX_UPLOAD_SWEEP_MS);
+  (uploadSweep as { unref?: () => void }).unref?.();
 
   let stopRequested = false;
   let server: ReturnType<typeof Bun.serve>;
@@ -1252,6 +1466,16 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   /** A route the tailnet never reaches: it would hand a tailnet peer this machine's agent surface, or widen the Inbox's exposure. */
   const localOnly = () =>
     json({ error: "This answers only on this computer, not over the tailnet.", code: "local_only" }, 403);
+
+  /** "Open in" for attachments: launches an app on this computer, so local only (never the tailnet, never the device door). */
+  const openInRoute = createInboxOpenInRoute({
+    store,
+    serverSession,
+    readBody,
+    json,
+    localOnly,
+    launcher: options.openInLauncher ?? systemOpenInLauncher(),
+  });
 
   const handle = async (req: Request, via: RequestVia): Promise<Response> => {
     // The tailnet listener checked its own Host (the served MagicDNS name)
@@ -1362,7 +1586,19 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       if (path === "/api/inbox/threads" && req.method === "GET") return json(listModel(projectFilterOf(url), archivedModeOf(url)));
       if (path === "/api/inbox/threads/archived" && req.method === "GET") return json(archivedModel(url));
       if (path === "/api/inbox/projects" && req.method === "GET") return json({ serverSession, cursor: store.cursor(), projects: projectFolders() });
-      if (path === "/api/inbox/events" && req.method === "GET") return eventStream(req, url);
+      if (path === "/api/inbox/events" && req.method === "GET") return eventStream(req, url, via);
+      // A window's report: its browser's notification permission for its own origin changed (inbox-windows.ts).
+      if (path === "/api/inbox/window") {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        const windowId = parseWindowId(body.window);
+        const permission = parseWindowPermission(body.permission);
+        if (!windowId) throw new InboxError("validation_error", "window: 8 to 64 letters, digits, - or _.", { field: "window" });
+        if (!permission) throw new InboxError("validation_error", "permission: granted, default, denied or unsupported.", { field: "permission" });
+        windows.report(windowId, { permission, origin: parseWindowOrigin(body.origin), via });
+        return json({ notify_reach: windows.reach(notificationsState().enabled) });
+      }
       if (path === "/api/inbox/restart") {
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
         const body = await readBody(req);
@@ -1385,8 +1621,17 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (via === "tailnet") return localOnly();
         if (path === "/api/inbox/whats-new") {
           if (req.method !== "GET") return json({ error: "Use GET." }, 405);
-          const notes = updates.whatsNew(url.searchParams.get("version") ?? "");
-          return notes ? json(notes) : json({ error: "No release notes for that version.", code: "notes_not_found" }, 404);
+          // Notes this machine never saved (a version installed outside the
+          // Inbox) are fetched by the release's tag, waited for at most 3 s;
+          // past that the page is told to ask again (503 notes_loading).
+          const answer = await updates.whatsNew(url.searchParams.get("version") ?? "");
+          if (answer.kind === "notes") return json(answer.notes);
+          if (answer.kind === "loading") {
+            const res = json({ error: "Fetching the release notes…", code: "notes_loading", retry_after_ms: 1000 }, 503);
+            res.headers.set("Retry-After", "1");
+            return res;
+          }
+          return json({ error: "No release notes for that version.", code: "notes_not_found" }, 404);
         }
         if (path === "/api/inbox/update" && req.method === "GET") return json(updates.details());
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
@@ -1485,9 +1730,22 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return json({ show, sound: soundState() });
       }
 
+      // Search: a read route (and the recent searches the window writes on opening a result).
+      const searched = await search.handle(req, url);
+      if (searched) return searched;
+      // The composers' skill picker and the SKILL.md a Send pastes in (inbox-skills.ts): read routes.
+      const skills = inboxSkillsRoute(req, url);
+      if (skills) return skills;
+
+      // Compose: live sessions in every project, a new thread, Send to another session, drafts and uploads.
+      const composed = await compose.route(req, url);
+      if (composed) return composed;
+
       const threadMatch = /^\/api\/inbox\/threads\/([A-Za-z0-9_]+)$/.exec(path);
       if (threadMatch && req.method === "GET") {
         // The window's thread: each message's seq (what is new since the last look) and a reply's sent annotations.
+        // Images the messages show with no captured file yet: copied in the background; the read never waits (approval "inbox-image-viewer").
+        if (store.thread(threadMatch[1]!)) imageCapture.schedule(threadMatch[1]!);
         const thread = store.windowThread(threadMatch[1]!);
         if (!thread) return json({ error: "No such thread.", code: "thread_not_found" }, 404);
         const decisionIds = thread.messages.flatMap((m) => (m.questions ?? []).map((q) => q.decision_id));
@@ -1521,6 +1779,85 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return json({ thread: row });
       }
 
+      // 👍 Looks good (design record "inbox-acknowledge"): silent, nothing sent and no
+      // session woken; an ack on the agent's latest message and a Mark read.
+      // `{ ack: false }` takes it back (the toast's Undo, the pressed button).
+      const ackMatch = /^\/api\/inbox\/messages\/([A-Za-z0-9_]+)\/ack$/.exec(path);
+      if (ackMatch) {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        if (body.ack !== undefined && typeof body.ack !== "boolean") throw new InboxError("validation_error", "ack: must be a boolean.", { field: "ack" });
+        const on = body.ack !== false;
+        const result = store.ackMessage(ackMatch[1]!, on);
+        if (on) scheduleAckSettle();
+        return json(result);
+      }
+
+      // The project menu (design record "inbox-project-menu"): Mark all as
+      // read and Archive all on one project, and their Undo. Loops over the
+      // single actions (packages/shared/inbox/project-batch.ts); the same
+      // guards as every window write. On the phone's door too (contract
+      // 7.43 to 7.45), whose idempotency log replays a batch's answer.
+      const projectBatchMatch = /^\/api\/inbox\/projects\/([A-Za-z0-9_]+)\/(read|unread|resolve)$/.exec(path);
+      if (projectBatchMatch) {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        const projectId = projectBatchMatch[1]!;
+        if (!isInboxId("prj", projectId)) throw new InboxError("validation_error", "A project id (prj_).", { field: "project" });
+        if (!store.project(projectId)) throw new InboxError("project_not_found", `No project ${projectId}.`);
+        const action = projectBatchMatch[2]!;
+        const batchId = batchIdOf(body);
+        const route = `${action}:${projectId}:${action === "resolve" ? String(body.resolved !== false) : ""}`;
+        if (batchId !== null) {
+          const seen = batches.get(batchId);
+          if (seen && seen.route !== route) throw new InboxError("batch_id_reused", "This batch_id answered another request.");
+          if (seen) return json({ ...(seen.answer as object), replayed: true });
+        }
+        const rows = (ids: readonly string[]) => ids.map((id) => store.listRow(id)).filter((row): row is InboxListRow => row !== null);
+        const folder = () => projectFolders().find((p) => p.id === projectId) ?? null;
+        let answer: Record<string, unknown>;
+        // A batch that stopped partway (a write failed): the threads it changed get their notes, and the
+        // answer names them with `error`, so the window offers Undo for what did apply and says the rest
+        // did not change. The cause goes to stderr, never the page.
+        const incomplete = (error: string | undefined) => {
+          if (error === undefined) return {};
+          process.stderr.write(`Inbox: the project menu's batch on ${projectId} stopped partway: ${error}\n`);
+          return { error: { code: "batch_incomplete", message: "Stopped partway; the other threads did not change." } };
+        };
+        if (action === "read") {
+          const { error, ...batch } = markProjectRead(store, projectId);
+          for (const id of batch.read) scheduleSetAside(id);
+          answer = { project: folder(), batch, threads: rows(batch.read), ...incomplete(error) };
+        } else if (action === "unread") {
+          const ids = threadIdList(body.threads, "threads");
+          const result = unmarkProjectRead(store, projectId, ids);
+          answer = { project: folder(), threads: rows(result.done), skipped: result.skipped };
+        } else {
+          if (body.resolved !== undefined && typeof body.resolved !== "boolean") throw new InboxError("validation_error", "resolved: must be a boolean.", { field: "resolved" });
+          if (body.resolved !== false) {
+            const { error, ...batch } = archiveProject(store, projectId);
+            // A came-back thread sent back by Mark read: its set-aside note, as for the single action.
+            for (const id of batch.read) scheduleSetAside(id);
+            answer = { project: folder(), batch, threads: rows([...batch.resolved, ...batch.read]), ...incomplete(error) };
+          } else {
+            const named = body.threads;
+            if (!named || typeof named !== "object" || Array.isArray(named)) {
+              throw new InboxError("validation_error", "threads: { resolved: [ids], read: [ids] } from the batch to undo.", { field: "threads" });
+            }
+            const { resolved, read } = named as Record<string, unknown>;
+            const undo = { resolved: threadIdList(resolved, "threads.resolved"), read: threadIdList(read, "threads.read") };
+            const result = unarchiveProject(store, projectId, undo);
+            // Unarchived: a Mark read's set-aside note an archive held back is due again (as for the single Unarchive).
+            for (const id of undo.resolved) if (result.done.includes(id)) scheduleSetAside(id);
+            answer = { project: folder(), threads: rows(result.done), skipped: result.skipped };
+          }
+        }
+        rememberBatch(batchId, route, answer);
+        return json({ ...answer, replayed: false });
+      }
+
       // Guided reviews (step 5): the snapshot a message carries (packages/server/inbox-guides.ts).
       const guide = await inboxGuideRoute(req, path, store, serverSession);
       if (guide) return guide;
@@ -1543,9 +1880,20 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
             // An unknown message is the store's 404, never "not live".
             const asked = body.to === undefined ? undefined : store.message(messageId);
             const to = body.to === undefined || !asked ? undefined : live.replyTarget(asked.thread_id, body.to);
+            // Files the person pasted into the reply box: their uploads become
+            // attachments on the reply, exactly as compose's become a thread's.
+            // A replay answers the reply it wrote before anything is copied
+            // (its uploads are gone by then); the rest checks the message first.
+            const uploads = body.uploads === undefined || body.uploads === null ? [] : body.uploads;
+            if (!Array.isArray(uploads)) throw new InboxError("validation_error", "uploads: a list of upload ids.", { field: "uploads" });
+            const replayKey = typeof body.idempotency_key === "string" ? body.idempotency_key.trim() : "";
+            const fresh = uploads.length > 0 && !store.replyByKey(messageId, replayKey);
+            if (fresh && !store.message(messageId)) throw new InboxError("message_not_found", `No message ${messageId}.`);
+            const attachments = fresh ? inboxUploadAttachments(store.dir, uploads, new Date().toISOString()) : [];
             let result: ReturnType<typeof store.sendReply>;
             try {
               result = store.sendReply(messageId, {
+                ...(attachments.length > 0 ? { attachments } : {}),
                 ...(to === undefined ? {} : { to }),
                 words: typeof body.words === "string" ? body.words : undefined,
                 questions: (body.questions as never) ?? [],
@@ -1555,6 +1903,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
                 skip_unanswered: body.skip_unanswered === true,
               });
             } catch (error) {
+              removeInboxAttachmentFiles(store.dir, attachments);
               // A skip-only target whose questions closed meanwhile: a no-op, so
               // the rest of a multi-message Send still goes.
               if (error instanceof InboxError && error.code === "nothing_to_send") {
@@ -1562,6 +1911,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
               }
               throw error;
             }
+            if (result.replayed) removeInboxAttachmentFiles(store.dir, attachments);
+            // Sent: the uploads are the reply's attachments now.
+            else if (attachments.length > 0) removeInboxUploads(store.dir, uploads.filter((id): id is string => typeof id === "string"));
             // Step 3: the sent answers whose decision switch is on become
             // decisions, after the reply landed; a refused one never undoes it.
             const decisions = recordDecisionsForReply(store, result.reply.id);
@@ -1597,6 +1949,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       if (decisionResponse) return decisionResponse;
 
       if (path === "/" && (req.method === "GET" || req.method === "HEAD")) {
+        // One origin: notification permission is per origin (inbox-canonical.ts).
+        const canonical = inboxCanonicalRedirect(req, url, port, via);
+        if (canonical) return canonical;
         const page = options.htmlContent ?? NOT_BUILT_PAGE;
         return new Response(req.method === "HEAD" ? null : page, {
           headers: {
@@ -1615,10 +1970,14 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       const newMessage = await live.route(req, path);
       if (newMessage) return newMessage;
 
-      // #1813: an image a message's body shows, read from its project
-      // (packages/server/inbox-message-images.ts).
-      const image = inboxMessageImageRoute(req, url, store);
+      // #1813: an image a message's body shows, read from wherever it is on this
+      // computer outside hidden folders (packages/server/inbox-message-images.ts).
+      const image = await inboxMessageImageRoute(req, url, store);
       if (image) return image;
+
+      // "Open in": an attachment in its own app, by id only (packages/server/inbox-open-in.ts).
+      const opened = await openInRoute(req, path, via);
+      if (opened) return opened;
 
       // Step 2: attachments by id, annotations, the HTML asset route, delete
       // thread and delete project (packages/server/inbox-attachments.ts).
@@ -1653,12 +2012,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     return handle(req, "local");
   };
 
-  attachmentRoutes = createInboxAttachmentRoutes({ store, serverSession, readBody });
+  attachmentRoutes = createInboxAttachmentRoutes({ store, serverSession, readBody, streamIdleMs: options.streamIdleMs, scheduleImageCapture: imageCapture.schedule });
   const started = startOnLoopback(fetch, previous?.port ?? null);
   server = started.server;
   portChanged = started.portChanged;
   port = server.port as number;
-  baseUrl = `http://localhost:${port}/`;
+  baseUrl = inboxCanonicalBaseUrl(port);
 
   const registry: InboxRegistryEntry = {
     v: 1,
@@ -1747,6 +2106,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // A set-aside note a stop interrupted (marked read, then the Inbox went away within the Undo window).
     for (const threadId of store.setAsideDue(setAsideDelayMs)) tellSetAside(threadId);
     for (const threadId of store.setAsideDue(0)) scheduleSetAside(threadId);
+    // An ack a stop interrupted inside its Undo window.
+    settleAcks();
+    if (store.acksPending() > 0) scheduleAckSettle();
   }, 0);
 
   let stopped = false;
@@ -1756,9 +2118,15 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     if (stopped) return;
     stopped = true;
     clearInterval(dataCheck);
+    windows.stop();
     for (const timer of setAsideTimers) clearTimeout(timer);
     setAsideTimers.clear();
+    connectStop.abort();
     updates.stop();
+    search.dispose();
+    // No capture writes after stop (a restart to update starts the next binary on this store).
+    imageCapture.stop();
+    clearInterval(uploadSweep);
     void mcp.close().catch(() => {});
     server.stop(true);
     // The tailnet mapping and the door listener, the Wi-Fi listener and its
@@ -1770,7 +2138,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     tailnetStopFailedPort = tailscale.stop().failedPort;
   };
 
-  return { port, url: baseUrl, token, serverSession, portChanged, store, registry, tailscale, connectAgents, stop };
+  return { port, url: baseUrl, token, serverSession, portChanged, store, registry, tailscale, connectAgents, search: search.index, imageCapture, stop };
 }
 
 /** Print where the Inbox is, and open it when a person asked for it. */

@@ -189,10 +189,12 @@ Register the tool but manage prompts and permissions yourself:
 |----------|-------------|
 | `PLANNOTATOR_REMOTE` | Set to `1` / `true` for remote mode, `0` / `false` for local mode, or leave unset for SSH auto-detection. Uses a fixed port in remote mode; browser-opening behavior depends on the environment. |
 | `PLANNOTATOR_PORT` | Fixed port to use. Default: random locally, `19432` for remote sessions. |
-| `PLANNOTATOR_BROWSER` | Custom browser to open plans in. macOS: app name or path. Linux/Windows: executable path. |
+| `PLANNOTATOR_BROWSER` | Custom browser to open plans in. macOS: app name or path. Linux/Windows: executable path. `none` (also `false`, `0`, `off`, `no`, `true`, `1`, `:`) opens no browser at all; the session URL is always printed. |
 | `PLANNOTATOR_ARTIFACT_SERVER_URL` | Artifact Server origin. Default: `https://artifacts.orvex.ai`. |
 | `PLANNOTATOR_ARTIFACT_SERVER_PROFILE` | Optional saved `artifactserver` CLI profile name. |
 
+| `PLANNOTATOR_SHARE_URL` | Custom share portal URL for self-hosting. Default: `https://share.plannotator.ai`. |
+| `PLANNOTATOR_PASTE_URL` | Custom paste service URL for self-hosting. Default: `https://plannotator-paste.plannotator.workers.dev`. |
 | `PLANNOTATOR_PLAN_TIMEOUT_SECONDS` | Timeout for `submit_plan` review wait. Default: `345600` (96h). Set `0` to disable timeout. |
 | `PLANNOTATOR_INBOX_TOOL` | Set to `1` to give the agent the `plannotator_inbox` tool when an Inbox is installed, `0` to keep it out. Wins over `inboxTool` in `~/.plannotator/config.json`. Default: off. |
 | `PLANNOTATOR_BIN` | Override the CLI path used by the OpenCode plugin's CLI runtime fallback. Default: `plannotator` on `PATH`. |
