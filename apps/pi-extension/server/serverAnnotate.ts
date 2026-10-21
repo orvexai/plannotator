@@ -61,6 +61,7 @@ import {
 	handleUploadRequest,
 } from "./handlers.ts";
 import { handleApiNotFound, html, json, parseBody, requestUrl } from "./helpers.ts";
+import { publishToArtifactServer, readArtifactServerComments, DEFAULT_ARTIFACT_SERVER_URL } from "../generated/artifact-server.ts";
 import { createPiAIRuntime, handlePiAIRequest } from "./ai-runtime.ts";
 import type { SessionBridge } from "../generated/ai/session-bridge.ts";
 
@@ -332,6 +333,7 @@ export async function startAnnotateServer(options: {
 		options.sharingEnabled ?? resolveSharingEnabled(loadConfig());
 	const shareBaseUrl =
 		(options.shareBaseUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
+	const artifactServerUrl = shareBaseUrl || DEFAULT_ARTIFACT_SERVER_URL;
 	const pasteApiUrl =
 		(options.pasteApiUrl ?? process.env.PLANNOTATOR_ARTIFACT_SERVER_URL) || undefined;
 
@@ -1084,6 +1086,40 @@ export async function startAnnotateServer(options: {
 				slug: annotateHistory.slug,
 				versions: listVersions(annotateProjectName, annotateHistory.slug),
 			});
+		} else if (url.pathname === "/api/artifact-share" && req.method === "POST") {
+			if (!isSameOriginOrNoOrigin(req.headers.origin ?? null, req.headers.host ?? "", req.headers["sec-fetch-site"])) {
+				json(res, { error: "Cross-origin request refused" }, 403);
+				return;
+			}
+			if (!sharingEnabled) {
+				json(res, { error: "Sharing is disabled" }, 403);
+				return;
+			}
+			try {
+				const body = await parseBody(req) as { content?: unknown; title?: unknown };
+				if (typeof body.content !== "string" || typeof body.title !== "string") {
+					json(res, { error: "content and title are required" }, 400);
+					return;
+				}
+				json(res, await publishToArtifactServer(body.content, body.title, artifactServerUrl));
+			} catch (error) {
+				json(res, { error: error instanceof Error ? error.message : "Artifact Server publish failed" }, 502);
+			}
+		} else if (url.pathname === "/api/artifact-comments" && req.method === "POST") {
+			if (!isSameOriginOrNoOrigin(req.headers.origin ?? null, req.headers.host ?? "", req.headers["sec-fetch-site"])) {
+				json(res, { error: "Cross-origin request refused" }, 403);
+				return;
+			}
+			try {
+				const body = await parseBody(req) as { reviewUrl?: unknown };
+				if (typeof body.reviewUrl !== "string") {
+					json(res, { error: "reviewUrl is required" }, 400);
+					return;
+				}
+				json(res, await readArtifactServerComments(body.reviewUrl, artifactServerUrl));
+			} catch (error) {
+				json(res, { error: error instanceof Error ? error.message : "Artifact Server comments could not be read" }, 502);
+			}
 		} else if (url.pathname === "/api/share-html" && req.method === "GET") {
 			handleShareHtml(res, url);
 		} else if (url.pathname === "/api/config" && req.method === "POST") {
