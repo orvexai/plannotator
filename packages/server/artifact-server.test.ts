@@ -6,6 +6,7 @@ import { publishToArtifactServer, readArtifactServerComments, runArtifactServerC
 import { writeRemoteShareLink } from './share-url';
 import { startPlannotatorServer } from './index';
 import { startReviewServer } from './review';
+import { startAnnotateServer } from './annotate';
 
 const originalCli = process.env.PLANNOTATOR_ARTIFACTSERVER_CLI;
 const originalDataDir = process.env.PLANNOTATOR_DATA_DIR;
@@ -164,6 +165,7 @@ describe('Artifact Server CLI sharing', () => {
     process.env.PLANNOTATOR_DATA_DIR = tempDir();
     const planServer = await startPlannotatorServer({ plan: '# Plan', origin: 'claude-code', htmlContent: '<html></html>' });
     const reviewServer = await startReviewServer({ rawPatch: '', gitRef: 'HEAD', origin: 'claude-code', htmlContent: '<html></html>' });
+    const annotateServer = await startAnnotateServer({ markdown: '# Notes', filePath: join(tempDir(), 'notes.md'), origin: 'claude-code', htmlContent: '<html></html>' });
     const outputs: string[] = [];
     const originalWrite = process.stderr.write;
     try {
@@ -175,8 +177,16 @@ describe('Artifact Server CLI sharing', () => {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ content: '# Review', title: 'Review' }),
       });
+      const annotateResponse = await fetch(`${annotateServer.url}/api/artifact-share`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Notes', title: 'Notes' }),
+      });
       const planBody = await planResponse.text();
       const reviewBody = await reviewResponse.text();
+      const annotateBody = await annotateResponse.text();
+      expect(annotateResponse.status).toBe(502);
+      expect(annotateBody).toContain('Artifact Server publish failed (exit 7).');
+      expect(annotateBody).not.toContain(bearer);
       expect(planResponse.status).toBe(502);
       expect(reviewResponse.status).toBe(502);
       expect(planBody).toContain('Artifact Server publish failed (exit 7).');
@@ -196,6 +206,7 @@ describe('Artifact Server CLI sharing', () => {
       (process.stderr as { write: unknown }).write = originalWrite;
       planServer.stop();
       reviewServer.stop();
+      annotateServer.stop();
     }
   });
 });

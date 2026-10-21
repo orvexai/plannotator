@@ -46,6 +46,7 @@ import {
 	saveSourceFileAtomic,
 } from "@plannotator/shared/source-save-node";
 import { createExternalAnnotationHandler } from "./external-annotations";
+import { publishToArtifactServer, readArtifactServerComments, DEFAULT_ARTIFACT_SERVER_URL } from "./artifact-server";
 import {
   ANNOTATE_CLIENT_LEASE_GRACE_MS,
   ANNOTATE_CLIENT_LEASE_HEARTBEAT_MS,
@@ -301,6 +302,7 @@ export async function startAnnotateServer(
     liveApp,
     onReady,
   } = options;
+  const artifactServerUrl = shareBaseUrl || process.env.PLANNOTATOR_ARTIFACT_SERVER_URL || DEFAULT_ARTIFACT_SERVER_URL;
 
   // Several files reviewed as one (`annotate-bundle`): the explicit, ordered
   // list, and the deepest directory containing them all (labels and the
@@ -1075,6 +1077,32 @@ export async function startAnnotateServer(
               slug: annotateHistory.slug,
               versions: listVersions(annotateProjectName, annotateHistory.slug),
             });
+          }
+
+          if (url.pathname === "/api/artifact-share" && req.method === "POST") {
+            if (!isSameOriginOrNoOrigin(req.headers.get("origin"), url.host, req.headers.get("sec-fetch-site"))) {
+              return Response.json({ error: "Cross-origin request refused" }, { status: 403 });
+            }
+            if (!sharingEnabled) return Response.json({ error: "Sharing is disabled" }, { status: 403 });
+            try {
+              const body = await req.json() as { content?: unknown; title?: unknown };
+              if (typeof body.content !== "string" || typeof body.title !== "string") return Response.json({ error: "content and title are required" }, { status: 400 });
+              return Response.json(await publishToArtifactServer(body.content, body.title, artifactServerUrl));
+            } catch (error) {
+              return Response.json({ error: error instanceof Error ? error.message : "Artifact Server publish failed" }, { status: 502 });
+            }
+          }
+          if (url.pathname === "/api/artifact-comments" && req.method === "POST") {
+            if (!isSameOriginOrNoOrigin(req.headers.get("origin"), url.host, req.headers.get("sec-fetch-site"))) {
+              return Response.json({ error: "Cross-origin request refused" }, { status: 403 });
+            }
+            try {
+              const body = await req.json() as { reviewUrl?: unknown };
+              if (typeof body.reviewUrl !== "string") return Response.json({ error: "reviewUrl is required" }, { status: 400 });
+              return Response.json(await readArtifactServerComments(body.reviewUrl, artifactServerUrl));
+            } catch (error) {
+              return Response.json({ error: error instanceof Error ? error.message : "Artifact Server comments could not be read" }, { status: 502 });
+            }
           }
 
           if (url.pathname === "/api/share-html" && req.method === "GET") {
