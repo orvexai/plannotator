@@ -3,44 +3,43 @@ name: Test
 on:
   pull_request:
     branches:
-      - main
+    - main
   push:
-    branches:
-      - main
-
+    tags:
+    - '**'
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
 
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: latest
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6   # v2.2.0
+      with:
+        bun-version: latest
 
-      - name: Install dependencies
-        run: bun install
+    - name: Install dependencies
+      run: bun install
 
-      - name: Generate Pi extension shared copies
-        run: |
-          cd apps/pi-extension
-          mkdir -p generated generated/ai/providers
-          for f in feedback-templates review-core storage draft project pr-provider pr-github pr-gitlab checklist integrations-common repo reference-common favicon resolve-file; do
-            src="../../packages/shared/$f.ts"
-            printf '// @generated — DO NOT EDIT. Source: packages/shared/%s.ts\n' "$f" | cat - "$src" > "generated/$f.ts"
-          done
-          for f in index types provider session-manager endpoints context base-session; do
-            src="../../packages/ai/$f.ts"
-            printf '// @generated — DO NOT EDIT. Source: packages/ai/%s.ts\n' "$f" | cat - "$src" > "generated/ai/$f.ts"
-          done
-          for f in claude-agent-sdk codex-sdk opencode-sdk pi-sdk pi-sdk-node pi-events; do
-            src="../../packages/ai/providers/$f.ts"
-            printf '// @generated — DO NOT EDIT. Source: packages/ai/providers/%s.ts\n' "$f" | cat - "$src" > "generated/ai/providers/$f.ts"
-          done
+    - name: Generate Pi extension shared copies
+      run: |
+        cd apps/pi-extension
+        mkdir -p generated generated/ai/providers
+        for f in feedback-templates review-core storage draft project pr-provider pr-github pr-gitlab checklist integrations-common repo reference-common favicon resolve-file; do
+          src="../../packages/shared/$f.ts"
+          printf '// @generated — DO NOT EDIT. Source: packages/shared/%s.ts\n' "$f" | cat - "$src" > "generated/$f.ts"
+        done
+        for f in index types provider session-manager endpoints context base-session; do
+          src="../../packages/ai/$f.ts"
+          printf '// @generated — DO NOT EDIT. Source: packages/ai/%s.ts\n' "$f" | cat - "$src" > "generated/ai/$f.ts"
+        done
+        for f in claude-agent-sdk codex-sdk opencode-sdk pi-sdk pi-sdk-node pi-events; do
+          src="../../packages/ai/providers/$f.ts"
+          printf '// @generated — DO NOT EDIT. Source: packages/ai/providers/%s.ts\n' "$f" | cat - "$src" > "generated/ai/providers/$f.ts"
+        done
 
-      - name: Type check
-        run: bun run typecheck
+    - name: Type check
+      run: bun run typecheck
 
-      - name: Run tests
-        run: bun test
+    - name: Run tests
+      run: bun test
