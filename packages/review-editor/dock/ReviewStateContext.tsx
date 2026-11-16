@@ -15,6 +15,11 @@ import type { EditSelectionComment } from '../edit/useEditSession';
 import type { CallFlowAnalysisState } from '../hooks/useCallFlowAnalysis';
 import type { CallFlowInstallController } from '../hooks/useCallFlowInstall';
 import type { CallFlowAdvert, CallFlowNode } from '@plannotator/shared/call-flow-types';
+import type { CallTreeDoc } from '@plannotator/shared/call-tree';
+import type { HostLineNote } from '../components/hostLineNotes';
+import type { CodeFileAnnotationInput } from '@plannotator/ui/components/CodeFilePopout';
+import type { ChangedFileView } from '../components/FileViewSwitch';
+import type { DiagramEngineUrls } from '../utils/diagramEngineContract';
 
 /** One-shot request to open the native code-annotation composer on a source range. */
 export interface LineAnnotationComposeRequest {
@@ -30,12 +35,22 @@ export interface LineAnnotationComposeRequest {
  * to panels registered in dockview's static component map (which can't
  * receive arbitrary props from a parent).
  */
+/** A Call tree opened from a hunk, and the hunk it came from. */
+export interface CallTreeRequest {
+  readonly doc: CallTreeDoc;
+  readonly origin: { readonly filePath: string; readonly line: number; readonly side: 'old' | 'new' };
+  readonly token: number;
+}
+
 export interface ReviewState {
   // Files & diff
   files: DiffFile[];
   rawPatch: string;
   focusedFileIndex: number;
   focusedFilePath: string | null;
+  /** A single-file diff panel is the active dock panel (and the guide is not
+   *  open): the file-level keys (`N` / `Shift+N`) act on the focused file. */
+  isDiffPanelActive?: boolean;
   diffStyle: 'split' | 'unified';
   /** Compact touch shells use a session-only style so desktop preferences stay untouched. */
   onDiffStyleChange: (style: 'split' | 'unified') => void;
@@ -82,6 +97,11 @@ export interface ReviewState {
    *  `markdownPreviewSupported` or has no full contents (static patch): no
    *  preview UI renders anywhere. */
   markdownPreview?: MarkdownPreviewController;
+  /** Where the review server serves the diagram engine (`diagramEngine` on
+   *  `/api/diff`). With it, Mermaid and Graphviz fences in Markdown previews
+   *  and guide overviews draw as diagrams, the engine imported on the first
+   *  such fence; absent, they show as code. */
+  diagramEngine?: DiagramEngineUrls | null;
   /** Commit a comment made by selecting text in a previewed Markdown file
    *  (file-scoped, carries the quote). */
   onAddMarkdownPreviewComment?: (
@@ -120,12 +140,33 @@ export interface ReviewState {
   onAddEditorCommentForFile: (filePath: string, comment: EditSelectionComment) => void;
   onAddFileComment: (text: string) => void;
   onAddFileCommentForFile: (filePath: string, text: string) => void;
+  /** Explorer (step 2): a changed file's view, Changes or Whole file. Absent: no switch. */
+  fileViewOf?: (filePath: string) => ChangedFileView;
+  onFileViewChange?: (filePath: string, view: ChangedFileView) => void;
+  /** A comment made in a whole-file view (a changed file's Whole file, or a
+   *  file the review does not change). `inDiff`: the lines sit in one hunk. */
+  onAddWholeFileAnnotation?: (input: CodeFileAnnotationInput, options: { inDiff: boolean }) => void;
+  /** Keep a preview tab (a comment in it, a double click on its tab). */
+  onKeepFileTab?: (panelId: string) => void;
+  /** Explorer (step 3): a jump's landing line, and where it came from. */
+  revealTarget?: import('../utils/explorerNavigation').RevealTarget | null;
+  jumpCrumb?: import('../utils/explorerNavigation').JumpCrumb | null;
+  /** Back / forward across jumps (absent: no history in this host). */
+  navigation?: { canBack: boolean; canForward: boolean; back: () => void; forward: () => void };
+  /** Where F12 looks: the token under the pointer in a diff, and the last one clicked. */
+  onTokenTarget?: import('../utils/tokenTarget').TokenTargetHandler;
+  /** The same for a whole-file view, and its Cmd+click (references). */
+  fileTokens?: (filePath: string) => import('../components/RepoFileView').FileTokenHandlers;
+  /** A result of the references panel opened in a tab at its line. */
+  onOpenCodeNavLocation?: (location: import('@plannotator/shared/code-nav').CodeNavLocation) => void;
   onEditAnnotation: (id: string, text?: string, suggestedCode?: string, originalCode?: string, conventionalLabel?: ConventionalLabel | null, decorations?: ConventionalDecoration[]) => void;
   /** Highlight a comment without moving the viewport (in-diff click). */
   onSelectAnnotation: (id: string | null) => void;
   /** Select AND scroll the diff to a comment (sidebar / findings-list click). */
   onNavigateToAnnotation: (id: string | null) => void;
   onDeleteAnnotation: (id: string) => void;
+  onExplainAnnotation: (id: string) => void;
+  agentFindingSources: ReadonlySet<string>;
 
   // PR description prose annotations (comment-only; text-anchored Annotation[],
   // kept separate from the diff CodeAnnotation[] above).
@@ -233,6 +274,9 @@ export interface ReviewState {
   prContext: PRContext | null;
   /** Viewable attachments harvested from the current hosted PR/MR context. */
   prArtifacts: readonly PRArtifact[];
+  openPRArtifact: (artifactId: string) => void;
+  prArtifactFocus: { readonly id: string; readonly seq: number } | null;
+  onPRArtifactFocusHandled: (seq: number) => void;
   isPRContextLoading: boolean;
   prContextError: string | null;
   fetchPRContext: () => void;
@@ -245,7 +289,7 @@ export interface ReviewState {
   onAllFilesFileScrolledPast: (filePath: string) => void;
   isAllFilesActive: boolean;
   // Which left panel drives the all-files item order ('list' = sections order).
-  allFilesOrder: 'tree' | 'list';
+  allFilesOrder: import('../components/AllFilesCodeView').AllFilesOrder;
   // All-files collapse-all toggle — the AllFilesCodeView registers its handler
   // here; the dock header's button (ReviewDockRightActions) invokes it.
   allFilesAllCollapsed: boolean;
@@ -270,6 +314,16 @@ export interface ReviewState {
   openCallFlowPanel: () => void;
   /** Opt-in runtime install controller backing the Dock's install funnel. */
   callFlowInstall: CallFlowInstallController;
+  /** The "Call tree" entries drawn on hunks (empty unless Call flow has a tree for them). Optional: other hosts draw none. */
+  callTreeHunkNotes?: readonly HostLineNote[];
+  /** The tree a hunk's "Call tree" entry opened, shown by the Call flow tab; bumps `token` per open. */
+  callTreeRequest?: CallTreeRequest | null;
+  /** Open a Call tree row's line: the diff when the line is in it, else the file's whole-file view. */
+  openCallTreeNode?: (node: CallFlowNode) => void;
+  /** Escape in a tree opened from a hunk: back to that hunk. */
+  returnFromCallTree?: () => void;
+  /** Stop showing the hunk's tree (the tab's own trees again). */
+  clearCallTreeRequest?: () => void;
 
   // Tour
   openTourPanel: (jobId: string) => void;

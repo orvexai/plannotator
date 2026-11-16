@@ -18,7 +18,8 @@ import { InlineMarkdown } from '@plannotator/ui/components/InlineMarkdown';
 import { QuestionContext } from '@plannotator/ui/components/blocks/QuestionContext';
 import type { InboxAuthor, InboxMessageWire, InboxQuestion } from '@plannotator/core/inbox-types';
 import type { QuestionAnswer } from '@plannotator/core/question-block';
-import { agentName, clockTime } from '../format';
+import { agentName, whenTime } from '../format';
+import { plainLabel } from '../folding';
 import { Icon } from '../icons';
 
 /** What replaced a question, read from its thread. */
@@ -29,13 +30,13 @@ export interface Replacement {
   message: Pick<InboxMessageWire, 'id' | 'created_at'> & { author: InboxAuthor };
 }
 
-/** Where a jump lands: one question's card, or a message. */
-export type JumpTarget = { kind: 'question'; messageId: string; key: string } | { kind: 'message'; messageId: string };
+/** Where a jump lands: a question's card, an action item's checklist row, or a message. */
+export type JumpTarget = { kind: 'question' | 'action'; messageId: string; key: string } | { kind: 'message'; messageId: string };
 
-/** The answer's words, as the card's "Your pick" shows them. */
+/** The answer's words, as the card's "Your pick" shows them; a picked label as its plain words (`plainLabel`). */
 export function pickWords(answer: QuestionAnswer): string {
   if (answer.skipped) return 'Skipped';
-  const parts = [...answer.selected];
+  const parts = answer.selected.map(plainLabel);
   if (answer.other) parts.push(answer.other);
   if (answer.text) parts.push(answer.text);
   return parts.join(', ');
@@ -64,13 +65,27 @@ export function replacedBy(messages: readonly InboxMessageWire[], question: Inbo
 
 /** A link to another card or message: the prompt (or words), with an arrow saying which way it is. */
 function JumpLink({ children, arrow, onJump, label }: { children: React.ReactNode; arrow: '↑' | '↓'; onJump: () => void; label?: string }) {
+  // An inline element with the button role, not a <button>: a button lays out
+  // as one box, so a long prompt broke the sentence around it and left its
+  // period alone on a line. This one wraps with the text like a link.
   return (
-    <button type="button" className="ib-q-link" onClick={onJump} aria-label={label}>
+    <span
+      role="button"
+      tabIndex={0}
+      className="ib-q-link"
+      onClick={onJump}
+      onKeyDown={(event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        onJump();
+      }}
+      aria-label={label}
+    >
       {children}
       <span className="ib-q-arrow" aria-hidden="true">
         {arrow}
       </span>
-    </button>
+    </span>
   );
 }
 
@@ -92,6 +107,7 @@ export function ReplacedQuestionCard({
   replacement,
   answer,
   onJump,
+  refRepo,
 }: {
   question: InboxQuestion;
   number: number;
@@ -100,13 +116,16 @@ export function ReplacedQuestionCard({
   /** The pick saved on it (never sent), or null. */
   answer: QuestionAnswer | null;
   onJump: (target: JumpTarget) => void;
+  /** The thread's repo, so `#123` refs in the old prompt and choices link as in the message. */
+  refRepo?: { display: string; host?: string } | null;
 }) {
   const id = useId();
+  const repo = { githubRepo: refRepo?.display, repoHost: refRepo?.host };
   const [open, setOpen] = useState(false);
   const promptId = `${id}-p`;
   const newsId = `${id}-news`;
   const panelId = `${id}-old`;
-  const at = clockTime(replacement.message.created_at);
+  const at = whenTime(replacement.message.created_at);
   const picked = answer && !answer.skipped ? new Set(answer.selected) : new Set<string>();
   return (
     <fieldset
@@ -127,7 +146,7 @@ export function ReplacedQuestionCard({
         </span>
       </div>
       <p className="ib-q-prompt" id={promptId}>
-        <InlineMarkdown text={question.prompt} />
+        <InlineMarkdown text={question.prompt} {...repo} />
       </p>
       <div className="ib-q-repl" id={newsId} data-replaced-row="">
         <Icon name="turnDown" size={14} />
@@ -168,12 +187,12 @@ export function ReplacedQuestionCard({
                   <input type={question.kind === 'multi' ? 'checkbox' : 'radio'} disabled checked={on} readOnly name={`${id}-old`} />
                   <span className="ib-q-lbl">
                     <b>
-                      <InlineMarkdown text={choice.label} />
+                      <InlineMarkdown text={choice.label} {...repo} />
                     </b>
                     {choice.description && (
                       <span className="ib-q-desc">
                         {' '}
-                        — <InlineMarkdown text={choice.description} />
+                        — <InlineMarkdown text={choice.description} {...repo} />
                       </span>
                     )}
                     {on && <span className="ib-tag ib-t-notsent">Not sent</span>}
@@ -234,7 +253,7 @@ export function ChangedNotice({
   const replacement = first ? replacementOf(thread.messages, first) : null;
   if (!first || !replacement) return null;
   const agent = agentName(replacement.message.author);
-  const at = clockTime(replacement.message.created_at);
+  const at = whenTime(replacement.message.created_at);
   const many = questions.length > 1;
   const which = many ? `${questions.length} questions you picked on` : questionName(first, false);
   return (
@@ -298,7 +317,7 @@ export function StaleGuard({
   const rest = [
     words ? 'your words' : '',
     otherPicks > 0 ? `${otherPicks} other ${otherPicks === 1 ? 'pick' : 'picks'}` : '',
-    annotations > 0 ? `${annotations} ${annotations === 1 ? 'annotation' : 'annotations'}` : '',
+    annotations > 0 ? `${annotations} ${annotations === 1 ? 'comment' : 'comments'}` : '',
   ].filter(Boolean);
   const restText = rest.length > 1 ? `${rest.slice(0, -1).join(', ')} and ${rest.at(-1)}` : (rest[0] ?? '');
   const heading = questions.length === 1 ? `${questionName(first)} changed before you sent` : `${questions.length} questions changed before you sent`;
@@ -333,7 +352,7 @@ export function StaleGuard({
           const replacement = replacementOf(thread.messages, q);
           if (!replacement) return null;
           const agent = agentName(replacement.message.author);
-          const at = clockTime(replacement.message.created_at);
+          const at = whenTime(replacement.message.created_at);
           return (
             <p key={`${q.message_id}/${q.key}`}>
               {replacement.by ? (

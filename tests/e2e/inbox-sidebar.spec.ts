@@ -6,23 +6,29 @@
  * survives a reload, the hover peek shows the navigation while it is closed,
  * the edge collapses on a click and resizes on a drag (and closes past half
  * the minimum, reopening when the held pointer comes back), reduced motion
- * lands without travel, and a phone width gets the sheet.
+ * lands without travel, and a phone width gets the sheet. Pinned and Projects
+ * close like folders: a click on the header, the closed Pinned's count, the
+ * project on screen kept under a closed Projects, the choice kept across a
+ * reload, and 44 px headers with their chevron on a phone.
  *
  * Build the binary first (see inbox.spec.ts), then `bun run test:e2e:inbox`.
  * The PNGs, the video and the sampled curves land in .local/proof/sidebar/.
  */
 
-import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import { expect, test, type Browser, type BrowserContext, type Page } from './inbox-test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DEMO_MESSAGES, SimAgent, scratchProject } from '../../scripts/inbox-sim';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { NO_BROWSER } from '../helpers/no-browser';
 
 const repo = resolve(__dirname, '../..');
 const builtBinary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
 const proofDir = join(resolve(process.env.PLANNOTATOR_E2E_PROOF_DIR ?? join(repo, '.local/proof')), 'sidebar');
 const WIDTH = 232;
+// The panes float on the ground (inbox.css --ib-gutter): the list starts one 8px gutter past the sidebar.
+const GUTTER = 8;
 
 interface World {
   root: string;
@@ -97,7 +103,7 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   const dataDir = join(root, 'data');
   const home = join(root, 'home');
   mkdirSync(home);
-  const env = { PATH: process.env.PATH ?? '', HOME: home, PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: 'none' };
+  const env = { PATH: process.env.PATH ?? '', HOME: home, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: NO_BROWSER };
   // The data dir this run hands the binary is its own temp folder, never the person's.
   expect(env.PLANNOTATOR_DATA_DIR.startsWith(root)).toBe(true);
   const started = spawnSync(builtBinary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
@@ -139,9 +145,9 @@ test('the toggle closes and opens the sidebar on the spring, and the list takes 
   const { page, url } = world;
   await page.goto(url);
   await expect(side(page)).toBeVisible();
-  await expect(side(page).getByRole('button', { name: 'billing-svc' })).toBeVisible();
+  await expect(side(page).getByRole('button', { name: /^billing-svc(?: \d+)?$/ })).toBeVisible();
   const list = page.locator('.ib-listcol');
-  await expect.poll(() => list.evaluate((el) => el.getBoundingClientRect().left)).toBe(WIDTH);
+  await expect.poll(() => list.evaluate((el) => el.getBoundingClientRect().left)).toBe(WIDTH + GUTTER);
   await shot('open');
 
   const trigger = page.locator('.ib-lhead').getByRole('button', { name: 'Toggle Sidebar' });
@@ -154,7 +160,7 @@ test('the toggle closes and opens the sidebar on the spring, and the list takes 
   for (let i = 1; i < closing.length; i++) expect(closing[i]![1]).toBeLessThanOrEqual(closing[i - 1]![1]);
   await expect(side(page)).toBeHidden();
   await expect(page.locator('.ib-sb-panel')).toHaveAttribute('inert', '');
-  expect(await list.evaluate((el) => el.getBoundingClientRect().left)).toBe(0);
+  expect(await list.evaluate((el) => el.getBoundingClientRect().left)).toBe(GUTTER);
   expect(await cookie(page, 'plannotator-inbox-sidebar-open')).toBe('false');
   await shot('closed');
 
@@ -172,15 +178,25 @@ test('Copy connect prompt copies the prompt naming this binary, says Copied, and
   const { page, context, url } = world;
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(url).origin });
   const foot = side(page).locator('.ib-side-foot');
-  // Just above Settings, an ordinary row of the same height.
-  await expect(foot.locator('.ib-nav')).toHaveText(['Copy connect prompt', 'Settings']);
-  const row = foot.getByRole('button', { name: 'Copy connect prompt' });
-  const settings = foot.getByRole('button', { name: 'Settings' });
-  expect((await row.boundingBox())!.height).toBe((await settings.boundingBox())!.height);
+  // Above Settings (and above the Update button or "What's new", when shown): an outlined pill with the four agents' marks, inside the sidebar.
+  const row = foot.getByRole('button', { name: 'Copy prompt to connect an agent' });
+  await expect(row).toBeVisible();
+  const marks = row.locator('.ib-cpill-ag');
+  await expect(marks).toHaveCount(4);
+  const pill = (await row.boundingBox())!;
+  const footBox = (await foot.boundingBox())!;
+  expect(pill.x + pill.width).toBeLessThanOrEqual(footBox.x + footBox.width + 0.5);
+  for (const mark of await marks.all()) {
+    const box = (await mark.boundingBox())!;
+    expect(box.width).toBe(16);
+    expect(box.x + box.width).toBeLessThanOrEqual(pill.x + pill.width);
+  }
+  expect((await foot.getByRole('button', { name: 'Settings' }).boundingBox())!.y).toBeGreaterThan(pill.y + pill.height);
   // The settings carry this run's absolute binary; the row copies it once they have loaded.
   await expect.poll(() => page.evaluate(() => fetch('/api/inbox/settings').then((r) => r.json()).then((s) => s.mcp_command[0]))).toBe(builtBinary);
   await row.click();
   await expect(foot.locator('button[data-connect-prompt]')).toHaveText('Copied');
+  await expect(marks).toHaveCount(4);
   await expect(foot.locator('button[data-connect-prompt]')).toBeFocused();
   await expect(side(page).locator('[data-connect-prompt-live]')).toHaveText('Connect prompt copied.');
   const copied = await page.evaluate(() => navigator.clipboard.readText());
@@ -188,7 +204,7 @@ test('Copy connect prompt copies the prompt naming this binary, says Copied, and
   expect(copied).toContain(`${builtBinary} inbox --help`);
   expect(copied).toContain('plannotator inbox --help');
   await shot('connect-prompt-copied');
-  await expect(foot.locator('button[data-connect-prompt]')).toHaveText('Copy connect prompt', { timeout: 4_000 });
+  await expect(foot.locator('button[data-connect-prompt]')).toHaveText('Copy prompt to connect an agent', { timeout: 4_000 });
 });
 
 test('⌘B and Ctrl+B toggle it, and the choice survives a reload', async () => {
@@ -241,7 +257,7 @@ test('closed, the left edge peeks the navigation after a rest, and it works', as
   await page.mouse.move(120, 450, { steps: 4 });
   await page.waitForTimeout(350);
   await shot('peek');
-  await side(page).getByRole('button', { name: 'docs-site' }).click();
+  await side(page).getByRole('button', { name: /^docs-site(?: \d+)?$/ }).click();
   await expect(page.locator('.ib-lhead h1')).toHaveText('docs-site');
   await page.mouse.move(900, 450, { steps: 6 });
   await expect(peek).not.toHaveAttribute('data-visible', '');
@@ -262,7 +278,7 @@ test('the edge: a click collapses, a drag resizes, past half the minimum it clos
   await page.mouse.move(WIDTH + 68, 500, { steps: 6 });
   await page.mouse.up();
   await expect(edge).toHaveAttribute('aria-valuenow', '300');
-  await expect.poll(() => page.locator('.ib-listcol').evaluate((el) => el.getBoundingClientRect().left)).toBe(300);
+  await expect.poll(() => page.locator('.ib-listcol').evaluate((el) => el.getBoundingClientRect().left)).toBe(300 + GUTTER);
   expect(await cookie(page, 'plannotator-inbox-sidebar-width')).toBe('300');
 
   // Below 100 px (half the 200 minimum) it closes mid-drag; back above, it reopens.
@@ -320,6 +336,9 @@ test('a phone width: the sidebar is a sheet the toggle opens, a pick and Escape 
   const sheet = page.getByRole('dialog');
   await expect(sheet).toBeVisible();
   await expect(sheet.getByRole('complementary', { name: 'Inbox navigation' })).toBeVisible();
+  // A phone's sheet has no Copy prompt pill (the desktop sidebar keeps it); Settings still ends the foot.
+  await expect(sheet.getByRole('button', { name: 'Settings' })).toBeVisible();
+  await expect(sheet.locator('button[data-connect-prompt]')).toHaveCount(0);
   await page.waitForTimeout(700);
   await shot('narrow-sheet');
   await sheet.getByRole('button', { name: 'Settings' }).click();
@@ -334,5 +353,55 @@ test('a phone width: the sidebar is a sheet the toggle opens, a pick and Escape 
   await expect(side(page)).toHaveCount(0);
   await page.locator('[data-settings-back]').click();
   await expect(side(page)).toBeVisible();
+  expect(world.errors).toEqual([]);
+});
+
+test('Pinned and Projects close like folders: the count, the project on screen kept, a reload, and the phone sheet', async () => {
+  const { page, url } = world;
+  await page.goto(url);
+  const header = (section: 'pinned' | 'projects') => side(page).locator(`[data-sidebar-section="${section}"]`);
+  await page.locator('.ib-lbody [data-thread-id]', { hasText: 'Stripe 409' }).first().click({ button: 'right' });
+  await page.locator('[data-row-action="pin"]').click();
+  await expect(side(page).locator('[data-pinned-row]')).toHaveCount(1);
+  await expect(header('pinned')).toHaveAttribute('aria-expanded', 'true');
+
+  // Closed, Pinned counts what waits on the person: the Stopped thread does not hide.
+  await header('pinned').click();
+  await expect(header('pinned')).toHaveAttribute('aria-expanded', 'false');
+  await expect(side(page).locator('[data-pinned-row]')).toHaveCount(0);
+  await expect(header('pinned')).toHaveAccessibleName('Starred 1 waiting on you');
+
+  // In a project, Projects closed keeps that project under its header, and nothing else.
+  await side(page).getByRole('button', { name: /^docs-site(?: \d+)?$/ }).click();
+  await expect(page.locator('.ib-lhead h1')).toHaveText('docs-site');
+  await header('projects').click();
+  await expect(header('projects')).toHaveAttribute('aria-expanded', 'false');
+  await expect(side(page).locator('.ib-projs .ib-proj')).toHaveText([/^docs-site/]);
+  expect(await cookie(page, 'plannotator-inbox-sidebar-closed')).toBe(encodeURIComponent('pinned,projects'));
+  await page.reload();
+  await expect(header('projects')).toHaveAttribute('aria-expanded', 'false');
+  await expect(header('pinned')).toHaveAttribute('aria-expanded', 'false');
+  await expect(side(page).locator('.ib-projs .ib-proj')).toHaveText([/^docs-site/]);
+  await page.mouse.move(900, 450);
+  await shot('sections-closed');
+
+  // A phone: the sheet's headers are 44 px, the chevron always shows, and a tap opens a section without closing the sheet.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.ib-lhead').getByRole('button', { name: 'Toggle Sidebar' }).click();
+  const sheet = page.getByRole('dialog');
+  const phoneHeader = sheet.locator('[data-sidebar-section="pinned"]');
+  await expect(phoneHeader).toBeVisible();
+  expect(await phoneHeader.evaluate((el) => el.getBoundingClientRect().height)).toBe(44);
+  expect(await phoneHeader.locator('.ib-side-sec-chev').evaluate((el) => getComputedStyle(el).visibility)).toBe('visible');
+  await phoneHeader.click();
+  await expect(phoneHeader).toHaveAttribute('aria-expanded', 'true');
+  await expect(sheet).toBeVisible();
+  await expect(sheet.locator('[data-pinned-row]')).toHaveCount(1);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await header('projects').click();
+  await expect(side(page).locator('.ib-projs .ib-proj')).toHaveCount(2);
+  expect(await cookie(page, 'plannotator-inbox-sidebar-closed')).toBeUndefined();
   expect(world.errors).toEqual([]);
 });

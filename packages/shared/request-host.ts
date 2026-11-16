@@ -17,8 +17,9 @@
  *  - Loopback names (`localhost`, `*.localhost`, 127.0.0.0/8 literals,
  *    `[::1]`): allowed in every mode.
  *  - Remote mode (wide bind): also any IPv4 or IPv6 literal (a LAN address,
- *    a container address), plus `extraHosts` (the configured urlHost and this
- *    machine's own hostname, supplied by the runtime adapter).
+ *    a container address), plus `extraHosts` (the configured urlHost, the
+ *    public URL's host and this machine's own hostname, supplied by the
+ *    runtime adapter).
  *  - `extraHosts` in any mode: names a runtime learned it is served on (the
  *    `tailscale serve` MagicDNS name of a `--tailscale` session).
  *  - `portHostPatterns` in any mode: the per-port hostnames of a browser IDE's
@@ -213,6 +214,42 @@ export function isAllowedRequestHost(hostHeader: string | null | undefined, poli
 		if (matchesName(hostname, entry)) return true;
 	}
 	return false;
+}
+
+/**
+ * Whether a state-changing request may pass the cross-origin write guard
+ * (request-origin.ts) because its Origin's hostname is NAMED in
+ * `PLANNOTATOR_ALLOWED_HOSTS` (an exact entry or a `.suffix` entry).
+ *
+ * This is for a plain-HTTP reverse proxy that rewrites Host (nginx's default
+ * `proxy_pass http://127.0.0.1:<port>` with no `proxy_set_header Host`): the
+ * page's Origin names the proxy's public hostname while Host names the
+ * upstream, and over plain HTTP to a non-localhost address browsers send no
+ * `Sec-Fetch-Site`, so nothing else says the request is the session's own.
+ *
+ * Deliberately narrower than the Host check: `*` never widens it (a `*` that
+ * turned the Host check off must not also turn off the cross-origin guard),
+ * a request the browser marked `Sec-Fetch-Site: cross-site`, `same-site` or
+ * `none` is never let through here, and `Origin: null` never passes.
+ */
+export function isOriginNamedInAllowedHosts(
+	originHeader: string | null | undefined,
+	fetchSite: string | string[] | null | undefined,
+	allowed: AllowedHostsSetting,
+): boolean {
+	const site = (Array.isArray(fetchSite) ? fetchSite[0] : fetchSite)?.trim();
+	if (site) return false;
+	const origin = originHeader?.trim();
+	if (!origin || origin === "null") return false;
+	let parsed: string | null;
+	try {
+		parsed = normalizeHostname(new URL(origin).hostname);
+	} catch {
+		return false;
+	}
+	const hostname = parsed;
+	if (!hostname) return false;
+	return allowed.names.some((entry) => matchesName(hostname, entry));
 }
 
 /** Plain-text body of the 403 a refused request gets. */

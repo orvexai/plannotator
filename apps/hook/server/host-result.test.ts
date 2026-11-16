@@ -7,7 +7,10 @@ import { deliveryFor } from "../hooks/mod/delivery";
 describe("reviewHostResult", () => {
   test("LGTM and Close never reach the agent; feedback does, as the CLI prints it", () => {
     const lgtm = { approved: true, feedback: "", annotations: [] };
-    expect(reviewHostResult(lgtm, buildReviewOutput(lgtm, "claude-code"))).toMatchObject({ decision: "approved", noop: true });
+    const lgtmOutput = buildReviewOutput(lgtm, "claude-code");
+    // noop, yet it carries the configured approved prompt, which a gated review delivers (#1907).
+    expect(reviewHostResult(lgtm, lgtmOutput)).toMatchObject({ decision: "approved", noop: true, message: lgtmOutput.message });
+    expect(lgtmOutput.message).not.toBe("");
 
     const closed = { approved: false, feedback: "", annotations: [], exit: true };
     expect(reviewHostResult(closed, buildReviewOutput(closed, "claude-code"))).toMatchObject({ decision: "dismissed", noop: true });
@@ -148,6 +151,9 @@ describe("isAllowedHostResultPath", () => {
     expect(isAllowedHostResultPath(`${data}/t3-code/env/threads/thread/reviews/pn-aabbcc/result.json`, data)).toBe(true);
     expect(isAllowedHostResultPath(`${data}/t3-code/../config.json`, data)).toBe(false);
     expect(isAllowedHostResultPath(`${data}/t3-code-evil/result.json`, data)).toBe(false);
+    // The DeepSeek Harness plugin's launches (apps/dsh-plugin/reviews.ts): if this were refused, no DSH decision would arrive.
+    expect(isAllowedHostResultPath(`${data}/dsh/pn-aabbcc/result.json`, data)).toBe(true);
+    expect(isAllowedHostResultPath(`${data}/dsh-evil/result.json`, data)).toBe(false);
     expect(isAllowedHostResultPath("/home/me/.bashrc", data)).toBe(false);
     expect(isAllowedHostResultPath(`${data}/claude-code-mod/s/l/other.json`, data)).toBe(false);
     expect(isAllowedHostResultPath(`${data}/claude-code-mod/../config.json`, data)).toBe(false);

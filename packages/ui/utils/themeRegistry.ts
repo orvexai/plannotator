@@ -32,6 +32,27 @@ export const BUILT_IN_THEMES: ThemeInfo[] = [
     },
   },
   {
+    id: 'plannotator-graphite',
+    name: 'Plannotator Graphite',
+    builtIn: true,
+    modeSupport: 'both',
+    colors: {
+      dark: { primary: 'oklch(0.765 0.124 283)', secondary: 'oklch(0.740 0.123 180)', accent: 'oklch(0.765 0.156 60)', background: 'oklch(0.225 0.006 286)', foreground: 'oklch(0.945 0.003 286)' },
+      light: { primary: 'oklch(0.50 0.25 280)', secondary: 'oklch(0.50 0.18 180)', accent: 'oklch(0.60 0.22 50)', background: 'oklch(0.97 0.005 260)', foreground: 'oklch(0.18 0.02 260)' },
+    },
+  },
+  {
+    id: 'plannotator-modern',
+    name: 'Plannotator Modern',
+    builtIn: true,
+    modeSupport: 'both',
+    syntaxHighlighting: true,
+    colors: {
+      dark: { primary: 'oklch(0.515 0.245 263)', secondary: '#414141', accent: '#66ccff', background: '#000000', foreground: '#f2f2f2' },
+      light: { primary: 'oklch(0.515 0.245 263)', secondary: 'oklch(0.45 0.085 224.283)', accent: 'oklch(0.47 0.157 37.304)', background: '#f7f7f7', foreground: '#0a0a0a' },
+    },
+  },
+  {
     id: 'simple',
     name: 'Simple',
     builtIn: true,
@@ -532,6 +553,17 @@ export const BUILT_IN_THEMES: ThemeInfo[] = [
     colors: {
       dark: { primary: '#7aa2f7', secondary: '#414868', accent: '#7dcfff', background: '#24283b', foreground: '#c0caf5' },
       light: { primary: '#2e7de9', secondary: '#a1a6c5', accent: '#007197', background: '#e1e2e7', foreground: '#3760bf' },
+    },
+  },
+  {
+    id: 'tokyo-night-moon',
+    name: 'Tokyo Night Moon',
+    builtIn: true,
+    modeSupport: 'dark-only',
+    syntaxHighlighting: true,
+    colors: {
+      dark: { primary: '#82aaff', secondary: '#444a73', accent: '#86e1fc', background: '#222436', foreground: '#c8d3f5' },
+      light: { primary: '#82aaff', secondary: '#444a73', accent: '#86e1fc', background: '#222436', foreground: '#c8d3f5' },
     },
   },
   {

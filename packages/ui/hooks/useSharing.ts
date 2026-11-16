@@ -8,7 +8,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Annotation, type ImageAttachment } from '../types';
+import { Annotation, type DocumentRenderAs, type ImageAttachment } from '../types';
 import {
   type SharePayload,
   type ArtifactServerComment,
@@ -107,8 +107,10 @@ export function useSharing(
   resolveRawHtmlForShare?: () => Promise<string | null>,
   setRawHtml?: (h: string) => void,
   setShareHtml?: (h: string) => void,
-  setRenderAs?: (m: 'markdown' | 'html') => void,
+  setRenderAs?: (m: DocumentRenderAs) => void,
   contentRevision = 0,
+  /** Render kind of the shared document; `asciidoc` travels as `r: 'asciidoc'`. */
+  renderAs?: DocumentRenderAs,
 ): UseSharingResult {
   const [isSharedSession, setIsSharedSession] = useState(false);
   const [isLoadingShared, setIsLoadingShared] = useState(true);
@@ -132,6 +134,7 @@ export function useSharing(
     globalAttachments,
     rawHtml,
     contentRevision,
+    renderAs,
   ]);
   const latestShareRequestContextRef = useRef(shareRequestContext);
   latestShareRequestContextRef.current = shareRequestContext;
@@ -147,6 +150,7 @@ export function useSharing(
   // Load a previously shared local hash payload. Artifact Server links open in Artifact Server.
   const loadFromHash = useCallback(async () => {
     try {
+
       const hash = window.location.hash.slice(1);
 
       // Not a share payload — leave it for Viewer to scroll to (or ignore).
@@ -164,7 +168,7 @@ export function useSharing(
           setMarkdown('');
         } else {
           setMarkdown(payload.p);
-          setRenderAs?.('markdown');
+          setRenderAs?.(payload.r === 'asciidoc' ? 'asciidoc' : 'markdown');
           setRawHtml?.('');
           setShareHtml?.('');
         }
@@ -230,6 +234,7 @@ export function useSharing(
     setShareUrlSize('');
   }, []);
 
+
   // Auto-refresh share URL when dependencies change
   useEffect(() => {
     refreshShareUrl();
@@ -289,6 +294,7 @@ export function useSharing(
       });
       const result = await response.json() as { reviewUrl?: string; error?: string };
       if (!response.ok || typeof result.reviewUrl !== 'string') throw new Error(result.error || 'Artifact Server publish failed');
+
       if (latestShareRequestContextRef.current !== requestContext) return null;
       shortShareUrlLifecycleRef.current = { _tag: 'associated', requestContext };
       setShortShareUrl(result.reviewUrl);
@@ -303,6 +309,7 @@ export function useSharing(
       if (latestShareRequestContextRef.current === requestContext) setIsGeneratingShortUrl(false);
     }
   }, [markdown, annotations, rawHtml, resolveRawHtmlForShare, shareRequestContext]);
+
 
   // Import comments from Artifact Server or local hash payloads.
   const importFromShareUrl = useCallback(async (url: string): Promise<ImportResult> => {

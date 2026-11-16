@@ -46,6 +46,17 @@ describe('deliveryFor', () => {
     expect(delivery.action === 'log' && delivery.suggest).toBe('address the review comments on PR #412')
   })
 
+  // #1907: a gated review waits for the outcome, and the platform post is it.
+  test('a gated review posted to the PR platform is a turn with its status line; ungated it logs', () => {
+    const status = 'Pull request approved on GitHub: https://x/pull/412'
+    const posted = record({ surface: 'review', decision: 'annotated', noop: true, platform: true, message: status })
+    expect(deliveryFor(posted, { ...CONTEXT, subject: 'PR #412', sessionId: 'pn-abc123', deliverApproval: true })).toEqual({
+      action: 'submit',
+      text: `Plannotator: PR #412 (pn-abc123) — Review posted.\n\n${status}`,
+    })
+    expect(deliveryFor(posted, { ...CONTEXT, subject: 'PR #412', sessionId: 'pn-abc123' }).action).toBe('log')
+  })
+
   // Every status line the review editor posts after a platform submission
   // (`statusMessage` in packages/review-editor/App.tsx), built the same way.
   test('every editor status line still logs as the platform post', () => {
@@ -97,6 +108,12 @@ describe('legacyResult (a CLI that predates the host result file)', () => {
   test('a review approval is an LGTM, not "Changes requested"', () => {
     const lgtm = legacyResult('review', `${DEFAULT_REVIEW_APPROVED_PROMPT}\n`)
     expect(deliveryFor(lgtm, CONTEXT).action).toBe('log')
+  })
+
+  test('a gated review takes an older CLI\'s LGTM as the approval to deliver (#1907)', () => {
+    const lgtm = legacyResult('review', `${DEFAULT_REVIEW_APPROVED_PROMPT}\n`)
+    const delivery = deliveryFor(lgtm, { ...CONTEXT, deliverApproval: true })
+    expect(delivery).toEqual({ action: 'submit', text: `Plannotator: notes.md — Approved.\n\n${DEFAULT_REVIEW_APPROVED_PROMPT}` })
   })
 
   test('a review approval with notes is delivered under its own outcome', () => {
@@ -168,5 +185,19 @@ describe('splitShellWords', () => {
     expect(splitShellWords(`"my file.md" 'it''s' a\\ b`)).toEqual(['my file.md', 'its', 'a b'])
     expect(splitShellWords('"say \\"hi\\"" $HOME *.md')).toEqual(['say "hi"', '$HOME', '*.md'])
     expect(splitShellWords('--base "feature one"')).toEqual(['--base', 'feature one'])
+    // Windows: a backslash is a path separator, never an escape.
+    expect(splitShellWords('C:\\Users\\me\\plan.md docs\\a.md', { windows: true })).toEqual(['C:\\Users\\me\\plan.md', 'docs\\a.md'])
+    expect(splitShellWords('"C:\\My Docs\\plan.md" \\\\srv\\share', { windows: true })).toEqual(['C:\\My Docs\\plan.md', '\\\\srv\\share'])
+    expect(splitShellWords('C:\\Users\\me\\plan.md')).toEqual(['C:Usersmeplan.md'])
+  })
+
+  test("Windows: a single quote is part of the name (O'Brien), and only double quotes group words", () => {
+    const path = "C:\\Users\\Administrator\\O'Brien [x]\\{a,b}\\plan.md"
+    // Typed bare, it splits only at its space, every character kept, the apostrophe included.
+    expect(splitShellWords(path, { windows: true })).toEqual(["C:\\Users\\Administrator\\O'Brien", '[x]\\{a,b}\\plan.md'])
+    expect(splitShellWords(`"${path}" --gate`, { windows: true })).toEqual([path, '--gate'])
+    expect(splitShellWords("docs\\Bob's notes.md 'x y'", { windows: true })).toEqual(["docs\\Bob's", 'notes.md', "'x", "y'"])
+    // macOS and Linux keep the shell's single quotes, as before.
+    expect(splitShellWords("'x y' it's'", {})).toEqual(['x y', 'its'])
   })
 })

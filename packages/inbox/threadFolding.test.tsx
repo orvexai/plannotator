@@ -6,13 +6,14 @@
  * has no layout, so where a test needs positions it gives the elements some.
  * The real browser proof is tests/e2e/inbox-thread-folding.spec.ts.
  *
- * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from the test.yml DOM list.
+ * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from tests/dom-test-list.txt.
  */
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { parseInboxQuestionBlocks } from '@plannotator/core/inbox-questions';
 import type { InboxAuthor, InboxMessageWire, InboxProject, InboxQuestion, InboxThread } from '@plannotator/core/inbox-types';
+import { sized, tooltipOf } from './testing/tooltip';
 
 const hasDom = typeof document !== 'undefined';
 // Viewer pulls in web-highlighter, which reads `window` at module-eval time.
@@ -76,7 +77,6 @@ function questionsOf(messageId: string, body: string): InboxQuestion[] {
     choices: q.parsed.choices,
     recommendation: null,
     suggested_text: null,
-    decision_on_answer: false,
     stopped: q.stopped,
     holds_up: q.holds_up,
     asked_by_agent_id: 'ses_a',
@@ -88,16 +88,13 @@ function questionsOf(messageId: string, body: string): InboxQuestion[] {
     picked_by: null,
     picked_at: null,
     sent_reply_id: null,
-    decision_id: null,
     message_id: messageId,
-    decision_recording: false,
-    decision_draft: null,
     superseded_by: null,
   }));
 }
 
 function sentAs(q: InboxQuestion, selected: string[], replyId: string): InboxQuestion {
-  return { ...q, state: 'sent', revision: 1, sent_revision: 1, sent_reply_id: replyId, answer: { v: 1, key: q.key, kind: q.kind, prompt: q.prompt, selected } };
+  return { ...q, state: 'sent', revision: 1, sent_revision: 1, sent_reply_id: replyId, answer: { v: 1, key: q.key, kind: q.kind as 'single', prompt: q.prompt, selected } };
 }
 
 function message(id: string, author: InboxAuthor, seq: number, body: string, extra: Partial<InboxMessageWire> = {}): InboxMessageWire {
@@ -185,6 +182,20 @@ async function settle() {
   });
 }
 
+/**
+ * Let `ms` pass inside act. The live region and a jump land from timers the
+ * pane sets (the announcement 30 ms after the click, the jump on the next
+ * frame); inside act their state updates are flushed before act returns. A
+ * plain wait outside act only works when the runner keeps up: under load both
+ * timers fire in one turn and the test reads the DOM before React renders the
+ * update the first one queued.
+ */
+async function waitInAct(ms: number) {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  });
+}
+
 function pane(thread: InboxThread, lookSeq?: number | null) {
   return (
     <div className="pn-inbox">
@@ -194,8 +205,6 @@ function pane(thread: InboxThread, lookSeq?: number | null) {
         onQuestions={() => {}}
         onChanged={async () => {}}
         onClose={() => {}}
-        decisions={[]}
-        onOpenDecisionPage={() => {}}
         file={null}
         onOpenFile={() => {}}
         onOpenGuide={() => {}}
@@ -223,18 +232,21 @@ const shown = (el: HTMLElement) => [...el.querySelectorAll<HTMLElement>('.ib-pbo
 const holdings = (el: HTMLElement, id: string) => [...(article(el, id)?.querySelectorAll('[data-holding]') ?? [])].map((h) => `${h.getAttribute('data-holding')}=${h.textContent}`);
 const focusedArticle = () => (document.activeElement as HTMLElement | null)?.closest('[data-message-article], [data-middle-fold]');
 const key = (k: string, target: EventTarget = document.body) => act(() => void target.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true })));
+const shift = (k: string, target: EventTarget = document.body) => act(() => void target.dispatchEvent(new KeyboardEvent('keydown', { key: k, shiftKey: true, bubbles: true, cancelable: true })));
 
 test.skipIf(!hasDom)('read messages fold to lines; the new, the last and one holding an unsent pick stay open; the middle of the read run hides', async () => {
   const el = await render(seven());
   // The read run A1..P3 keeps its first and last two; the new last message is open under the divider.
   expect(shown(el)).toEqual(['msg_A1:line', 'fold', 'msg_A3:line', 'msg_P3:line', 'divider', 'msg_A4:open']);
-  expect(el.querySelector('[data-middle-fold]')!.textContent).toBe('3 earlier messages');
+  // A run of 20 or fewer opens in one step, so there is no "Show all" and no count of what is left.
+  expect(el.querySelector('[data-middle-fold]')!.textContent).toBe('Show 3 earlier');
+  expect(el.querySelector('[data-fold-all]')).toBeNull();
   expect(el.querySelector('[data-new-divider]')!.textContent).toBe('New since you looked');
   expect(article(el, 'msg_A4')!.hasAttribute('data-new')).toBe(true);
   expect(article(el, 'msg_A4')!.querySelector('.ib-newtag')!.textContent).toBe('New');
   expect(el.querySelector('[data-thread-meta]')!.textContent).toContain('7 messages');
   expect(el.querySelector('[data-thread-meta]')!.textContent).toContain('1 new since you looked');
-  expect(el.querySelector('[data-expand-all]')!.textContent).toBe('Expand all');
+  expect(el.querySelector('[data-expand-all]')!.getAttribute('aria-label')).toBe('Expand all messages');
   // Every folded line and every open header is a button that says whether it is open.
   expect(article(el, 'msg_A1')!.querySelector('[data-fold-head]')!.getAttribute('aria-expanded')).toBe('false');
   expect(article(el, 'msg_A4')!.querySelector('[data-fold-head]')!.getAttribute('aria-expanded')).toBe('true');
@@ -243,16 +255,16 @@ test.skipIf(!hasDom)('read messages fold to lines; the new, the last and one hol
   const thread = seven();
   const a3 = thread.messages[4]!;
   const [q] = questionsOf('msg_A3', ONE_OPEN);
-  thread.messages[4] = { ...a3, body: ONE_OPEN, questions: [{ ...q!, message_id: 'msg_A3', state: 'picked', answer: { v: 1, key: q!.key, kind: q!.kind, prompt: q!.prompt, selected: ['Cmd K only'] }, picked_at: '2026-10-10T13:00:00.000Z' }] };
+  thread.messages[4] = { ...a3, body: ONE_OPEN, questions: [{ ...q!, message_id: 'msg_A3', state: 'picked', answer: { v: 1, key: q!.key, kind: q!.kind as 'single', prompt: q!.prompt, selected: ['Cmd K only'] }, picked_at: '2026-10-10T13:00:00.000Z' }] };
   act(() => root!.unmount());
   host!.remove();
   const again = await render(thread);
   // The read run before it is four long now: the first and last two stay, one message hides.
   expect(shown(again)).toEqual(['msg_A1:line', 'fold', 'msg_A2:line', 'msg_P2:line', 'msg_A3:open', 'msg_P3:line', 'divider', 'msg_A4:open']);
-  expect(again.querySelector('[data-middle-fold]')!.textContent).toBe('1 earlier message');
+  expect(again.querySelector('[data-middle-fold]')!.textContent).toBe('Show 1 earlier');
   // Folded by hand, its line says the pick is not sent.
   act(() => (article(again, 'msg_A3')!.querySelector('[data-fold-head]') as HTMLButtonElement).click());
-  expect(holdings(again, 'msg_A3')).toEqual(['picks=1 pick, not sent']);
+  expect(holdings(again, 'msg_A3')).toEqual(['picks=1 pick in your draft']);
 });
 
 test.skipIf(!hasDom)("a folded line's snippet is the person's answers when every question is answered, else the message's first words; and it says what the message holds", async () => {
@@ -260,9 +272,10 @@ test.skipIf(!hasDom)("a folded line's snippet is the person's answers when every
   act(() => (el.querySelector('[data-middle-fold] button') as HTMLButtonElement).click());
   const snippet = (id: string) => article(el, id)!.querySelector('[data-snippet]')!;
   expect(snippet('msg_A1').getAttribute('data-snippet')).toBe('answers');
-  // A prompt over 40 characters is cut at a word, so the answer stays on the line; the whole prompt is the title.
+  // A prompt over 40 characters is cut at a word, so the answer stays on the line; the whole prompt is in the tooltip while the line is cut.
   expect(snippet('msg_A1').textContent).toBe('Which search index should the docs site… → Pagefind · Which sections go in the index → Guides, API reference');
-  expect(snippet('msg_A1').getAttribute('title')).toBe('Which search index should the docs site use: Pagefind; Which sections go in the index: Guides, API reference');
+  sized(snippet('msg_A1'), 600, 200);
+  expect(await tooltipOf(snippet('msg_A1'))).toBe('Which search index should the docs site use: Pagefind; Which sections go in the index: Guides, API reference');
   expect(snippet('msg_A3').getAttribute('data-snippet')).toBe('words');
   // Markdown marks gone, link text kept.
   expect(snippet('msg_A3').textContent).toBe('Both notes are in: results show the section path. Ready for a read.');
@@ -273,7 +286,7 @@ test.skipIf(!hasDom)("a folded line's snippet is the person's answers when every
   expect(holdings(el, 'msg_P2')).toEqual(['annotations=2', 'delivered=Delivered']);
   expect(holdings(el, 'msg_P3')).toEqual(['delivered=Delivered']);
   // The line's label reads the sender, the time, what it holds and the snippet.
-  expect(article(el, 'msg_A1')!.querySelector('[data-fold-head]')!.getAttribute('aria-label')).toMatch(/^Claude Code, \d{1,2}:\d{2} [AP]M\. 2 questions answered\. Which search index should the docs site use: Pagefind; Which sections go in the index: Guides, API reference$/);
+  expect(article(el, 'msg_A1')!.querySelector('[data-fold-head]')!.getAttribute('aria-label')).toMatch(/^Claude Code, (?:[A-Z][a-z]{2} \d{1,2}, (?:\d{4}, )?)?\d{1,2}:\d{2} [AP]M\. 2 questions answered\. Which search index should the docs site use: Pagefind; Which sections go in the index: Guides, API reference$/);
 
   // One question answered, one still open: the first words, and "1 open question".
   const thread = seven();
@@ -285,23 +298,24 @@ test.skipIf(!hasDom)("a folded line's snippet is the person's answers when every
   expect(holdings(el, 'msg_A1')).toEqual(['open=1 open question']);
 });
 
-test.skipIf(!hasDom)('the middle fold opens to lines and focuses the first; Expand all opens everything; Fold all goes back to lines, keeping the last open', async () => {
+test.skipIf(!hasDom)('the middle fold opens to lines and focuses the nearest of them; Expand all opens everything; Fold all goes back to lines, keeping the last open', async () => {
   const el = await render(seven());
   act(() => (el.querySelector('[data-middle-fold] button') as HTMLButtonElement).click());
   expect(shown(el)).toEqual(['msg_A1:line', 'msg_P1:line', 'msg_A2:line', 'msg_P2:line', 'msg_A3:line', 'msg_P3:line', 'divider', 'msg_A4:open']);
-  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_P1');
+  // Focus goes to the message that came in where the fold was (the newest of them), never up to the oldest.
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_P2');
   await settle();
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await waitInAct(40);
   expect(el.querySelector('[data-fold-live]')!.textContent).toBe('3 earlier messages shown');
 
   act(() => (el.querySelector('[data-expand-all]') as HTMLButtonElement).click());
   expect(shown(el)).toEqual(['msg_A1:open', 'msg_P1:open', 'msg_A2:open', 'msg_P2:open', 'msg_A3:open', 'msg_P3:open', 'divider', 'msg_A4:open']);
-  expect(el.querySelector('[data-expand-all]')!.textContent).toBe('Fold all');
+  expect(el.querySelector('[data-expand-all]')!.getAttribute('aria-label')).toBe('Fold the earlier messages');
   expect(article(el, 'msg_A1')!.querySelector('[data-message-id="msg_A1"]')).not.toBeNull();
 
   act(() => (el.querySelector('[data-expand-all]') as HTMLButtonElement).click());
   expect(shown(el)).toEqual(['msg_A1:line', 'fold', 'msg_A3:line', 'msg_P3:line', 'divider', 'msg_A4:open']);
-  expect(el.querySelector('[data-expand-all]')!.textContent).toBe('Expand all');
+  expect(el.querySelector('[data-expand-all]')!.getAttribute('aria-label')).toBe('Expand all messages');
 });
 
 test.skipIf(!hasDom)('opening a line keeps it where it was: the scroll moves by however much the thread above it changed', async () => {
@@ -322,6 +336,36 @@ test.skipIf(!hasDom)('opening a line keeps it where it was: the scroll moves by 
   expect(article(el, 'msg_A3')!.hasAttribute('data-open')).toBe(true);
   // Focus stays on the message the person opened (its header now).
   expect(document.activeElement).toBe(article(el, 'msg_A3')!.querySelector('[data-fold-head]'));
+});
+
+test.skipIf(!hasDom)("a message's head is one row folded or open: the mark, the name and the time keep their cells; only the third column swaps, and only a body the person opened fades in", async () => {
+  const el = await render(seven());
+  const cells = (row: Element) => [...row.querySelectorAll(':scope > *, :scope > .ib-a11y-skip > *')].map((c) => c.className).filter((c) => c !== 'ib-a11y-skip' && c !== 'ib-fl-hit');
+  const folded = article(el, 'msg_A3')!.querySelector('.ib-fline')!;
+  const foldedMark = folded.querySelector('.ib-mk')!.className;
+  const foldedName = folded.querySelector('.ib-fl-nm')!.textContent;
+  expect(cells(folded)).toEqual(['ib-mk ib-big', 'ib-fl-nm', 'ib-fl-sn', 'ib-fl-chips', 'ib-fl-tm']);
+
+  act(() => article(el, 'msg_A3')!.querySelector<HTMLButtonElement>('[data-fold-head]')!.click());
+  const open = article(el, 'msg_A3')!.querySelector('[data-open-head]')!;
+  // The same row: the mark the same size (its classes), the name in the same cell, the snippet's column now
+  // says where it was sent and to whom, the time last.
+  expect(open.classList.contains('ib-fline')).toBe(true);
+  expect(cells(open)).toEqual(['ib-mk ib-big', 'ib-fl-nm ib-who', 'ib-fl-meta', 'ib-fl-chips', 'ib-fl-tm']);
+  expect(open.querySelector('.ib-mk')!.className).toBe(foldedMark);
+  expect(open.querySelector('.ib-fl-nm')!.textContent).toBe(foldedName);
+  expect(open.querySelector('.ib-fl-meta')!.textContent).toBe('in docs-site · to you');
+  // The fold button lies under the row; the row's text is its label's, hidden from screen readers.
+  const hit = open.querySelector('.ib-fl-hit')!;
+  expect(hit.getAttribute('data-fold-head')).toBe('');
+  expect(hit.getAttribute('aria-expanded')).toBe('true');
+  expect(open.querySelector('.ib-fl-nm')!.getAttribute('aria-hidden')).toBe('true');
+  // The body the person opened fades in; one open from the first draw does not.
+  expect(article(el, 'msg_A3')!.querySelector('.ib-msg')!.hasAttribute('data-revealed')).toBe(true);
+  expect(article(el, 'msg_A4')!.querySelector('.ib-msg')!.hasAttribute('data-revealed')).toBe(false);
+  // Folding is instant, and the line is the folded row again.
+  act(() => (hit as HTMLButtonElement).click());
+  expect(cells(article(el, 'msg_A3')!.querySelector('.ib-fline')!)).toEqual(['ib-mk ib-big', 'ib-fl-nm', 'ib-fl-sn', 'ib-fl-chips', 'ib-fl-tm']);
 });
 
 test.skipIf(!hasDom)('the thread opens at the divider with the last read line above it; with nothing new it opens at the top', async () => {
@@ -376,28 +420,28 @@ test.skipIf(!hasDom)('the "↓ 1 new" pill shows while the first new message is 
   expect(pill.hasAttribute('data-off')).toBe(true);
 });
 
-test.skipIf(!hasDom)('keys: n goes to the first new message, j and k move between messages and the fold; never while typing', async () => {
+test.skipIf(!hasDom)('keys: n goes to the first new message, Shift+J and Shift+K move between messages and the fold; never while typing', async () => {
   const el = await render(seven());
   key('n');
   expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_A4');
-  key('k');
+  shift('K');
   expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_P3');
-  key('k');
-  key('k');
+  shift('K');
+  shift('K');
   expect(focusedArticle()?.hasAttribute('data-middle-fold')).toBe(true);
-  key('k');
+  shift('K');
   expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_A1');
-  key('k');
+  shift('K');
   expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_A1');
-  key('j');
-  key('j');
+  shift('J');
+  shift('J');
   expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_A3');
   // In the reply box the letters are text.
   act(() => ([...el.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Reply') as HTMLButtonElement).click());
   const box = el.querySelector('textarea')!;
   box.focus();
   key('n', box);
-  key('j', box);
+  shift('J', box);
   expect(document.activeElement).toBe(box);
 });
 
@@ -433,7 +477,13 @@ test.skipIf(!hasDom)('a one-message thread looks as it always did: no fold butto
   expect(el.querySelector('.ib-newtag')).toBeNull();
   expect(el.querySelector('[data-new-pill]')).toBeNull();
   expect(el.querySelector('.ib-pbody')!.classList.contains('ib-folding')).toBe(false);
-  expect(article(el, ROOT)!.querySelector('.ib-who')!.textContent).toBe('Claude Code in docs-site');
+  // The same head row as every other message (inbox-polish, item 5), with nothing to fold.
+  const head = article(el, ROOT)!.querySelector('[data-open-head]')!;
+  expect(head.classList.contains('ib-fline')).toBe(true);
+  expect(head.querySelector('.ib-who')!.textContent).toBe('Claude Code');
+  expect(head.querySelector('.ib-fl-meta')!.textContent).toBe('in docs-site · to you');
+  expect(head.querySelector('.ib-fl-nm')!.hasAttribute('aria-hidden')).toBe(false);
+  expect(head.querySelector('.ib-fl-in')!.hasAttribute('aria-hidden')).toBe(false);
 });
 
 test.skipIf(!hasDom)('a payload without seqs (an older Inbox) folds nothing and marks nothing new', async () => {
@@ -455,7 +505,7 @@ test.skipIf(!hasDom)('a link to a replaced card in a folded message opens the me
   const link = article(el, 'msg_A4')!.querySelector<HTMLButtonElement>('[data-replaces-line] .ib-q-link')!;
   act(() => link.click());
   await settle();
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await waitInAct(40);
   expect(article(el, ROOT)!.hasAttribute('data-open')).toBe(true);
   expect(document.activeElement?.getAttribute('data-question-key')).toBe(index!.key);
 });
@@ -476,7 +526,7 @@ test.skipIf(!hasDom)('a reply the person sends during the visit is a look: every
   // Folded, the lines above the reply are not drawn as unread either.
   act(() => (el.querySelector('[data-expand-all]') as HTMLButtonElement).click());
   act(() => (el.querySelector('[data-expand-all]') as HTMLButtonElement).click());
-  expect(el.querySelector('[data-expand-all]')!.textContent).toBe('Expand all');
+  expect(el.querySelector('[data-expand-all]')!.getAttribute('aria-label')).toBe('Expand all messages');
   expect(el.querySelector('.ib-fl-unread')).toBeNull();
   expect(el.querySelector('.ib-newtag')).toBeNull();
   // The agent writes again after the reply: that one is new.
@@ -501,7 +551,7 @@ test.skipIf(!hasDom)('the meta line says one time when the thread began and ende
   const thread = seven();
   const at = thread.messages[0]!.created_at;
   const el = await render({ ...thread, messages: thread.messages.map((m) => ({ ...m, created_at: at })) });
-  const span = el.querySelectorAll('[data-thread-meta] > span')[2]!.textContent!;
+  const span = el.querySelectorAll('[data-thread-meta-rest] > span')[2]!.textContent!;
   expect(span).not.toContain(' to ');
   expect(span).toMatch(/\d{1,2}:\d{2} [AP]M$/);
   expect(el.querySelectorAll('button div').length).toBe(0);
@@ -558,7 +608,7 @@ test.skipIf(!hasDom)('typing in the reply box measures nothing: the chrome and t
   expect(measured).toBe(0);
 });
 
-test.skipIf(!hasDom)('the thread box shrinking (the reply box opening below it) brings the pill back without a scroll or a window resize', async () => {
+test.skipIf(!hasDom)('the thread box changing size (the reply box opening or closing below it) re-measures the pill without a scroll or a window resize; a message once on screen never brings it back', async () => {
   // A fake ResizeObserver the test drives, standing in for the browser's.
   const observers: { callback: ResizeObserverCallback; observed: Element[]; connected: boolean }[] = [];
   stub(globalThis, 'ResizeObserver', {
@@ -578,8 +628,8 @@ test.skipIf(!hasDom)('the thread box shrinking (the reply box opening below it) 
       }
     },
   });
-  // The new message's top is at 700; the thread box ends at 800, then at 600 once the foot grows.
-  let bottom = 800;
+  // The new message's top is at 700; the thread box ends at 600 while the reply box is open, at 800 once it closes.
+  let bottom = 600;
   stub(HTMLElement.prototype, 'getBoundingClientRect', {
     value(this: HTMLElement) {
       const y = this.classList.contains('ib-pbody') ? 0 : this.hasAttribute('data-new') ? 700 : 0;
@@ -589,16 +639,22 @@ test.skipIf(!hasDom)('the thread box shrinking (the reply box opening below it) 
   });
   const el = await render(seven());
   const body = el.querySelector('.ib-pbody')!;
-  const watcher = observers.find((o) => o.observed.includes(body))!;
-  expect(watcher).toBeDefined();
+  // Every observer on the body fires, as in a browser: the foot's line (footLine.ts) watches it too.
+  const watchers = observers.filter((o) => o.observed.includes(body));
+  expect(watchers.length).toBeGreaterThan(0);
+  const resized = () => act(() => watchers.forEach((w) => w.callback([], {} as ResizeObserver)));
   const pill = el.querySelector<HTMLButtonElement>('[data-new-pill]')!;
-  expect(pill.hasAttribute('data-off')).toBe(true);
-  bottom = 600;
-  act(() => watcher.callback([], {} as ResizeObserver));
   expect(pill.hasAttribute('data-off')).toBe(false);
+  bottom = 800;
+  resized();
+  expect(pill.hasAttribute('data-off')).toBe(true);
+  // The reply box opens again and covers it: it was on screen, so the pill stays away.
+  bottom = 600;
+  resized();
+  expect(pill.hasAttribute('data-off')).toBe(true);
   act(() => root!.unmount());
   root = null;
-  expect(watcher.connected).toBe(false);
+  expect(watchers.every((w) => !w.connected)).toBe(true);
 });
 
 // The Inbox's own notes (Mark read's set-aside note, a late Undo's reopened
@@ -622,8 +678,6 @@ async function renderWithSent(thread: InboxThread, sent: { at: string; checked_a
           onQuestions={() => {}}
           onChanged={async () => {}}
           onClose={() => {}}
-          decisions={[]}
-          onOpenDecisionPage={() => {}}
           file={null}
           onOpenFile={() => {}}
           onOpenGuide={() => {}}
@@ -635,6 +689,16 @@ async function renderWithSent(thread: InboxThread, sent: { at: string; checked_a
   await settle();
   return host;
 }
+
+test.skipIf(!hasDom)('an earlier reply the agent read, opened from its line, says "Delivered to" like its folded line; the latest message keeps no line of its own', async () => {
+  const el = await render(seven());
+  act(() => (el.querySelector('[data-middle-fold] button') as HTMLButtonElement).click());
+  expect(holdings(el, 'msg_P3')).toEqual(['delivered=Delivered']);
+  act(() => article(el, 'msg_P3')!.querySelector<HTMLButtonElement>('[data-fold-head]')!.click());
+  await settle();
+  expect(article(el, 'msg_P3')!.querySelector('[data-delivery]')?.textContent).toBe('Delivered to Claude Code');
+  expect(article(el, 'msg_A4')!.querySelector('[data-delivery]')).toBeNull();
+});
 
 test.skipIf(!hasDom)("a reply, then the Inbox's set-aside note: the Saved for / Delivered to line sits on the reply, never on the note", async () => {
   const [q] = questionsOf(ROOT, ONE_OPEN);
@@ -689,4 +753,454 @@ test.skipIf(!hasDom)('an agent message posted inside the Undo window still reads
   const fromVisit = await renderWithSent(thread, null, 2);
   expect(article(fromVisit, 'msg_A2')!.hasAttribute('data-new')).toBe(true);
   expect(fromVisit.querySelector('[data-new-divider]')).not.toBeNull();
+});
+
+// The middle fold opens in steps (approval "inbox-thread-fold-steps", take a; the owner: "sometimes I only
+// want to see the previous handful of messages. But I have to open up the whole list here, which is huge,
+// and it like scrolls to the top"). The failures these guard: one click drew every hidden message and threw
+// the reader up to the oldest one; the newest messages moved under the reader; the room a step borrows
+// stayed behind as an empty end, or broke following an arrival and the "↓ N new" pill.
+
+/** A long thread, every message read: 50 messages between the person and the agent, a minute apart. */
+function longThread(count = 50): InboxThread {
+  const id = (i: number) => (i === 0 ? ROOT : `msg_L${i}`);
+  const messages = Array.from({ length: count }, (_, i) =>
+    message(id(i), i % 2 === 0 ? AGENT : PERSON, 2 * i + 2, `Step ${i} of the rollout is done.`, {
+      created_at: new Date(Date.UTC(2026, 9, 10, 9) + i * 60_000).toISOString(),
+      ...(i === 0 ? { person_seen_seq: 2 * count, agent_checked_seq: 2 * count } : {}),
+    }),
+  );
+  return { thread_id: ROOT, project: PROJECT, subject: 'Search for the docs site', thread_name: null, resolved_at: null, messages };
+}
+const L = (i: number) => (i === 0 ? ROOT : `msg_L${i}`);
+const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, k) => from + k);
+
+/**
+ * A layout happy-dom does not have: the thread's view is VIEW px tall (`resize` changes it) with PAD px of
+ * padding at its end, as `.ib-pbody` has; each message and the fold is ROW px (an arrival as tall as `heights`
+ * says), the borrowed room as tall as its style, everything else nothing. `scrollTop` is clamped as a browser
+ * clamps it, so a step that would scroll past the end needs the room.
+ */
+const VIEW = 800;
+const ROW = 40;
+const PAD = 18;
+function laidOut(el: HTMLElement, heights: Record<string, number> = {}) {
+  const body = el.querySelector<HTMLElement>('.ib-pbody')!;
+  body.style.paddingBottom = `${PAD}px`;
+  let scroll = 0;
+  let viewH = VIEW;
+  const own = (node: Element): number => {
+    if (!(node instanceof HTMLElement)) return 0;
+    if (node.hasAttribute('data-fold-room')) return parseFloat(node.style.height) || 0;
+    const id = node.getAttribute('data-message-article');
+    if (id) return heights[id] ?? ROW;
+    return node.hasAttribute('data-middle-fold') ? ROW : 0;
+  };
+  const content = () => [...body.children].reduce((sum, c) => sum + own(c), 0) + PAD;
+  const topOf = (node: Element) => {
+    let y = -scroll;
+    for (const c of body.children) {
+      if (c === node) return y;
+      y += own(c);
+    }
+    return y;
+  };
+  const rect = (top: number, height: number) => ({ top, bottom: top + height, left: 0, right: 600, width: 600, height, x: 0, y: top, toJSON() {} });
+  Object.defineProperty(body, 'scrollTop', { configurable: true, get: () => scroll, set: (v: number) => void (scroll = Math.max(0, Math.min(v, Math.max(0, content() - viewH)))) });
+  Object.defineProperty(body, 'scrollHeight', { configurable: true, get: () => Math.max(content(), viewH) });
+  Object.defineProperty(body, 'clientHeight', { configurable: true, get: () => viewH });
+  stub(HTMLElement.prototype, 'getBoundingClientRect', {
+    value(this: HTMLElement) {
+      if (this === body) return rect(0, viewH);
+      let node: HTMLElement = this;
+      while (node.parentElement && node.parentElement !== body) node = node.parentElement;
+      return node.parentElement === body ? rect(topOf(node), own(node)) : rect(0, 0);
+    },
+  });
+  stub(HTMLElement.prototype, 'offsetHeight', {
+    get(this: HTMLElement) {
+      return this.parentElement === body ? own(this) : 0;
+    },
+  });
+  const scrolled: string[] = [];
+  stub(HTMLElement.prototype, 'scrollIntoView', {
+    value(this: HTMLElement) {
+      scrolled.push(this.closest('[data-message-article]')?.getAttribute('data-message-article') ?? this.className);
+    },
+  });
+  const room = () => el.querySelector<HTMLElement>('[data-fold-room]')!;
+  const scrollTo = (top: number) => {
+    body.scrollTop = top;
+    act(() => void body.dispatchEvent(new Event('scroll')));
+  };
+  /** The view gets shorter or taller without a scroll (the reply box, the window): the browser keeps scrollTop where it can. */
+  const resize = (height: number) => {
+    viewH = height;
+    body.scrollTop = scroll;
+  };
+  return { body, room, roomHeight: () => own(room()), top: (id: string) => article(el, id)!.getBoundingClientRect().top, scrolled, scrollTo, resize };
+}
+
+/** A ResizeObserver the test drives, standing in for the browser's: `fire()` calls back every live one watching `target`. */
+function drivenResizeObserver() {
+  const observers: { callback: ResizeObserverCallback; observed: Element[]; live: boolean }[] = [];
+  stub(globalThis, 'ResizeObserver', {
+    writable: true,
+    value: class {
+      private entry: (typeof observers)[number];
+      constructor(callback: ResizeObserverCallback) {
+        this.entry = { callback, observed: [], live: true };
+        observers.push(this.entry);
+      }
+      observe(target: Element) {
+        this.entry.observed.push(target);
+      }
+      unobserve() {}
+      disconnect() {
+        this.entry.live = false;
+      }
+    },
+  });
+  return (target: Element) => act(() => observers.filter((o) => o.live && o.observed.includes(target)).forEach((o) => o.callback([], {} as ResizeObserver)));
+}
+
+test.skipIf(!hasDom)('a long fold opens 20 at a time, the 20 just above the newer messages; focus on the nearest of them, a screen reader hears the count; Show all opens the rest', async () => {
+  const el = await render(longThread());
+  // The read run keeps the first and the last two; the 46 between hide behind the fold.
+  expect(shown(el)).toEqual([`${ROOT}:line`, 'fold', 'msg_L47:line', 'msg_L48:line', 'msg_L49:open']);
+  const fold = () => el.querySelector<HTMLElement>('[data-middle-fold]');
+  const step = () => fold()!.querySelector<HTMLButtonElement>('[data-fold-step]')!;
+  expect(fold()!.textContent).toBe('Show 20 earlier · 46 hiddenShow all');
+  expect(fold()!.getAttribute('role')).toBe('group');
+  expect(fold()!.getAttribute('aria-label')).toBe('46 earlier messages folded');
+  expect(step().getAttribute('aria-label')).toBe('Show 20 earlier messages');
+  // The step is the fold's head (Shift+J / Shift+K reach it); Show all is the quiet second button.
+  expect(step().hasAttribute('data-fold-head')).toBe(true);
+  expect(el.querySelector('[data-fold-all]')!.getAttribute('aria-label')).toBe('Show all 46 earlier messages');
+
+  act(() => step().click());
+  // L27..L46 come in as lines between the fold and L47; the 26 older ones stay folded.
+  expect(shown(el)).toEqual([`${ROOT}:line`, 'fold', ...range(27, 48).map((i) => `${L(i)}:line`), 'msg_L49:open']);
+  expect(fold()!.textContent).toBe('Show 20 earlier · 26 hiddenShow all');
+  // Only what came in fades in.
+  expect([...el.querySelectorAll('[data-fold-new]')].map((a) => a.getAttribute('data-message-article'))).toEqual(range(27, 46).map(L));
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_L46');
+  await waitInAct(40);
+  expect(el.querySelector('[data-fold-live]')!.textContent).toBe('20 earlier messages shown, 26 still folded');
+
+  act(() => step().click());
+  // Six left: the step says so, and Show all is gone (it would do the same).
+  expect(fold()!.textContent).toBe('Show 6 earlier');
+  expect(el.querySelector('[data-fold-all]')).toBeNull();
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_L26');
+  await waitInAct(40);
+  expect(el.querySelector('[data-fold-live]')!.textContent).toBe('20 earlier messages shown, 6 still folded');
+
+  // Fold all starts over; Show all then opens the whole run at once, without the fade.
+  act(() => (el.querySelector('[data-expand-all]') as HTMLButtonElement).click());
+  act(() => (el.querySelector('[data-expand-all]') as HTMLButtonElement).click());
+  expect(fold()!.textContent).toBe('Show 20 earlier · 46 hiddenShow all');
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-all]')!.click());
+  expect(fold()).toBeNull();
+  expect(shown(el)).toEqual([...range(0, 48).map((i) => `${L(i)}:line`), 'msg_L49:open']);
+  expect(el.querySelector('[data-fold-new]')).toBeNull();
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_L46');
+  await waitInAct(40);
+  expect(el.querySelector('[data-fold-live]')!.textContent).toBe('46 earlier messages shown');
+});
+
+test.skipIf(!hasDom)('after a step a keyboard goes back up to the fold with Shift+K through what it showed, 20 heads; no key was added', async () => {
+  const el = await render(longThread());
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_L46');
+  for (let i = 0; i < 19; i += 1) shift('K');
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_L27');
+  shift('K');
+  expect(document.activeElement).toBe(el.querySelector('[data-fold-step]'));
+  // Enter on it is the next step.
+  act(() => (document.activeElement as HTMLButtonElement).click());
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_L26');
+});
+
+test.skipIf(!hasDom)('a step never moves the newest messages: on a short thread it borrows room below, which shrinks to the part in view as the person scrolls and is gone once out of view', async () => {
+  const el = await render(longThread());
+  const view = laidOut(el);
+  // The thread fits the view: the fold at 40, L47..L49 below it, empty view under them.
+  const before = [47, 48, 49].map((i) => view.top(L(i)));
+  expect(before).toEqual([80, 120, 160]);
+  expect(view.roomHeight()).toBe(0);
+
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  // 20 rows came in above L47 and the view scrolled by them: L47..L49 did not move, the fold went up off screen.
+  expect([47, 48, 49].map((i) => view.top(L(i)))).toEqual(before);
+  expect(view.top('msg_L46')).toBe(40);
+  expect(el.querySelector('[data-middle-fold]')!.getBoundingClientRect().top).toBeLessThan(0);
+  // Nothing scrolled to the focus (it is on screen, where the fold was).
+  expect(view.scrolled).toEqual([]);
+  // The room is the empty part of the view under L49 (above the view's padding), exactly what was empty before the step.
+  expect(view.roomHeight()).toBe(VIEW - PAD - 200);
+  expect(view.room().getBoundingClientRect().bottom).toBe(VIEW - PAD);
+
+  // Scrolled up 300 px: the room keeps only the part still in view, and nothing moves when it shrinks.
+  view.scrollTo(view.body.scrollTop - 300);
+  expect(view.top('msg_L49')).toBe(460);
+  expect(view.roomHeight()).toBe(VIEW - PAD - 500);
+  expect(view.room().getBoundingClientRect().bottom).toBe(VIEW - PAD);
+  // Up out of view: the room is gone; the thread ends at L49 again.
+  view.scrollTo(0);
+  expect(view.roomHeight()).toBe(0);
+  expect(view.body.scrollHeight).toBe(Math.max(VIEW, 25 * ROW + PAD));
+
+  // Show all from the fold near the top keeps the message below it where it was too.
+  const below = view.top('msg_L27');
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-all]')!.click());
+  expect(view.top('msg_L27')).toBe(below);
+  expect(view.top('msg_L49')).toBe(below + 22 * ROW);
+  expect(view.scrolled).toEqual([]);
+});
+
+test.skipIf(!hasDom)('with room borrowed, an arrival at the end is still followed, the room never shows under it, a scroll to the end lands on the thread; scrolled up, the "↓ 1 new" pill counts the next one', async () => {
+  const thread = longThread();
+  const last = thread.messages.at(-1)!.seq!;
+  const props = { onSeen: () => {}, seenThrough: last, lookSeq: last };
+  const draw = (t: InboxThread) => (
+    <div className="pn-inbox">
+      <ThreadPane thread={t} sent={null} onQuestions={() => {}} onChanged={async () => {}} onClose={() => {}} file={null} onOpenFile={() => {}} onOpenGuide={() => {}} {...props} />
+    </div>
+  );
+  host = document.createElement('div');
+  document.body.appendChild(host);
+  act(() => {
+    root = createRoot(host!);
+    root.render(draw(thread));
+  });
+  await settle();
+  const el = host;
+  const view = laidOut(el, { msg_A90: 300, msg_A91: 600 });
+  const scrolls: number[] = [];
+  stub(HTMLElement.prototype, 'scrollBy', {
+    value(this: HTMLElement, options: ScrollToOptions) {
+      scrolls.push(options.top ?? 0);
+      this.scrollTop += options.top ?? 0;
+    },
+  });
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  // The browser's scroll event after the step's own scroll: the thread is at its end.
+  view.scrollTo(view.body.scrollTop);
+  expect(view.roomHeight()).toBe(VIEW - PAD - 200);
+
+  // A short arrival lands in the empty end of the view: no scroll needed, and the room shrinks to what is left under it.
+  const one = [...thread.messages, message('msg_A90', AGENT, last + 1, 'Rolled out to everyone.', { created_at: '2026-10-10T10:00:00.000Z' })];
+  act(() => root!.render(draw({ ...thread, messages: one })));
+  await settle();
+  expect(view.top('msg_A90')).toBe(200);
+  expect(scrolls).toEqual([]);
+  expect(view.roomHeight()).toBe(VIEW - PAD - 500);
+  expect(view.room().getBoundingClientRect().bottom).toBe(VIEW - PAD);
+  // A send's "scroll to the end" moves nothing: the end of the thread is already in view.
+  const at = view.body.scrollTop;
+  view.scrollTo(view.body.scrollHeight);
+  expect(view.body.scrollTop).toBe(at);
+  expect(el.querySelector('[data-new-pill]')!.hasAttribute('data-off')).toBe(true);
+
+  // A tall arrival runs past the view: the thread follows it as at any end, and the room is gone.
+  const two = [...one, message('msg_A91', AGENT, last + 2, 'Metrics look normal.', { created_at: '2026-10-10T10:01:00.000Z' })];
+  act(() => root!.render(draw({ ...thread, messages: two })));
+  await settle();
+  expect(scrolls.length).toBe(1);
+  expect(scrolls[0]).toBeGreaterThan(0);
+  expect(view.roomHeight()).toBe(0);
+  // Under the arrival there is only the view's own padding to scroll, no blank.
+  expect(view.body.scrollHeight - view.body.scrollTop - VIEW).toBeLessThanOrEqual(PAD);
+
+  // Scrolled up away from the end, the next arrival is not followed, and the pill counts it.
+  view.scrollTo(0);
+  const three = [...two, message('msg_A92', AGENT, last + 3, 'Closing the rollout.', { created_at: '2026-10-10T10:02:00.000Z' })];
+  act(() => root!.render(draw({ ...thread, messages: three })));
+  await settle();
+  expect(scrolls.length).toBe(1);
+  const pill = el.querySelector<HTMLButtonElement>('[data-new-pill]')!;
+  expect(pill.hasAttribute('data-off')).toBe(false);
+  expect(pill.textContent).toBe('1 new');
+});
+
+test.skipIf(!hasDom)('a step with the fold at the top edge of the view keeps the newest messages still: the focus there is not scrolled into view', async () => {
+  const el = await render(longThread());
+  const view = laidOut(el);
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  // The person scrolls up through what came in until the fold sits flush with the top of the view.
+  view.scrollTo(view.body.scrollTop + el.querySelector('[data-middle-fold]')!.getBoundingClientRect().top);
+  expect(el.querySelector('[data-middle-fold]')!.getBoundingClientRect().top).toBe(0);
+  const below = view.top('msg_L27');
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  expect(view.top('msg_L27')).toBe(below);
+  // Focus is on L26, where the fold was, at the very top: on screen, so nothing scrolls to it.
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_L26');
+  expect(view.top('msg_L26')).toBe(0);
+  expect(view.scrolled).toEqual([]);
+});
+
+test.skipIf(!hasDom)('the view getting shorter (the reply box opens, the window shrinks) trims the borrowed room, so scrolling to the end never lands in blank', async () => {
+  const fire = drivenResizeObserver();
+  const el = await render(longThread());
+  const view = laidOut(el);
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  view.scrollTo(view.body.scrollTop);
+  expect(view.roomHeight()).toBe(VIEW - PAD - 200);
+  // The reply box opens: the thread's box is 200 px shorter, the bottom of the room now under the view.
+  view.resize(600);
+  fire(view.body);
+  expect(view.roomHeight()).toBe(600 - PAD - 200);
+  const at = view.top('msg_L49');
+  view.scrollTo(view.body.scrollHeight);
+  expect(view.top('msg_L49')).toBe(at);
+  // The window gets shorter still.
+  view.resize(400);
+  act(() => void window.dispatchEvent(new Event('resize')));
+  expect(view.roomHeight()).toBe(400 - PAD - 200);
+  view.scrollTo(view.body.scrollHeight);
+  expect(view.top('msg_L49')).toBe(at);
+});
+
+test.skipIf(!hasDom)("the person's own send with room borrowed: the room keeps only what is under the reply, so the send's scroll to the end moves nothing", async () => {
+  const thread = longThread();
+  const el = await render(thread);
+  const view = laidOut(el);
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  view.scrollTo(view.body.scrollTop);
+  const at = view.top('msg_L49');
+  const last = thread.messages.at(-1)!.seq!;
+  const sent = message('msg_P90', PERSON, last + 1, 'Ship it.', { created_at: '2026-10-10T10:00:00.000Z' });
+  act(() => root!.render(pane({ ...thread, messages: [...thread.messages, sent] })));
+  await settle();
+  expect(view.top('msg_P90')).toBe(at + ROW);
+  expect(view.roomHeight()).toBe(VIEW - PAD - (at + 2 * ROW));
+  // ThreadPane's send ends with `scrollTo({ top: scrollHeight })`.
+  view.scrollTo(view.body.scrollHeight);
+  expect(view.top('msg_L49')).toBe(at);
+});
+
+test.skipIf(!hasDom)('a jump into a hidden message opens the run from its newest side down to it, no further: the older ones stay behind the fold', async () => {
+  const thread = longThread();
+  // L10, deep in the hidden run, holds an open question; the open questions list jumps to it.
+  thread.messages[10] = { ...thread.messages[10]!, author: AGENT, body: ONE_OPEN, questions: questionsOf('msg_L10', ONE_OPEN) };
+  const el = await render(thread);
+  expect(article(el, 'msg_L10')).toBeNull();
+  const button = el.querySelector<HTMLButtonElement>('[data-open-questions]')!;
+  await act(async () => {
+    button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerType: 'mouse' }));
+    button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+    button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, button: 0, pointerType: 'mouse' }));
+    button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0 }));
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true, button: 0 }));
+  });
+  for (let i = 0; i < 60 && !document.querySelector('[data-open-questions-list] [data-open-question]'); i += 1) await settle();
+  await act(async () => document.querySelector<HTMLElement>('[data-open-questions-list] [data-open-question]')!.click());
+  for (let i = 0; i < 60 && !article(el, 'msg_L10')?.hasAttribute('data-open'); i += 1) await settle();
+  // L10 is open with everything newer than it in the run; L1..L9 are still folded above it.
+  expect(article(el, 'msg_L10')!.hasAttribute('data-open')).toBe(true);
+  expect(shown(el)).toEqual([`${ROOT}:line`, 'fold', 'msg_L10:open', ...range(11, 48).map((i) => `${L(i)}:line`), 'msg_L49:open']);
+  expect(el.querySelector('[data-middle-fold]')!.textContent).toBe('Show 9 earlier');
+});
+
+/**
+ * `read` agent messages the person has looked at, then `fresh` new ones (approval "inbox-thread-fold-unread": past
+ * 20 new, the thread opens on its newest 20 and the older new ones wait behind the fold).
+ */
+function manyNew(read: number, fresh: number): InboxThread {
+  const id = (i: number) => (i === 0 ? ROOT : `msg_N${i}`);
+  const messages = Array.from({ length: read + fresh }, (_, i) =>
+    message(id(i), AGENT, 2 * i + 2, `Step ${i} of the rollout is done.`, {
+      created_at: new Date(Date.UTC(2026, 9, 10, 9) + i * 60_000).toISOString(),
+      ...(i === 0 ? { person_seen_seq: read === 0 ? 0 : 2 * read, agent_checked_seq: 0 } : {}),
+    }),
+  );
+  return { thread_id: ROOT, project: PROJECT, subject: 'Search for the docs site', thread_name: null, resolved_at: null, messages };
+}
+const N = (i: number) => (i === 0 ? ROOT : `msg_N${i}`);
+
+/** Every top-level element of the thread is 50px under the one before it (happy-dom has no layout). */
+function rowsOf50() {
+  stub(HTMLElement.prototype, 'offsetTop', {
+    get(this: HTMLElement) {
+      const parent = this.parentElement;
+      return parent?.classList.contains('ib-pbody') ? [...parent.children].indexOf(this) * 50 : 0;
+    },
+  });
+}
+
+test.skipIf(!hasDom)('past 20 new, the thread opens on its newest 20; the older new ones wait behind the fold, under the divider, and it opens where it did', async () => {
+  rowsOf50();
+  // Three read, thirty new: N3..N12 hide, N13..N32 (the newest 20) open.
+  const el = await render(manyNew(3, 30));
+  expect(shown(el)).toEqual([`${ROOT}:line`, 'msg_N1:line', 'msg_N2:line', 'divider', 'fold', ...range(13, 32).map((i) => `${N(i)}:open`)]);
+  expect(el.querySelector('[data-middle-fold]')!.textContent).toBe('Show 10 earlier');
+  // Where it opened before: the divider, with the last read line just above it.
+  const body = el.querySelector<HTMLElement>('.ib-pbody')!;
+  const divider = el.querySelector<HTMLElement>('[data-new-divider]')!;
+  const above = divider.previousElementSibling as HTMLElement;
+  expect(above.getAttribute('data-message-article')).toBe('msg_N2');
+  expect(body.scrollTop).toBe(above.offsetTop - 6);
+  expect(el.querySelector('[data-thread-meta]')!.textContent).toContain('30 new since you looked');
+
+  // Folding marks nothing read: the older new ones come in still New, and the count holds.
+  act(() => el.querySelector<HTMLButtonElement>('[data-fold-step]')!.click());
+  expect(shown(el)).toEqual([`${ROOT}:line`, 'msg_N1:line', 'msg_N2:line', 'divider', ...range(3, 12).map((i) => `${N(i)}:line`), ...range(13, 32).map((i) => `${N(i)}:open`)]);
+  for (const i of range(3, 12)) {
+    expect(article(el, N(i))!.hasAttribute('data-new')).toBe(true);
+    expect(article(el, N(i))!.querySelector('.ib-newtag')?.textContent).toBe('New');
+  }
+  expect(el.querySelector('[data-thread-meta]')!.textContent).toContain('30 new since you looked');
+
+  // Never looked at (every message new): it opens at the top, as before, its first message a line above the fold.
+  act(() => root!.unmount());
+  host!.remove();
+  const unread = await render(manyNew(0, 30));
+  expect(shown(unread)).toEqual([`${ROOT}:line`, 'fold', ...range(10, 29).map((i) => `${N(i)}:open`)]);
+  expect(unread.querySelector('[data-middle-fold]')!.textContent).toBe('Show 9 earlier');
+  expect(unread.querySelector<HTMLElement>('.ib-pbody')!.scrollTop).toBe(0);
+});
+
+test.skipIf(!hasDom)('20 new or fewer: every new message opens, as before', async () => {
+  const el = await render(manyNew(3, 20));
+  expect(shown(el)).toEqual([`${ROOT}:line`, 'msg_N1:line', 'msg_N2:line', 'divider', ...range(3, 22).map((i) => `${N(i)}:open`)]);
+  expect(el.querySelector('[data-middle-fold]')).toBeNull();
+});
+
+test.skipIf(!hasDom)('a link to a new message behind the fold opens the fold down to it and lands on it', async () => {
+  const centred: string[] = [];
+  stub(HTMLElement.prototype, 'scrollIntoView', {
+    writable: true,
+    value(this: HTMLElement, options?: ScrollIntoViewOptions) {
+      if (options?.block === 'center') centred.push(this.getAttribute('data-message-article') ?? '');
+    },
+  });
+  const thread = manyNew(3, 30);
+  let landed = 0;
+  host = document.createElement('div');
+  document.body.appendChild(host);
+  act(() => {
+    root = createRoot(host!);
+    root.render(
+      <div className="pn-inbox">
+        <ThreadPane thread={thread} sent={null} onQuestions={() => {}} onChanged={async () => {}} onClose={() => {}} file={null} onOpenFile={() => {}} onOpenGuide={() => {}} landing={{ messageId: 'msg_N6', terms: [], questionKey: null }} onLanded={() => void (landed += 1)} />
+      </div>,
+    );
+  });
+  for (let i = 0; i < 60 && landed === 0; i += 1) await waitInAct(16);
+  expect(landed).toBe(1);
+  // N6 is open and landed on; the new ones under it came in as lines; N3..N5 stay behind the fold.
+  expect(shown(host)).toEqual([`${ROOT}:line`, 'msg_N1:line', 'msg_N2:line', 'divider', 'fold', 'msg_N6:open', ...range(7, 12).map((i) => `${N(i)}:line`), ...range(13, 32).map((i) => `${N(i)}:open`)]);
+  expect(centred).toContain('msg_N6');
+  expect(focusedArticle()?.getAttribute('data-message-article')).toBe('msg_N6');
+});
+
+test.skipIf(!hasDom)('past 20 new, a message that arrives while the thread is open shows open at the bottom', async () => {
+  const thread = manyNew(0, 30);
+  const el = await render(thread);
+  const arrival = message('msg_N30', AGENT, 62, 'Step 30 of the rollout is done.', { created_at: new Date(Date.UTC(2026, 9, 10, 9) + 30 * 60_000).toISOString() });
+  act(() => root!.render(pane({ ...thread, messages: [...thread.messages, arrival] })));
+  await settle();
+  expect(shown(el).slice(-2)).toEqual(['msg_N29:open', 'msg_N30:open']);
+  expect(el.querySelector('[data-middle-fold]')!.textContent).toBe('Show 9 earlier');
 });

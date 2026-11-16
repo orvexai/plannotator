@@ -25,7 +25,9 @@ export function parseT3Args(args: readonly string[]): Invocation {
     const arg = rest[i]!;
     if (!positionalOnly && arg === "--") { positionalOnly = true; continue; }
     if (!positionalOnly && (arg === "--gate" || arg === "--markdown")) {
-      if (command !== "annotate") throw new Error(`${arg} is only valid with t3 annotate.`);
+      if (command !== "annotate" && !(arg === "--gate" && command === "review")) {
+        throw new Error(arg === "--gate" ? "--gate is only valid with t3 annotate and t3 review." : `${arg} is only valid with t3 annotate.`);
+      }
       if (arg === "--gate") { if (gate) throw new Error("Repeated --gate."); gate = true; }
       else { if (markdown) throw new Error("Repeated --markdown."); markdown = true; }
     } else if (!positionalOnly && arg.startsWith("--")) {
@@ -37,7 +39,7 @@ export function parseT3Args(args: readonly string[]): Invocation {
     } else targets.push(arg);
   }
   const url = flags.get("--url");
-  if (!url) throw new Error("--url is required; copy the MCP URL from T3 Settings → Connections.");
+  if (!url) throw new Error("--url is required; in T3 Settings → Environments, open the environment's menu and choose Copy MCP URL.");
   const thread = flags.get("--thread");
   if ((command === "login" || command === "logout") && thread) throw new Error(`${command === "login" ? "Login authorizes" : "Logout forgets"} an environment; it takes no --thread.`);
   if (command !== "login" && command !== "logout") {

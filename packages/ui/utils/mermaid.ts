@@ -11,9 +11,8 @@
  * the lazy path IS Plannotator's own path: `packages/editor/App.tsx` no longer
  * imports `./mermaid-eager`, so a plan with no diagram never downloads the
  * runtime in a chunked build (the share portal, any host that bundles by
- * route). The single-file builds inline the `import('mermaid')` target through
- * `inlineDynamicImports`, so there the lazy import resolves from the bundle
- * itself and nothing is fetched. A host that wants the runtime registered at
+ * route), nor in the single-file builds, which carry it as a packed chunk
+ * their server serves on request (build/pack-app.ts). A host that wants the runtime registered at
  * startup imports `./mermaid-eager`, which fills the slot at module
  * evaluation; the slot then short-circuits this loader.
  *
@@ -23,6 +22,16 @@
 import type { Mermaid, MermaidConfig } from 'mermaid';
 
 /**
+ * Width in px at which node labels wrap (#2064). Mermaid 12 lowered the
+ * default from 200 to 120, and at Plannotator's 16 px label text that wraps
+ * after about eight CJK characters and splits short Latin labels. 140 is the
+ * owner-approved middle: long labels still wrap, short ones stay on one line.
+ * The themed path (`buildMermaidConfig`) spreads this config, so both the
+ * themed and the host-fallback `initialize` carry it.
+ */
+export const MERMAID_LABEL_WRAP_WIDTH = 140;
+
+/**
  * Hoisted verbatim from the former module-scope `mermaid.initialize(...)` in
  * MermaidBlock. Nothing in it reads a CSS token or the resolved mode.
  * `securityLevel: 'strict'` is a deliberate security pin (see MermaidBlock.test.ts).
@@ -30,6 +39,13 @@ import type { Mermaid, MermaidConfig } from 'mermaid';
 export const MERMAID_CONFIG: MermaidConfig = {
   startOnLoad: false,
   securityLevel: 'strict',
+  /**
+   * Mermaid's own failure output is a "Syntax error in text" graphic drawn
+   * into a temporary node on `document.body`, left there when it throws. The
+   * block shows a failure itself (the source, with a note), so Mermaid draws
+   * nothing for one; `diagram-render` also removes any leftover node.
+   */
+  suppressErrorRendering: true,
   theme: 'dark',
   themeVariables: {
     primaryColor: '#3b82f6',
@@ -61,6 +77,14 @@ export const MERMAID_CONFIG: MermaidConfig = {
   flowchart: {
     htmlLabels: true,
     curve: 'basis',
+    wrappingWidth: MERMAID_LABEL_WRAP_WIDTH,
+  },
+  /**
+   * Mermaid 11 drew state labels with the flowchart width; Mermaid 12 gives
+   * state diagrams their own `wrappingWidth`, also 120, so it is pinned too.
+   */
+  state: {
+    wrappingWidth: MERMAID_LABEL_WRAP_WIDTH,
   },
 };
 

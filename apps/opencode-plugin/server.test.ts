@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import serverPlugin, {
+  addInboxBriefing,
   createPlanReadyNotifier,
   pushComposedSystemReminder,
   replacePlanningSystemParts,
 } from "./server";
-import { commandFailureNoticeText, createV2BridgeClient, dropSessionUrlNotices, formatCommandFailureNotice, formatSessionUrlNotice } from "./v2-client";
+import { INBOX_COMMAND_BRIEFING } from "@plannotator/shared/inbox/connection";
+import { commandFailureNoticeText, createInboxBriefings, createV2BridgeClient, dropSessionUrlNotices, formatCommandFailureNotice, formatInboxNotice, formatSessionUrlNotice, inboxNoticeText } from "./v2-client";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -216,6 +218,47 @@ describe("OpenCode V2 server plugin", () => {
     expect(strippedSystemText.join("\n")).not.toContain("undefined");
   });
 
+  test("rewrites OpenCode 2's Plan mode reminder in the plan agent's history so the model submits with submit_plan (#2101)", async () => {
+    const enter = `<system-reminder>
+You are in Plan mode. Discuss the plan with the user directly in the conversation. Do not create or update plan files unless the user explicitly asks you to; when they do, write them only in:
+/home/dev/.opencode/plan
+
+Do not modify any other files or ask a subagent to do so.
+
+You remain in Plan mode until the user switches agents. If the user asks you to implement changes, do not do so. Tell them they need to switch agents.
+</system-reminder>`;
+    const testContext = createContext({ workflow: "plan-agent" });
+    await serverPlugin.setup(testContext.context as never);
+    const request = () => ({
+      agent: "plan",
+      system: [{ type: "text" as const, text: "Base system prompt" }],
+      messages: [
+        { role: "user", content: [{ type: "text", text: enter }] },
+        { role: "user", content: [{ type: "text", text: "Create an execution plan for the cache." }] },
+      ] as unknown[],
+      tools: { submit_plan: { description: "Submit", input: {} } },
+    });
+    const first = request();
+    await testContext.runContextHooks(first);
+    const reminder = (first.messages[0] as { content: Array<{ text: string }> }).content[0]!.text;
+    expect(reminder).toContain("submit it with the submit_plan tool");
+    expect(reminder).not.toContain("Discuss the plan with the user directly");
+    expect((first.messages[1] as { content: Array<{ text: string }> }).content[0]!.text).toBe("Create an execution plan for the cache.");
+    expect(first.tools.submit_plan).toBeDefined();
+    expect(first.system[0]!.text).toContain("## Plannotator");
+
+    // Prompt caching: the next request with the same history carries the same bytes.
+    const second = request();
+    await testContext.runContextHooks(second);
+    expect(JSON.stringify(second.messages)).toBe(JSON.stringify(first.messages));
+    expect(JSON.stringify(second.system)).toBe(JSON.stringify(first.system));
+
+    // Another agent under plan-agent: the history is left as OpenCode sent it.
+    const build = { ...request(), agent: "build" };
+    await testContext.runContextHooks(build);
+    expect((build.messages[0] as { content: Array<{ text: string }> }).content[0]!.text).toBe(enter);
+  });
+
   test("keeps all-agents mode scoped to primary agents by default", async () => {
     delete process.env.PLANNOTATOR_ALLOW_SUBAGENTS;
     const testContext = createContext(
@@ -251,6 +294,7 @@ describe("OpenCode V2 server plugin", () => {
       "plannotator-review",
       "plannotator-annotate",
       "plannotator-last",
+      "plannotator-inbox",
     ]);
 
     // No command domain: nothing registered, and the pre-existing submit_plan
@@ -310,7 +354,7 @@ describe("OpenCode V2 server plugin", () => {
     });
     await serverPlugin.setup(testContext.context as never);
 
-    expect(registered).toHaveLength(3);
+    expect(registered).toHaveLength(4);
     expect(testContext.getToolDefinition()).toBeUndefined();
   });
 
@@ -432,11 +476,11 @@ describe("V2 plan review URL delivery", () => {
     });
   });
 
-  // Regression: the fallback must stay SILENT, not fall back to app.log. That
-  // is console.error, the same stderr handleServerReady has already printed the
-  // URL to, so logging here would duplicate the line in remote mode and add a
-  // stray one locally. This hook was empty for exactly that reason.
-  test("without session.synthetic the plan path stays silent", () => {
+  // Without session.synthetic the URL falls back to the console log, which an
+  // older host shows with OPENCODE_PRINT_LOGS=1. handleServerReady no longer
+  // prints the ready line here (the embedded path passes announce: false), so
+  // this log is the only place the URL can reach on such a host.
+  test("without session.synthetic the plan path logs the URL once", () => {
     const log = mock((_entry: unknown) => {});
     const client = createV2BridgeClient({
       ctx: { session: {} },
@@ -447,7 +491,8 @@ describe("V2 plan review URL delivery", () => {
 
     expect(client.notifyUrl).toBeUndefined();
     expect(() => createPlanReadyNotifier(client)(SESSION_URL)).not.toThrow();
-    expect(log).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0]![0]).toEqual({ level: "info", message: formatSessionUrlNotice(SESSION_URL) });
   });
 
   // Regression: the notifier tests above all pass while the plan path itself is
@@ -542,6 +587,17 @@ describe("session-URL notices stay out of the model context", () => {
     expect(messages).toEqual([user("q"), assistant("a"), user("annotate notes.md instead")]);
   });
 
+  // Failure caught: /plannotator-inbox's notices (where the Inbox is, or why
+  // it did not open) read by the model as a request.
+  test("/plannotator-inbox's notice and failure notice are dropped; a pasted copy of the address line is not", () => {
+    const opened = user(inboxNoticeText("http://localhost:61234/", "No browser opened: this is a remote session."));
+    const failed = user(commandFailureNoticeText("plannotator-inbox", "The plannotator on PATH is older than /plannotator-inbox."));
+    const pasted = user(`${formatInboxNotice("http://localhost:61234/")} is this right?`);
+    const messages: unknown[] = [user("q"), assistant("a"), opened, failed, pasted];
+    expect(dropSessionUrlNotices(messages)).toBe(2);
+    expect(messages).toEqual([user("q"), assistant("a"), pasted]);
+  });
+
   // Failure caught: the person pasting the failure line they SAW (the
   // notice's description) to ask about it, and that message vanishing from
   // every later model request.
@@ -593,5 +649,59 @@ describe("session-URL notices stay out of the model context", () => {
     await testContext.runGenerateHooks(event);
 
     expect(event.messages).toEqual([user("make a plan"), assistant("calling submit_plan"), user("[Plannotator Ask AI] why step 2?")]);
+  });
+});
+
+// /plannotator-inbox on OpenCode 2 starts no turn, so the model learns the
+// Inbox from the session's requests after it. Failure caught: the briefing
+// never reaching the model, reaching another session or a subagent, or piling
+// up once per request.
+describe("OpenCode 2 /plannotator-inbox briefing", () => {
+  const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+  const agents = async () => [{ name: "build", mode: "primary" }, { name: "explore", mode: "subagent" }] as never;
+  const request = (sessionID: string, agent = "build", messages: unknown[] = [user("next")]) => ({
+    sessionID,
+    agent,
+    system: [{ type: "text" as const, text: "You are OpenCode." }],
+    messages,
+  });
+  const count = (event: { system: Array<{ text: string }> }) => event.system.map((part) => part.text).join("\n").split(INBOX_COMMAND_BRIEFING).length - 1;
+
+  test("a session that opened the Inbox carries the briefing once on each request; another session does not", async () => {
+    const briefings = createInboxBriefings();
+    const before = request("ses_1");
+    await addInboxBriefing(before, briefings, agents);
+    expect(count(before)).toBe(0);
+
+    briefings.mark("ses_1");
+    const after = request("ses_1");
+    await addInboxBriefing(after, briefings, agents);
+    await addInboxBriefing(after, briefings, agents);
+    expect(count(after)).toBe(1);
+
+    const other = request("ses_2");
+    await addInboxBriefing(other, briefings, agents);
+    expect(count(other)).toBe(0);
+  });
+
+  test("the command's notice in the session marks it too (after a restart); a subagent never gets it", async () => {
+    const briefings = createInboxBriefings();
+    const resumed = request("ses_3", "build", [user(inboxNoticeText("http://localhost:61234/")), user("next")]);
+    await addInboxBriefing(resumed, briefings, agents);
+    expect(count(resumed)).toBe(1);
+
+    briefings.mark("ses_4");
+    const sub = request("ses_4", "explore");
+    await addInboxBriefing(sub, briefings, agents);
+    expect(count(sub)).toBe(0);
+  });
+
+  test("wired into the plugin's context hook: read before the notice is dropped from the request", async () => {
+    const testContext = createContext({ workflow: "manual" });
+    await serverPlugin.setup(testContext.context as never);
+    const event = { ...request("ses_5", "build", [user(inboxNoticeText("http://localhost:61234/")), user("next")]), tools: {} };
+    await testContext.runContextHooks(event as never);
+    expect(count(event)).toBe(1);
+    expect(event.messages).toEqual([user("next")]);
   });
 });

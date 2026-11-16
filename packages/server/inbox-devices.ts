@@ -22,16 +22,30 @@
  * The tailnet. "Reach from my tailnet" opens a second loopback listener that
  * serves the door and nothing else, and publishes THAT port at
  * `https://<MagicDNS name>:8443` through `tailscale serve` (never funnel).
+ * When another mapping holds 8443 at the first publish, the next free port up
+ * to 8450; that port then sticks (the address carries it), and a later start
+ * that finds it held refuses rather than move (inbox-tailnet-door.ts).
  * `tailscale serve` passes the client's Host header through, so the socket,
- * not a header, keeps tailnet requests on the door. Kept in inbox.json as
- * `tailnet: { https_port, door_port }`; published at each start, taken down
- * (listener and mapping) when the switch goes off and at each clean stop.
+ * not a header, keeps tailnet requests on the door. The switch is kept in
+ * inbox.json as `tailnet: { https_port, door_port }`; the port and the
+ * mapping the Inbox made, and only that, in `inbox/tailnet-door.json`.
+ * Published at each start, taken down (listener and mapping) when the switch
+ * goes off and at each clean stop.
  *
  * The Wi-Fi. "Reach from this Wi-Fi" opens a TLS listener on every interface
  * that serves the same door-only handler, with a pinned self-signed
  * certificate and a Bonjour record (inbox-lan.ts, contract section 3).
+ *
+ * Machines (inbox-machines.ts). Another Plannotator Inbox links through the
+ * same door as a device with platform `machine`, redeemed from a machine
+ * offer. That works with Phones off: then the door answers only a machine's
+ * token (anything else is the unknown-route 404, as before), pairing takes
+ * only a machine offer, and the tailnet door publishes at start only while a
+ * machine is linked. A machine may never ask for the merged view
+ * (`machines=1`), so two Inboxes linked both ways cannot echo each other.
  */
 
+import { childEnv } from "@plannotator/shared/child-env";
 import { randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { hostname } from "node:os";
@@ -47,7 +61,11 @@ import {
 } from "@plannotator/shared/inbox/devices";
 import { readInboxRegistry, updateOwnInboxRegistry, type InboxRegistryEntry } from "@plannotator/shared/inbox/registry";
 import { InboxError, inboxDir } from "@plannotator/shared/inbox/schema";
-import { runTailscale, serveStatusProxy, TAILSCALE_SERVE_TIMEOUT_MS, type TailscaleRunner } from "@plannotator/shared/tailscale";
+import { INBOX_DEVICE_MARKUP_MAX_BYTES } from "@plannotator/shared/inbox/markups";
+import { inboxDiskFullError, INBOX_UPLOAD_MAX_BYTES } from "@plannotator/shared/inbox/uploads";
+import { describeTailscaleFailure, runTailscale, TAILSCALE_SERVE_TIMEOUT_MS, type TailscaleRunner } from "@plannotator/shared/tailscale";
+import { MACHINE_WINDOW_HEADER } from "./inbox-outbox";
+import { INBOX_SNOOZE_HELD } from "./inbox-snooze";
 import { createInboxLan, LanUnavailableError } from "./inbox-lan";
 import {
   PAIRING_CHECKS_DEADLINE_MS,
@@ -57,15 +75,39 @@ import {
   type PairingProbes,
   type PairingTailscaleRunner,
 } from "./inbox-pairing-checks";
+import { syncSection } from "./inbox-perf";
 import { isSameOriginOrNoOrigin } from "@plannotator/shared/request-origin";
-import { enableTailscaleServe, removeTailscaleServe, TailscaleServeError } from "./tailscale-serve";
+import { enableTailscaleServe, TailscaleServeError, takeDownOwnServeMapping } from "./tailscale-serve";
+import {
+  adoptLegacyTailnetDoor,
+  chooseTailnetDoorPort,
+  clearTailnetDoorRecord,
+  hasTailnetDoorRecord,
+  INBOX_TAILNET_HTTPS_PORTS,
+  INBOX_TAILNET_PORT_RANGE,
+  legacyTailnetDoorRecord,
+  readTailnetDoorRecord,
+  writeTailnetDoorRecord,
+  type TailnetDoorRecord,
+} from "./inbox-tailnet-door";
 
 /** The pairing offer's lifetime (limit, contract section 1): long enough to fetch a phone. */
 export const PAIRING_OFFER_MS = 10 * 60_000;
 /** Wrong six-digit codes before the offer closes (limit, contract section 1). */
 export const PAIRING_CODE_TRIES = 5;
-/** The tailnet HTTPS port (contract section 1, ruling 8). */
-export const INBOX_TAILNET_HTTPS_PORT = 8443;
+/** The tailnet HTTPS port the door takes first (contract section 1, ruling 8); the next free one up to 8450 when it is taken. */
+export const INBOX_TAILNET_HTTPS_PORT = INBOX_TAILNET_HTTPS_PORTS[0]!;
+/**
+ * Phones off: how long the tailnet door stays published for a machine that
+ * was unlinked here while it could not be told (asleep, away), so that its
+ * next contact is refused (`401 device_revoked`) and it removes its side. A
+ * week: a laptop closed for a trip or a holiday still hears it when it opens,
+ * and a machine silent for longer is likely gone (wiped, sold), so the door
+ * does not stay published for nobody. The outbox keeps settled writes as long.
+ */
+export const UNLINKED_REFUSAL_KEPT_MS = 7 * 24 * 60 * 60_000;
+/** After that refusal has been answered, the door comes down once the answer has left (as `UNLINKED_DOOR_CLOSE_MS`). */
+const REFUSED_DOOR_CLOSE_MS = 1_000;
 
 export const DOOR_PREFIX = "/api/inbox/device/";
 
@@ -87,41 +129,207 @@ function refuse(status: number, code: string, error: string, details: Record<str
  * The allowlist (contract section 2): door route to the window's route. A
  * door path outside it is `404 device_route_not_found`; the window, `/mcp`,
  * the bridge, control, settings, restart, the raw text route
- * (`attachments/<id>`; text reaches the phone through `view`), uploading a
- * markup, project deletion, decision retire and replace, pairing and the
- * device list are never on it. An attachment's bytes reach the phone only
- * through the window's own `image` and `download` routes, so the dotenv
- * refusal, the size checks and the headers are the window's.
+ * (`attachments/<id>`; text reaches the phone through `view`), project
+ * deletion, drafts, recent searches, "Open in",
+ * pairing and the device list are never on it. An attachment's bytes reach
+ * the phone only through the window's own `image` and `download` routes, so
+ * the dotenv refusal, the size checks and the headers are the window's. The
+ * images a message's body shows come the same way, through the window's
+ * `messages/<id>/image`.
+ *
+ * `raw`: the two routes whose body is a file, not JSON (an upload, a
+ * drawing). The door streams the body as it came and passes the query on;
+ * the idempotency key rides the query (`?idempotency_key=`). The relay does
+ * not carry them (`413 relay_upload_unavailable`): v1 sends files over the
+ * Wi-Fi or the tailnet only.
  */
-const ALLOWLIST: readonly { method: "GET" | "POST"; route: RegExp; window: (m: RegExpExecArray) => string }[] = [
+interface DoorRoute {
+  method: "GET" | "POST";
+  route: RegExp;
+  window: (m: RegExpExecArray) => string;
+  /** A raw body (a file), at most `max` bytes, refused past it with `413 <code>`. */
+  raw?: { max: number; code: string; what: string };
+  /** Body fields the door refuses (`422`): what the window takes and the phone may not use. */
+  refuse?: readonly { field: string; message: string }[];
+  /** The window route's query when a linked machine asks: its write may have waited in that machine's outbox. */
+  fromMachine?: string;
+  /** Only a linked machine's token reaches it (a phone gets the unknown-route 404): starting and stopping agents from another machine. */
+  machineOnly?: true;
+}
+
+const ALLOWLIST: readonly DoorRoute[] = [
   { method: "GET", route: /^health$/, window: () => "/api/inbox/health" },
   { method: "GET", route: /^threads$/, window: () => "/api/inbox/threads" },
   { method: "GET", route: /^projects$/, window: () => "/api/inbox/projects" },
+  // What's new (public release notes, read only): the release list, a release's notes and their saved images, so a
+  // phone reads them as the window does (owner ruling 2026-11-11: one person, the same app on every device).
+  { method: "GET", route: /^whats-new$/, window: () => "/api/inbox/whats-new" },
+  { method: "GET", route: /^whats-new\/releases$/, window: () => "/api/inbox/whats-new/releases" },
+  { method: "GET", route: /^whats-new\/image$/, window: () => "/api/inbox/whats-new/image" },
+  // A project's picture (a logo, read only): a linked machine's window shows that machine's project rows with it.
+  { method: "GET", route: /^projects\/([^/]+)\/picture$/, window: (m) => `/api/inbox/projects/${m[1]}/picture` },
   // The archived threads (Settings' Archived block), read only; before threads/:id, which would also match it.
   { method: "GET", route: /^threads\/archived$/, window: () => "/api/inbox/threads/archived" },
   { method: "GET", route: /^threads\/([^/]+)$/, window: (m) => `/api/inbox/threads/${m[1]}` },
   { method: "POST", route: /^threads\/([^/]+)\/seen$/, window: (m) => `/api/inbox/threads/${m[1]}/seen` },
-  // Mark read and its Undo.
-  { method: "POST", route: /^threads\/([^/]+)\/(read|unread)$/, window: (m) => `/api/inbox/threads/${m[1]}/${m[2]}` },
+  // Mark read, its Undo (`unread`: Move back) and Mark unread (`mark-unread`).
+  { method: "POST", route: /^threads\/([^/]+)\/(read|unread|mark-unread)$/, window: (m) => `/api/inbox/threads/${m[1]}/${m[2]}` },
+  // Snooze and Unsnooze (approval "inbox-snooze"): a snooze lives on the thread's home machine.
+  { method: "POST", route: /^threads\/([^/]+)\/snooze$/, window: (m) => `/api/inbox/threads/${m[1]}/snooze`, fromMachine: `?${INBOX_SNOOZE_HELD}` },
+  // Star and Unstar (`threads/:id/pin`), and the stars' order or Unstar's Undo (`pins`): contract 7.65, approval
+  // "inbox-starred-pills". A linked machine sends the same two for this Inbox's threads (approval "inbox-linked-marks").
+  { method: "POST", route: /^threads\/([^/]+)\/pin$/, window: (m) => `/api/inbox/threads/${m[1]}/pin` },
+  { method: "POST", route: /^pins$/, window: () => "/api/inbox/pins" },
+  // Add to Priority, Remove from Priority and their Undo (contract 7.66). A linked machine sends the same for this
+  // Inbox's threads (approval "inbox-linked-marks").
+  { method: "POST", route: /^threads\/([^/]+)\/priority$/, window: (m) => `/api/inbox/threads/${m[1]}/priority` },
+  // An agent's face or given name (approval "inbox-linked-marks"): a linked machine's window sets them for this Inbox's agents.
+  { method: "POST", route: /^agent-faces$/, window: () => "/api/inbox/agent-faces", machineOnly: true },
+  // A thread's tags, and a tag's rename, delete and Undo (approval "inbox-thread-tags"): a linked machine's window
+  // tags this Inbox's threads by a tag's name and changes the tag of that name here. Phones do not take tags.
+  { method: "POST", route: /^threads\/([^/]+)\/tags$/, window: (m) => `/api/inbox/threads/${m[1]}/tags`, machineOnly: true },
+  { method: "POST", route: /^initiatives\/([^/]+)$/, window: (m) => `/api/inbox/initiatives/${m[1]}`, machineOnly: true },
+  // A tag's row colour and "Show tag colors" (mark `tag-colours`): a linked machine's window sets them here too, so
+  // every machine shows the same colours, and a phone sets them as the window does (its list ⋮ has the switch).
+  { method: "POST", route: /^tag-colours$/, window: () => "/api/inbox/tag-colours" },
+  // The Board's cards (mark `cards`): a linked machine's window lists this Inbox's cards, opens one, and moves,
+  // edits, links and tags it here; the look and "Got it" are this store's too. Phones have no Board.
+  { method: "GET", route: /^cards$/, window: () => "/api/inbox/cards", machineOnly: true },
+  { method: "GET", route: /^cards\/(crd_[^/]+)$/, window: (m) => `/api/inbox/cards/${m[1]}`, machineOnly: true },
+  { method: "GET", route: /^cards\/(crd_[^/]+)\/refs$/, window: (m) => `/api/inbox/cards/${m[1]}/refs`, machineOnly: true },
+  { method: "POST", route: /^cards\/(crd_[^/]+)$/, window: (m) => `/api/inbox/cards/${m[1]}`, machineOnly: true },
+  { method: "POST", route: /^cards\/seen$/, window: () => "/api/inbox/cards/seen", machineOnly: true },
+  { method: "POST", route: /^cards\/dropped\/seen$/, window: () => "/api/inbox/cards/dropped/seen", machineOnly: true },
+  // The PR board (mark `pulls`): a linked machine's window lists the PRs this Inbox's gh / glab lists, opens one (its
+  // diff, files, details, pictures), closes, reopens or merges one of them here, as this computer's signed-in
+  // account, and ties PRs to a review thread it started here (`owner`, after the thread's start through
+  // `messages`). Those four run only with the window's mark (`window`), which stops a bare call, the relay and a phone
+  // (no PR board), not a program on that machine that imitates its window (inbox-launch.md "Accepted, not defended").
+  { method: "GET", route: /^pulls$/, window: () => "/api/inbox/pulls", machineOnly: true },
+  { method: "GET", route: /^pulls\/(risk|details|diff|file|repo-files|repo-file|avatar|media|media\/sizes)$/, window: (m) => `/api/inbox/pulls/${m[1]}`, machineOnly: true },
+  { method: "POST", route: /^pulls\/(close|reopen|merge|owner)$/, window: (m) => `/api/inbox/pulls/${m[1]}`, machineOnly: true },
+  // "Changed since you looked" (approval "inbox-pr-dashboard"): the look at a PR lives on the machine that lists it.
+  { method: "POST", route: /^pulls\/looked$/, window: () => "/api/inbox/pulls/looked", machineOnly: true },
+  // A thread's PRs (approval "inbox-pr-binding"): read, added and removed on the thread's own machine.
+  { method: "GET", route: /^threads\/([^/]+)\/pulls$/, window: (m) => `/api/inbox/threads/${m[1]}/pulls`, machineOnly: true },
+  { method: "POST", route: /^threads\/([^/]+)\/pulls$/, window: (m) => `/api/inbox/threads/${m[1]}/pulls`, machineOnly: true },
   { method: "GET", route: /^events$/, window: () => "/api/inbox/events" },
-  { method: "POST", route: /^messages\/([^/]+)\/(picks|reply|resolve)$/, window: (m) => `/api/inbox/messages/${m[1]}/${m[2]}` },
+  // `to`: Send to another session (7.41), a person message no session took yet. `ack`: 👍 Looks good and its Undo (7.56).
+  // `reask`: Re-ask, the agent asks its open questions again in one message (7.61).
+  { method: "POST", route: /^messages\/([^/]+)\/(picks|reply|resolve|to|ack|send-now|take-back|reask)$/, window: (m) => `/api/inbox/messages/${m[1]}/${m[2]}` },
+  // A hand-off's Undo inside its window (approval "inbox-tag-handoff", contract 7.64): the reply goes as an Ask.
+  { method: "POST", route: /^messages\/([^/]+)\/handoff\/undo$/, window: (m) => `/api/inbox/messages/${m[1]}/handoff/undo` },
+  // An action item's Done or Can't do it, and its Undo (approval "inbox-next-actions", contract 7.63).
+  { method: "POST", route: /^messages\/([^/]+)\/actions\/(a-[0-9a-f]{8}(?:-\d{1,3})?)$/, window: (m) => `/api/inbox/messages/${m[1]}/actions/${m[2]}` },
   { method: "POST", route: /^threads\/([^/]+)\/delete$/, window: (m) => `/api/inbox/threads/${m[1]}/delete` },
+  // The thread's reply draft (the words typed on the computer and not sent), read only: contract 7.62.
+  { method: "GET", route: /^threads\/([^/]+)\/draft$/, window: (m) => `/api/inbox/threads/${m[1]}/draft` },
   { method: "GET", route: /^threads\/([^/]+)\/attachments$/, window: (m) => `/api/inbox/threads/${m[1]}/attachments` },
+  // Export decisions: the thread's decisions as a download (`?format=md|html|json&tz=`), read only, from what the thread read serves.
+  { method: "GET", route: /^threads\/([^/]+)\/decisions$/, window: (m) => `/api/inbox/threads/${m[1]}/decisions` },
   { method: "GET", route: /^attachments\/([^/]+)\/view$/, window: (m) => `/api/inbox/attachments/${m[1]}/view` },
-  // An image's bytes and any kind's download: the window's own routes, so the
-  // phone gets the same dotenv refusal, sniffed type and headers.
-  { method: "GET", route: /^attachments\/([^/]+)\/(image|download)$/, window: (m) => `/api/inbox/attachments/${m[1]}/${m[2]}` },
+  // An image's bytes, a video's or a recording's (by Range) and any kind's download (by Range
+  // too): the window's own routes, so the phone gets the same dotenv refusal,
+  // sniffed type and headers. Of the phone's request headers the door forwards
+  // Range, If-Range and If-None-Match (and Last-Event-ID to the event stream).
+  { method: "GET", route: /^attachments\/([^/]+)\/(image|video|audio|download)$/, window: (m) => `/api/inbox/attachments/${m[1]}/${m[2]}` },
   { method: "GET", route: /^markups\/([^/]+)$/, window: (m) => `/api/inbox/markups/${m[1]}` },
+  // An image a message's body shows (`?path=<src as written>`, a question
+  // block's context included): the window's own route, so the phone gets the
+  // same rules (referenced by that body, inside its project, sniffed, capped)
+  // and the same headers. The query rides through as the door received it.
+  { method: "GET", route: /^messages\/([^/]+)\/image$/, window: (m) => `/api/inbox/messages/${m[1]}/image` },
   { method: "GET", route: /^html-assets\/([^/]+)\/(.+)$/, window: (m) => `/api/html-assets/${m[1]}/${m[2]}` },
   { method: "POST", route: /^annotations$/, window: () => "/api/inbox/annotations" },
   { method: "POST", route: /^annotations\/([^/]+)\/remove$/, window: (m) => `/api/inbox/annotations/${m[1]}/remove` },
   { method: "GET", route: /^messages\/([^/]+)\/guide$/, window: (m) => `/api/inbox/messages/${m[1]}/guide` },
   { method: "POST", route: /^messages\/([^/]+)\/guide\/reviewed$/, window: (m) => `/api/inbox/messages/${m[1]}/guide/reviewed` },
-  { method: "POST", route: /^messages\/([^/]+)\/decision$/, window: (m) => `/api/inbox/messages/${m[1]}/decision` },
-  { method: "GET", route: /^decisions$/, window: () => "/api/inbox/decisions" },
+  // A comment on a guided review's diff (7.53), new or edited (same annotation id); removed through annotations/:id/remove.
+  { method: "POST", route: /^messages\/([^/]+)\/guide\/annotations$/, window: (m) => `/api/inbox/messages/${m[1]}/guide/annotations` },
+  // A comment on the text of an agent's message (7.59), new or edited (same annotation id); removed through annotations/:id/remove.
+  { method: "POST", route: /^messages\/([^/]+)\/annotations$/, window: (m) => `/api/inbox/messages/${m[1]}/annotations` },
   { method: "GET", route: /^threads\/([^/]+)\/sessions$/, window: (m) => `/api/inbox/threads/${m[1]}/sessions` },
+  // Tags (7.60): who the person can tag with `@`; the tags ride the reply's `tags`, forwarded unchanged.
+  { method: "GET", route: /^threads\/([^/]+)\/taggable$/, window: (m) => `/api/inbox/threads/${m[1]}/taggable` },
   { method: "POST", route: /^threads\/([^/]+)\/message$/, window: (m) => `/api/inbox/threads/${m[1]}/message` },
+  // Compose (7.39, 7.40): every live session, and a thread the person starts (the body's key is also the store's own).
+  { method: "GET", route: /^sessions$/, window: () => "/api/inbox/sessions" },
+  // `draft_id` deletes a shared draft, and drafts stay on the computer (never seen by phones).
+  {
+    method: "POST",
+    route: /^messages$/,
+    window: () => "/api/inbox/messages",
+    refuse: [{ field: "draft_id", message: "draft_id: drafts stay on the computer; a phone sends without one." }],
+  },
+  // Search (7.42), read only; the query rides through. The door sends no Origin, so the route's cross-site check passes.
+  { method: "GET", route: /^search$/, window: () => "/api/inbox/search" },
+  // The project menu (7.43 to 7.45): Mark all as read, Archive all, and their Undo. The door's log replays a batch's answer.
+  { method: "POST", route: /^projects\/([^/]+)\/(read|unread|resolve)$/, window: (m) => `/api/inbox/projects/${m[1]}/${m[2]}` },
+  // The skill catalog (7.46, 7.47), read only.
+  { method: "GET", route: /^skills$/, window: () => "/api/inbox/skills" },
+  { method: "GET", route: /^skills\/content$/, window: () => "/api/inbox/skills/content" },
+  // Uploads and drawings (7.48, 7.49): raw bodies, the key in the query; never through the relay.
+  // A file the phone can already see, for the message being written: no bytes, so an ordinary JSON route.
+  { method: "POST", route: /^uploads\/reuse$/, window: () => "/api/inbox/uploads/reuse" },
+  { method: "POST", route: /^uploads$/, window: () => "/api/inbox/uploads", raw: { max: INBOX_UPLOAD_MAX_BYTES, code: "upload_too_large", what: "a file" } },
+  { method: "POST", route: /^markups$/, window: () => "/api/inbox/markups", raw: { max: INBOX_DEVICE_MARKUP_MAX_BYTES, code: "markup_too_large", what: "a drawing" } },
+  // A pending pasted-text upload's words (approval "inbox-paste-attachment"), read only: a linked machine's
+  // window puts a long paste back in a reply to this machine's thread, as it uploaded it here.
+  { method: "GET", route: /^uploads\/([^/]+)\/text$/, window: (m) => `/api/inbox/uploads/${m[1]}/text` },
+  { method: "GET", route: /^uploads\/([^/]+)\/image$/, window: (m) => `/api/inbox/uploads/${m[1]}/image` },
+  // Tidy and Combine on this Inbox's threads from a linked machine's window (approval "inbox-multi-select", marks `tidy`
+  // and `combine`): its own sessions are asked, since only they can read its threads. Phones have no Tidy.
+  { method: "GET", route: /^tidy$/, window: () => "/api/inbox/tidy", machineOnly: true },
+  { method: "POST", route: /^tidy$/, window: () => "/api/inbox/tidy", machineOnly: true },
+  { method: "GET", route: /^combine$/, window: () => "/api/inbox/combine", machineOnly: true },
+  { method: "POST", route: /^combine$/, window: () => "/api/inbox/combine", machineOnly: true },
+  { method: "POST", route: /^combine\/(cmb_[^/]+)\/(cancel|undo)$/, window: (m) => `/api/inbox/combine/${m[1]}/${m[2]}`, machineOnly: true },
+  // A launched agent's Stop, Try again, Trust folder and Delete from a linked machine's window (remote launch). Open in
+  // Terminal and the launch settings never cross: they are this computer's.
+  { method: "POST", route: /^launch\/([^/]+)\/(stop|retry|trust|delete)$/, window: (m) => `/api/inbox/launch/${m[1]}/${m[2]}`, machineOnly: true },
+  // A file an agent's message names, read only (approval "inbox-file-refs-open-viewer"): its view and an image's or a
+  // film's bytes (by Range), for a linked machine's window. The window's own routes, so the same refusals and headers.
+  // Not a phone's: a phone reads them through the tailnet as the owner.
+  { method: "GET", route: /^open-in\/file\/(view|raw)$/, window: (m) => `/api/inbox/open-in/file/${m[1]}`, machineOnly: true },
+  // And attached to its message there when the person comments on it from a linked machine's window.
+  { method: "POST", route: /^open-in\/file\/attach$/, window: () => "/api/inbox/open-in/file/attach", machineOnly: true },
+  // "Another folder on <machine>…": folder names under that machine's home, for a linked machine's window only.
+  { method: "GET", route: /^launch\/folders$/, window: () => "/api/inbox/launch/folders", machineOnly: true },
+  // Clone from a git URL: where a URL would be cloned on that machine, and whether its git can read it.
+  { method: "GET", route: /^launch\/(clone|clone-check)$/, window: (m) => `/api/inbox/launch/${m[1]}`, machineOnly: true },
 ];
+
+/** The two writes only a linked machine sends this door (inbox-machines.ts answers them); never a window route. */
+const MACHINE_DOOR_WRITES = ["link-back", "unlink", "update"] as const;
+/** Read and start this computer's update, for a linked machine's window: never on the allowlist, so no phone and no relay command reaches it. */
+const MACHINE_DOOR_UPDATE = "update";
+/** This computer's accounts, for a linked machine's window: never on the allowlist, so no phone and no relay command reaches them. */
+const MACHINE_DOOR_ACCOUNTS = "accounts";
+
+/**
+ * The window route a door request goes to, or null: the allowlist's first entry for its method and route, skipping a
+ * linked machine's own entries for a phone.
+ */
+export function doorRouteOf(method: string, route: string, machine: boolean): { entry: (typeof ALLOWLIST)[number]; windowPath: string } | null {
+  for (const entry of ALLOWLIST) {
+    if (entry.method !== method) continue;
+    if (entry.machineOnly && !machine) continue;
+    const match = entry.route.exec(route);
+    if (match) return { entry, windowPath: entry.window(match) };
+  }
+  return null;
+}
+
+/** For rule 8's test (inbox-outbox.test.ts): every door route in words (`GET threads`, `POST messages/:id/(picks|reply|…)`). */
+export function doorRouteNames(): string[] {
+  const words = (route: RegExp) => route.source.replace(/^\^|\$$/g, "").replaceAll("([^/]+)", ":id").replaceAll("\\/", "/");
+  return [...ALLOWLIST.map((entry) => `${entry.method} ${words(entry.route)}`), `GET ${MACHINE_DOOR_ACCOUNTS}`, ...MACHINE_DOOR_WRITES.map((route) => `POST ${route}`)];
+}
+
+/** For rule 8's test: the door's POST routes, and which take a raw body (a file). */
+export function doorWriteRoutes(): { route: string; raw: boolean }[] {
+  return ALLOWLIST.filter((entry) => entry.method === "POST").map((entry) => ({ route: entry.route.source, raw: entry.raw !== undefined }));
+}
 
 /** Where a pairing attempt reached the door: the Wi-Fi's listener, the tailnet's, or this computer's own port (the simulator). */
 export type PairingVia = "wifi" | "tailnet" | "local";
@@ -190,9 +398,11 @@ export interface InboxDevicesContext {
   port: () => number;
   registry: () => InboxRegistryEntry;
   readBody: (req: Request) => Promise<Record<string, unknown>>;
-  /** The server's own `fetch`: the door hands each allowed request to it on loopback. */
-  dispatch: (req: Request) => Promise<Response>;
+  /** The server's own `fetch`: the door hands each allowed request to it on loopback, saying which device asked. */
+  dispatch: (req: Request, from: InboxDoorCaller) => Promise<Response>;
   now?: () => Date;
+  /** Tests: how long the door stays up for a machine unlinked while it could not be told. Default `UNLINKED_REFUSAL_KEPT_MS`. */
+  refusalKeptMs?: number;
   tailscale?: TailscaleRunner;
   /** Tests: how step 1's checks run `tailscale` (may be asynchronous). Default: `tailscale` when given, else the CLI as a child process. */
   checksTailscale?: PairingTailscaleRunner;
@@ -205,13 +415,55 @@ export interface InboxDevicesContext {
     paired: (device: InboxDevice) => Promise<{ url: string; mailbox_id: string } | null>;
     revoked: (device: InboxDevice) => void;
   };
+  /** Phones on (PLANNOTATOR_INBOX_PHONES): the whole phone surface. Off: the door serves linked machines only. Default true. */
+  phones?: boolean;
+  /** Linked machines (inbox-machines.ts): the two door routes only a machine calls. Bound after both exist. */
+  machines?: () => InboxDoorMachines | null;
+  /** A linked machine's Update (inbox-updates.ts). */
+  machineUpdate?: { read: () => unknown; start: () => Promise<{ outcome: string }> };
 }
 
-/** The computer's name as the phone shows it: macOS's ComputerName, else the host name's first label. */
+/**
+ * Who a request the door hands on came from. `window`: a linked machine says the person pressed it in a window
+ * there (`X-Plannotator-Window`), which its own Inbox checked; only a machine's word counts, a phone's never asks.
+ */
+export interface InboxDoorCaller {
+  device_id: string;
+  name: string;
+  platform: string;
+  window: boolean;
+}
+
+/** What the door hands to inbox-machines.ts. */
+export interface InboxDoorMachines {
+  /** The other machine handed this Inbox a code for its own door: link back (both ways). */
+  linkBack: (deviceId: string, body: Record<string, unknown>) => Promise<Response>;
+  /** The other machine unlinked this one: forget it here too. */
+  unlinkedBy: (deviceId: string) => Response;
+  /** A machine is linked: publish the tailnet door at start even with Phones off. */
+  hasLinks: () => boolean;
+}
+
+/** The platform a linked Inbox pairs as. */
+export const MACHINE_PLATFORM = "machine";
+/** A paired cloud agent's device (section 13 of the contract): minted by this computer, served by the agent door only. */
+export const AGENT_PLATFORM = "agent";
+/** Machine offers kept, open or redeemed (a CLI offer and a link-back can be open at once). */
+const MACHINE_OFFERS_KEPT = 8;
+
+/**
+ * The computer's name as a phone and a linked machine show it: PLANNOTATOR_MACHINE_NAME when set (a headless box
+ * whose host name says nothing, two Inboxes on one computer in a test), else macOS's ComputerName, else the host
+ * name's first label.
+ */
 function computerName(): string {
+  // Control characters stripped: the name is echoed by another machine's CLI and must never carry a terminal escape.
+  const named = process.env.PLANNOTATOR_MACHINE_NAME?.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
+  if (named) return named.slice(0, 64);
   if (process.platform === "darwin") {
     try {
-      const out = spawnSync("scutil", ["--get", "ComputerName"], { encoding: "utf8", timeout: 2000 });
+      // windows-hide-guard: macOS only (scutil).
+      const out = spawnSync("scutil", ["--get", "ComputerName"], { encoding: "utf8", timeout: 2000, env: childEnv() });
       const name = out.status === 0 ? out.stdout.trim() : "";
       if (name) return name;
     } catch {
@@ -227,38 +479,141 @@ function sameSecret(a: string, b: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
+/** How much of a file the door reads and drops after a replay or a refusal before it closes the connection instead. */
+export const DOOR_DRAIN_MAX_BYTES = 1024 * 1024;
+export const DOOR_DRAIN_MAX_MS = 2_000;
+
+/**
+ * A raw body (a file) on its way to the window, counted. The window reads
+ * `stream`; past `max` bytes the stream errors and the client's body is
+ * cancelled, so nothing past the bound is read or buffered, whatever the
+ * Content-Length said (a chunked body declares none). The window's handler
+ * is called in-process, so Bun's request size bound does not apply to it.
+ *
+ * `settle()` after the answer: true when the client's body was read to its
+ * end, reading and dropping what is left up to `DOOR_DRAIN_MAX_BYTES` within
+ * `DOOR_DRAIN_MAX_MS` (an HTTP/1.1 client still sending waits for its body to
+ * be read); false when it stopped short, and the answer then closes the
+ * connection.
+ */
+function meteredBody(body: ReadableStream<Uint8Array>, max: number, tooLarge: () => Error) {
+  const reader = body.getReader();
+  let seen = 0;
+  let done = false;
+  let stopped = false;
+  let over = false;
+  const stop = async () => {
+    if (stopped || done) return;
+    stopped = true;
+    await reader.cancel().catch(() => {});
+  };
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          done = true;
+          controller.close();
+          return;
+        }
+        seen += next.value.byteLength;
+        if (seen > max) {
+          over = true;
+          await stop();
+          controller.error(tooLarge());
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch (error) {
+        stopped = true;
+        controller.error(error);
+      }
+    },
+    cancel: () => stop(),
+  });
+  const settle = async (): Promise<boolean> => {
+    if (done) return true;
+    if (stopped) return false;
+    const deadline = Date.now() + DOOR_DRAIN_MAX_MS;
+    let dropped = 0;
+    while (dropped <= DOOR_DRAIN_MAX_BYTES) {
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const next = await Promise.race([
+        reader.read().catch(() => null),
+        new Promise<"late">((resolve) => (timer = setTimeout(() => resolve("late"), left))),
+      ]);
+      clearTimeout(timer);
+      if (next === "late" || next === null) break;
+      if (next.done) {
+        done = true;
+        return true;
+      }
+      dropped += next.value.byteLength;
+    }
+    await stop();
+    return false;
+  };
+  return { stream, over: () => over, settle };
+}
+
+/** The same answer, closing the connection after it (a request body left unread past the drain bound). */
+function withClose(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("Connection", "close");
+  return new Response(response.body, { status: response.status, headers });
+}
+
 function bearer(req: Request): string | null {
   const match = /^Bearer\s+(\S+)$/i.exec((req.headers.get("authorization") ?? "").trim());
   return match ? match[1]! : null;
 }
 
 /**
- * Take down the mapping on 8443 when it points at one of `targets` (this
- * Inbox's door listeners). "none" when there is no such mapping, "failed"
- * when Tailscale could not say or could not remove it.
+ * Take down the door mapping this Inbox recorded (inbox-tailnet-door.ts),
+ * only while it still points exactly where the record says: anything else on
+ * that port is someone else's and is never touched. With no record yet, an
+ * older build's inbox.json `tailnet` is read as one, once
+ * (`adoptLegacyTailnetDoor`). The record keeps the port and says the mapping
+ * is gone once it is down or found gone; it is unchanged when Tailscale could
+ * not say or could not remove it. Nothing is spawned when there is nothing
+ * recorded. Also `uninstall --purge`, with the Inbox stopped (`legacy`: that
+ * data dir's inbox.json `tailnet`).
  */
-function takeDownOwnMapping(run: TailscaleRunner, targets: readonly string[]): "removed" | "none" | "failed" {
-  const status = run(["serve", "status", "--json"], TAILSCALE_SERVE_TIMEOUT_MS);
-  if (status.error || status.status !== 0) return "failed";
-  const existing = serveStatusProxy(status.stdout, INBOX_TAILNET_HTTPS_PORT);
-  if (existing.state === "malformed") return "failed";
-  if (existing.state !== "mapped" || !targets.includes(existing.proxy)) return "none";
-  return removeTailscaleServe(INBOX_TAILNET_HTTPS_PORT, run) ? "removed" : "failed";
+export function takeDownInboxTailnet(
+  dataDir: string,
+  run: TailscaleRunner = runTailscale,
+  legacy: InboxRegistryEntry["tailnet"] = readInboxRegistry(dataDir)?.tailnet,
+): "removed" | "none" | "failed" {
+  let record = readTailnetDoorRecord(dataDir);
+  if (!record && !hasTailnetDoorRecord(dataDir)) {
+    if (!legacy?.door_port) return "none";
+    const status = run(["serve", "status", "--json"], TAILSCALE_SERVE_TIMEOUT_MS);
+    if (status.error || status.status !== 0) return "failed";
+    record = adoptLegacyTailnetDoor(dataDir, legacy, status.stdout);
+  }
+  if (!record?.published) return "none";
+  const result = takeDownOwnServeMapping(run, record.https_port, [record.target]);
+  if (result !== "failed") writeTailnetDoorRecord(dataDir, { ...record, published: false });
+  return result;
 }
 
-/**
- * `uninstall --purge` with the Inbox stopped: take down the tailnet mapping
- * the last run left, by the door_port inbox.json kept. Nothing is spawned when
- * the switch was never on.
- */
-export function takeDownInboxTailnet(dataDir: string, run: TailscaleRunner = runTailscale): "removed" | "none" | "failed" {
-  const door = readInboxRegistry(dataDir)?.tailnet?.door_port;
-  return door ? takeDownOwnMapping(run, [`http://127.0.0.1:${door}`]) : "none";
+/** Why the door's port could not be taken (inbox-tailnet-door.ts), in the window's words. */
+class DoorPortError extends Error {
+  constructor(
+    readonly code: "tailnet_port_taken" | "tailnet_port_held" | "tailnet_port_raced",
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 export function createInboxDevices(context: InboxDevicesContext) {
   const now = () => (context.now ? context.now() : new Date());
-  const tailscale = context.tailscale ?? runTailscale;
+  const runTailscaleAtOnce = context.tailscale ?? runTailscale;
+  // The door's publish still waits on the CLI (Pair a phone, Link a machine): named for the loop watch.
+  const tailscale: TailscaleRunner = (args, timeoutMs) => syncSection(`tailscale:${args.slice(0, 2).join(" ")}`, () => runTailscaleAtOnce(args, timeoutMs));
   const devices = InboxDevices.open(context.dataDir);
   const commandLog = new JsonLines<CommandLine>(join(inboxDir(context.dataDir), INBOX_DEVICE_COMMANDS_FILE));
   const commands = new Map<string, CommandLine>();
@@ -271,6 +626,9 @@ export function createInboxDevices(context: InboxDevicesContext) {
   let offer: Offer | null = null;
   /** The last offer made, kept after it closes so the window can say what reached the door while it showed. */
   let lastOffer: Offer | null = null;
+  const phonesOn = context.phones !== false;
+  /** Machine offers (inbox-machines.ts), newest last, with the device each was redeemed for. */
+  const machineOffers: (Offer & { deviceId: string | null })[] = [];
   let name: string | null = null;
   const tailnet: TailnetState = { on: false, address: null, error: null };
 
@@ -289,7 +647,7 @@ export function createInboxDevices(context: InboxDevicesContext) {
     const revoked = devices.revoke(device.id, now().toISOString()) ?? device;
     for (const stream of streams.get(device.id) ?? []) stream.abort();
     streams.delete(device.id);
-    context.relay?.revoked(revoked);
+    if (device.platform !== MACHINE_PLATFORM) context.relay?.revoked(revoked);
     return revoked;
   };
 
@@ -314,6 +672,45 @@ export function createInboxDevices(context: InboxDevicesContext) {
       // A phone can use the code only through an address it carries; the window never shows a code without one.
       reachable: reach.tailnet !== null || (reach.lan !== null && reach.fingerprint !== null),
     };
+  };
+
+  /** A one-time offer another Inbox redeems as a machine (Phones on or off). */
+  const openMachineOffer = () => {
+    const made = {
+      secret: randomBytes(32).toString("base64url"),
+      code: String(randomInt(0, 1_000_000)).padStart(6, "0"),
+      expiresAt: now().getTime() + PAIRING_OFFER_MS,
+      wrong: 0,
+      redeemed: false,
+      attempts: [],
+      deviceId: null,
+    };
+    machineOffers.push(made);
+    if (machineOffers.length > MACHINE_OFFERS_KEPT) machineOffers.splice(0, machineOffers.length - MACHINE_OFFERS_KEPT);
+    return { secret: made.secret, code: made.code, expires_at: new Date(made.expiresAt).toISOString() };
+  };
+  const openMachineOffers = () => machineOffers.filter((o) => !o.redeemed && o.wrong < PAIRING_CODE_TRIES && o.expiresAt > now().getTime());
+  const offerDevice = (secret: string) => machineOffers.find((o) => sameSecret(o.secret, secret))?.deviceId ?? null;
+
+  /** A machine redeems a machine offer: the same limits as a phone's (10 minutes, 5 wrong codes), its own slots. */
+  const redeemMachine = (name: string, secret: string | null, code: string | null): Response => {
+    const open = openMachineOffers();
+    const match = open.find((o) => (secret ? sameSecret(secret, o.secret) : code === o.code));
+    if (!match) {
+      if (!secret) for (const o of open) o.wrong += 1;
+      if (secret || open.length === 0) return refuse(410, "offer_expired", "This link code is no longer open. Make a new one on the other machine.");
+      return refuse(401, "pairing_code_wrong", "That code is not the one on the other machine.", {
+        tries_left: Math.max(PAIRING_CODE_TRIES - Math.max(...open.map((o) => o.wrong)), 0),
+      });
+    }
+    match.redeemed = true;
+    const token = `tok_${randomBytes(32).toString("base64url")}`;
+    const at = now().toISOString();
+    const device = devices.add({ id: inboxId("dev"), name, platform: MACHINE_PLATFORM, token, secret: match.secret, at });
+    // A machine is never a phone: no relay carriage, no pushes.
+    devices.setCarriage(device.id, false, at);
+    match.deviceId = device.id;
+    return json({ device: publicDevice(devices.get(device.id) ?? device), token, computer: computer() }, 201);
   };
 
   const attempt = (target: Offer | null, entry: Omit<PairingAttempt, "at">) => {
@@ -358,6 +755,12 @@ export function createInboxDevices(context: InboxDevicesContext) {
     if (!platform.ok) throw new InboxError("validation_error", `platform: ${platform.message}`, { field: "platform" });
     const secret = typeof body.secret === "string" && body.secret ? body.secret : null;
     const code = typeof body.code === "string" && body.code ? body.code : null;
+    if (platform.name === MACHINE_PLATFORM) {
+      // Machines link over the tailnet only: never by a code, or at all, over the Wi-Fi.
+      if (via === "wifi") return refuse(403, "machine_not_accepted_here", "Machines link over the tailnet, not the Wi-Fi.");
+      if (!secret && !code) throw new InboxError("validation_error", "secret or code: one is required.", { field: "secret" });
+      return redeemMachine(byName.name, secret, code);
+    }
     if (secretOnly && !secret && code) {
       attempt(openOffer() ?? lastOffer, { via, result: "code_over_wifi" });
       return refuse(400, "code_not_accepted_here", "Over the Wi-Fi, pair by scanning the QR code on your computer's screen.");
@@ -393,16 +796,78 @@ export function createInboxDevices(context: InboxDevicesContext) {
   // ── The door (contract section 2) ──
 
   /** Hand one allowed request to the window's handler, on loopback, as the window would send it. */
-  const toWindow = (req: Request, windowPath: string, search: string, body: string | null, signal: AbortSignal): Promise<Response> => {
+  const toWindow = (
+    req: Request,
+    device: InboxDevice,
+    windowPath: string,
+    search: string,
+    body: string | ReadableStream<Uint8Array> | null,
+    signal: AbortSignal,
+    raw = false,
+  ): Promise<Response> => {
     const headers = new Headers({ Accept: "application/json" });
-    if (body !== null) headers.set("Content-Type", "application/json");
+    if (raw) {
+      // A file's bytes (an upload, a drawing): its type and length as the phone sent them, so the window's own 413 check runs first.
+      headers.set("Content-Type", req.headers.get("content-type") ?? "application/octet-stream");
+      const length = req.headers.get("content-length");
+      if (length) headers.set("Content-Length", length);
+    } else if (body !== null) headers.set("Content-Type", "application/json");
     const lastEventId = req.headers.get("last-event-id");
     if (lastEventId) headers.set("Last-Event-ID", lastEventId);
-    return context.dispatch(new Request(`http://127.0.0.1:${context.port()}${windowPath}${search}`, { method: req.method, headers, body, signal }));
+    // Of the phone's own headers the door forwards exactly three, and the
+    // window's answer comes back unchanged: If-None-Match, the image routes'
+    // validator (attachments/<id>/image, messages/<id>/image: a phone that
+    // cached the bytes revalidates and gets the window's 304); and a GET's
+    // Range and If-Range, a player's byte range (the `video` and `download`
+    // routes answer 206 with Content-Range, Accept-Ranges and ETag).
+    const ifNoneMatch = req.headers.get("if-none-match");
+    if (ifNoneMatch) headers.set("If-None-Match", ifNoneMatch);
+    if (req.method === "GET") {
+      const range = req.headers.get("range");
+      if (range) headers.set("Range", range);
+      const ifRange = req.headers.get("if-range");
+      if (ifRange) headers.set("If-Range", ifRange);
+    }
+    const from: InboxDoorCaller = {
+      device_id: device.id,
+      name: device.name,
+      platform: device.platform,
+      window: device.platform === MACHINE_PLATFORM && req.headers.get(MACHINE_WINDOW_HEADER) === "1",
+    };
+    return context.dispatch(new Request(`http://127.0.0.1:${context.port()}${windowPath}${search}`, { method: req.method, headers, body, signal }), from);
   };
 
   /** A POST through the door: answered once per device and key, then replayed. */
-  const command = async (req: Request, device: InboxDevice, doorPath: string, windowPath: string): Promise<Response> => {
+  /** A POST through the door: answered once per device and key, then replayed. */
+  const command = async (req: Request, device: InboxDevice, url: URL, windowPath: string, entry: DoorRoute): Promise<Response> => {
+    const doorPath = url.pathname;
+    const raw = entry.raw ?? null;
+    // A raw body (a file): the key in the query, which rides on whole; the body streams through, counted.
+    // JSON: the key in the body, no query.
+    if (raw) {
+      const tooLarge = () =>
+        refuse(413, raw.code, `Not accepted: ${raw.what} is at most ${Math.round(raw.max / (1024 * 1024))} MB.`, { max_bytes: raw.max });
+      const declared = Number(req.headers.get("content-length") ?? "");
+      // Declared past the bound: refused before a byte is read, and the connection closes rather than read the rest.
+      if (Number.isFinite(declared) && declared > raw.max) {
+        await req.body?.cancel().catch(() => {});
+        return withClose(tooLarge());
+      }
+      const metered = req.body ? meteredBody(req.body, raw.max, () => new InboxError(raw.code, `${raw.what} is too large.`)) : null;
+      /** Every raw answer: what is left of the file read and dropped (bounded), else the connection closes. */
+      const finish = async (response: Response) => ((await metered?.settle()) === false ? withClose(response) : response);
+      const key = url.searchParams.get("idempotency_key");
+      if (key === null || !key.trim()) {
+        return finish(refuse(422, "validation_error", "idempotency_key: required on a phone's command (in the query for a file).", { field: "idempotency_key" }));
+      }
+      return claim(req, device, doorPath, key, finish, async () => {
+        const response = await toWindow(req, device, windowPath, url.search, metered?.stream ?? null, req.signal, true);
+        const answer = await response.text();
+        // Past the bound: the door's own refusal (nothing kept, nothing recorded), whatever the window made of the cut stream.
+        if (metered?.over()) return { response: withClose(tooLarge()), record: false };
+        return { response: await finish(new Response(answer, { status: response.status, headers: response.headers })), answer, status: response.status, record: true };
+      });
+    }
     let text: string;
     let body: unknown;
     try {
@@ -412,35 +877,60 @@ export function createInboxDevices(context: InboxDevicesContext) {
       throw new InboxError("validation_error", "body: expected a JSON object.");
     }
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new InboxError("validation_error", "body: expected a JSON object.");
-    const key = (body as Record<string, unknown>).idempotency_key;
+    const fields = body as Record<string, unknown>;
+    const key = fields.idempotency_key;
     if (typeof key !== "string" || !key.trim()) {
       throw new InboxError("validation_error", "idempotency_key: required on a phone's command.", { field: "idempotency_key" });
     }
+    for (const refused of entry.refuse ?? []) {
+      if (fields[refused.field] !== undefined) throw new InboxError("validation_error", refused.message, { field: refused.field });
+    }
+    return claim(req, device, doorPath, key, async (response) => response, async () => {
+      const response = await toWindow(req, device, windowPath, device.platform === MACHINE_PLATFORM ? (entry.fromMachine ?? "") : "", text, req.signal);
+      const answer = await response.text();
+      return { response: new Response(answer, { status: response.status, headers: response.headers }), answer, status: response.status, record: true };
+    });
+  };
+
+  /**
+   * One command under its key: a replay answers the recorded status and body
+   * (`finish` settles a raw body first); otherwise `apply` runs once, and an
+   * answer under 500 is recorded. Replays match on method and door path, never
+   * on the query or the body.
+   */
+  const claim = async (
+    req: Request,
+    device: InboxDevice,
+    doorPath: string,
+    key: string,
+    finish: (response: Response) => Promise<Response>,
+    apply: () => Promise<{ response: Response; answer?: string; status?: number; record: boolean }>,
+  ): Promise<Response> => {
     const slot = `${device.id}\n${key}`;
     // Wait while the same command runs; no await when none does, so the check and the claim below happen in one turn.
     while (inFlight.has(slot)) await inFlight.get(slot);
     const seen = commands.get(slot);
     if (seen) {
       if (seen.method !== req.method || seen.path !== doorPath) {
-        return refuse(409, "idempotency_key_reused", "This idempotency_key was already used on another route.", { field: "idempotency_key" });
+        return finish(refuse(409, "idempotency_key_reused", "This idempotency_key was already used on another route.", { field: "idempotency_key" }));
       }
-      return json(seen.body, seen.status, { "Idempotent-Replayed": "true" });
+      // A replayed file is not kept: the answer names the upload or drawing the first one made.
+      return finish(json(seen.body, seen.status, { "Idempotent-Replayed": "true" }));
     }
     const run = (async () => {
-      const response = await toWindow(req, windowPath, "", text, req.signal);
-      const answer = await response.text();
-      if (response.status < 500) {
+      const result = await apply();
+      if (result.record && result.status !== undefined && result.status < 500) {
         let parsed: unknown = null;
         try {
-          parsed = JSON.parse(answer);
+          parsed = JSON.parse(result.answer ?? "");
         } catch {
-          parsed = answer;
+          parsed = result.answer ?? null;
         }
-        const line: CommandLine = { v: 1, at: now().toISOString(), device_id: device.id, key, method: req.method, path: doorPath, status: response.status, body: parsed };
+        const line: CommandLine = { v: 1, at: now().toISOString(), device_id: device.id, key, method: req.method, path: doorPath, status: result.status, body: parsed };
         commandLog.append(line);
         commands.set(slot, line);
       }
-      return new Response(answer, { status: response.status, headers: response.headers });
+      return result.response;
     })();
     inFlight.set(slot, run.catch(() => {}));
     try {
@@ -452,6 +942,8 @@ export function createInboxDevices(context: InboxDevicesContext) {
 
   const caught = (error: unknown): Response => {
     if (error instanceof InboxError) return json({ error: error.message, code: error.code, ...error.details }, error.code === "validation_error" ? 422 : 400);
+    const full = inboxDiskFullError(error);
+    if (full) return json({ error: full.message, code: full.code }, 507);
     return refuse(500, "internal_error", "Internal error.");
   };
 
@@ -459,13 +951,26 @@ export function createInboxDevices(context: InboxDevicesContext) {
   const serve = async (req: Request, url: URL, route: string, device: InboxDevice): Promise<Response> => {
     devices.touch(device.id, now().toISOString());
     if (route === "revoke" && req.method === "POST") return json({ device: publicDevice(revoke(device)) });
-    for (const entry of ALLOWLIST) {
-      if (entry.method !== req.method) continue;
-      const match = entry.route.exec(route);
-      if (!match) continue;
-      const windowPath = entry.window(match);
-      if (req.method === "POST") return await command(req, device, url.pathname, windowPath);
-      if (route !== "events") return await toWindow(req, windowPath, url.search, null, req.signal);
+    if (device.platform === MACHINE_PLATFORM) {
+      // A machine reads this Inbox's own threads only (PLAN rule 3): never the merged view, so links both ways cannot echo.
+      if (url.searchParams.has("machines")) return refuse(403, "machines_view_refused", "A linked machine reads this Inbox's own threads only.");
+      const machines = context.machines?.() ?? null;
+      const [linkBack, unlink] = MACHINE_DOOR_WRITES;
+      if (machines && req.method === "POST" && route === linkBack) return machines.linkBack(device.id, await context.readBody(req));
+      if (machines && req.method === "POST" && route === unlink) return machines.unlinkedBy(device.id);
+      // The body is never read, so a machine cannot name a version or a place to download from.
+      if (context.machineUpdate && route === MACHINE_DOOR_UPDATE) {
+        if (req.method === "GET") return json(context.machineUpdate.read());
+        if (req.method === "POST") return json(await context.machineUpdate.start());
+      }
+      // Only this Inbox's own read, so it never passes on a third machine's. Of the query, only Refresh's `fresh`.
+      if (req.method === "GET" && route === MACHINE_DOOR_ACCOUNTS) return await toWindow(req, device, "/api/inbox/accounts", url.searchParams.get("fresh") === "1" ? "?fresh=1" : "", null, req.signal);
+    }
+    const door = doorRouteOf(req.method, route, device.platform === MACHINE_PLATFORM);
+    if (door) {
+      const { entry, windowPath } = door;
+      if (req.method === "POST") return await command(req, device, url, windowPath, entry);
+      if (route !== "events") return await toWindow(req, device, windowPath, url.search, null, req.signal);
       // The event stream lives until the phone leaves or is removed.
       const stream = new AbortController();
       req.signal.addEventListener("abort", () => stream.abort());
@@ -473,22 +978,47 @@ export function createInboxDevices(context: InboxDevicesContext) {
       open.add(stream);
       streams.set(device.id, open);
       stream.signal.addEventListener("abort", () => open.delete(stream));
-      return await toWindow(req, windowPath, url.search, null, stream.signal);
+      return await toWindow(req, device, windowPath, url.search, null, stream.signal);
     }
     return refuse(404, "device_route_not_found", "Not a phone route.");
   };
 
+  /**
+   * Phones off: whether the door answers this request at all (it is there
+   * for linked machines only). A machine's pairing while a machine offer is
+   * open, and a machine's token, are answered. So is a token this door does
+   * not know, once machines link here (through the tailnet's listener, or
+   * when any machine device exists): `401 device_token_invalid` tells a
+   * machine whose link was wiped here (a reinstall) to re-pair, and ends the
+   * writes it holds with their notice. Anything else gets the unknown-route
+   * 404 it always got, Origin header or not.
+   */
+  const answersWithPhonesOff = (req: Request, route: string, via: PairingVia, token: string | null, device: InboxDevice | null): boolean => {
+    if (route === "pair" && req.method === "POST") return openMachineOffers().length > 0;
+    if (device) return device.platform === MACHINE_PLATFORM;
+    return token !== null && (via === "tailnet" || devices.list().some((d) => d.platform === MACHINE_PLATFORM));
+  };
+
   /** `via`: the listener the request reached (the window's own port when the caller says nothing). */
-  const door = async (req: Request, url: URL, via: PairingVia = "local"): Promise<Response> => {
+  /** Null: Phones are off and this is no machine's request (the caller answers its unknown-route 404). */
+  const door = async (req: Request, url: URL, via: PairingVia = "local"): Promise<Response | null> => {
     try {
-      if (req.headers.get("origin") !== null) return refuse(403, "origin_not_allowed", "Browser requests are not accepted here.");
       const route = url.pathname.startsWith(DOOR_PREFIX) ? url.pathname.slice(DOOR_PREFIX.length) : "";
-      if (route === "pair" && req.method === "POST") return await redeem(req, via);
       const token = bearer(req);
+      const device = token ? devices.byToken(token) : null;
+      if (!phonesOn && !answersWithPhonesOff(req, route, via, token, device)) return null;
+      if (req.headers.get("origin") !== null) return refuse(403, "origin_not_allowed", "Browser requests are not accepted here.");
+      if (route === "pair" && req.method === "POST") return await redeem(req, via);
       if (!token) return refuse(401, "device_token_missing", "This request needs the phone's token.");
-      const device = devices.byToken(token);
       if (!device) return refuse(401, "device_token_invalid", "This token does not belong to a paired phone.");
-      if (device.revoked_at !== null) return refuse(401, "device_revoked", "This phone was removed from the Inbox. Pair it again.");
+      if (device.revoked_at !== null) {
+        // A machine unlinked while it could not be told has now heard it: the door it kept up may come down.
+        if (device.refusal_owed_until !== undefined) refusalAnswered(device.id);
+        return refuse(401, "device_revoked", "This phone was removed from the Inbox. Pair it again.");
+      }
+      if (device.platform === AGENT_PLATFORM) return refuse(403, "agent_not_accepted_here", "A cloud agent's pairing opens the agent door only.");
+      // A machine reaches this door over the tailnet only, never the Wi-Fi's listener.
+      if (device.platform === MACHINE_PLATFORM && via === "wifi") return refuse(403, "machine_not_accepted_here", "Machines reach this Inbox over the tailnet, not the Wi-Fi.");
       return await serve(req, url, route, device);
     } catch (error) {
       return caught(error);
@@ -499,15 +1029,22 @@ export function createInboxDevices(context: InboxDevicesContext) {
    * A command that came up through the relay (contract section 4), applied
    * in-process as the device whose key opened it: the same revocation check,
    * allowlist and idempotency log as a request at the door, so a command the
-   * relay replays writes nothing again. Two door routes are not carried:
-   * `pair` (pairing through the relay is not in v1) and `events` (the down
-   * items are the relay's stream; an endless answer cannot be one result).
+   * relay replays writes nothing again. Four door routes are not carried:
+   * `pair` (pairing through the relay is not in v1), `events` (the down
+   * items are the relay's stream; an endless answer cannot be one result),
+   * and the raw-body `uploads` and `markups` (`413 relay_upload_unavailable`).
+   * A sealed command carries no headers in v1, so no Range reaches the
+   * window from here: `attachments/:id/video` and `download` answer the whole
+   * file (`200`), which the relay carries when it fits one frame and answers
+   * `413 result_too_large` otherwise, without reading it (inbox-relay.ts).
+   * A phone plays a video over the Wi-Fi or the tailnet; relay ranges are v1.1.
    */
   const asDevice = async (deviceId: string, input: { method: string; path: string; body?: unknown }): Promise<Response> => {
     try {
       const device = devices.get(deviceId);
       if (!device) return refuse(401, "device_token_invalid", "This token does not belong to a paired phone.");
       if (device.revoked_at !== null) return refuse(401, "device_revoked", "This phone was removed from the Inbox. Pair it again.");
+      if (device.platform === AGENT_PLATFORM) return refuse(403, "agent_not_accepted_here", "A cloud agent's pairing opens the agent door only.");
       if (input.method !== "GET" && input.method !== "POST") return refuse(404, "device_route_not_found", "Not a phone route.");
       let url: URL;
       try {
@@ -518,6 +1055,11 @@ export function createInboxDevices(context: InboxDevicesContext) {
       const route = url.pathname.startsWith(DOOR_PREFIX) ? url.pathname.slice(DOOR_PREFIX.length) : "";
       if (!route || route === "pair" || route === "events" || url.origin !== `http://127.0.0.1:${context.port()}`) {
         return refuse(404, "device_route_not_found", "Not a phone route.");
+      }
+      // A file (an upload, a drawing) is not carried: a sealed command's body is JSON, and a file in it would be
+      // base64 inside the envelope, past Cloudflare's message limit well under the 100 MB cap. v1: the Wi-Fi or the tailnet.
+      if (input.method === "POST" && ALLOWLIST.some((entry) => entry.raw && entry.method === "POST" && entry.route.test(route))) {
+        return refuse(413, "relay_upload_unavailable", "Files and drawings are sent over the Wi-Fi or the tailnet, not the relay.");
       }
       const req = new Request(url, {
         method: input.method,
@@ -551,7 +1093,7 @@ export function createInboxDevices(context: InboxDevicesContext) {
         return refuse(404, "device_route_not_found", "Not a phone route.");
       }
       if (url.pathname !== "/api/inbox/device" && !url.pathname.startsWith(DOOR_PREFIX)) return refuse(404, "device_route_not_found", "Not a phone route.");
-      return door(req, url, via);
+      return door(req, url, via).then((answer) => answer ?? refuse(404, "device_route_not_found", "Not a phone route."));
     };
 
   // ── The Wi-Fi (contract section 3): the same door-only handler, over TLS on every interface. ──
@@ -594,12 +1136,19 @@ export function createInboxDevices(context: InboxDevicesContext) {
     doorServer = null;
   };
 
-  /** Targets a mapping of this Inbox's own points at: this run's door listener, or the last run's. */
-  const ownTargets = () =>
-    [doorServer?.port, context.registry().tailnet?.door_port].filter((p): p is number => !!p).map((p) => `http://127.0.0.1:${p}`);
+  /** The tailnet HTTPS port the door is published on this run, while it is. */
+  let doorHttpsPort: number | null = null;
 
+  /** The record, or (no record yet) what an older build's inbox.json `tailnet` says, never written here: the pairing checks only read. */
+  const recordFor = (serveStatus: string): TailnetDoorRecord | null =>
+    hasTailnetDoorRecord(context.dataDir) ? readTailnetDoorRecord(context.dataDir) : legacyTailnetDoorRecord(context.registry().tailnet, serveStatus);
+
+  /** The tailnet port the door would take now, from `tailscale serve status --json`: the kept port, else (first publish) the first free one. */
+  const doorPortIn = (serveStatus: string) => chooseTailnetDoorPort(serveStatus, recordFor(serveStatus));
+
+  /** The switch: inbox.json's `tailnet`. Off also forgets the door's port, so the next first publish chooses again. */
   const saveSwitch = (on: boolean) => {
-    const value = on && doorServer ? { https_port: INBOX_TAILNET_HTTPS_PORT, door_port: doorServer.port as number } : undefined;
+    const value = on && doorServer ? { https_port: doorHttpsPort ?? INBOX_TAILNET_HTTPS_PORT, door_port: doorServer.port as number } : undefined;
     const apply = (target: InboxRegistryEntry) => {
       if (value) target.tailnet = { ...value };
       else delete target.tailnet;
@@ -607,24 +1156,80 @@ export function createInboxDevices(context: InboxDevicesContext) {
     // Never another Inbox's entry, never into a removed data folder.
     updateOwnInboxRegistry(context.dataDir, context.registry().serverSession, apply);
     apply(context.registry());
+    if (!on) clearTailnetDoorRecord(context.dataDir);
   };
+
+  /** Who reaches the door on its port, for the words of a refusal. */
+  const reachers = () => (phonesOn ? "linked machines and paired phones" : "linked machines");
 
   const tailnetWords = (error: unknown): { code: string; message: string } => {
-    if (error instanceof TailscaleServeError && error.code === "conflict") {
-      return {
-        code: "tailnet_port_taken",
-        message: `Another tailscale serve mapping already uses port ${INBOX_TAILNET_HTTPS_PORT}. The Inbox never replaces it: remove it with "tailscale serve --https=${INBOX_TAILNET_HTTPS_PORT} off" if nothing needs it.`,
-      };
-    }
+    if (error instanceof DoorPortError) return { code: error.code, message: error.message };
     const detail = error instanceof Error ? error.message.replace(/^--tailscale:\s*/, "") : String(error);
-    return { code: "tailnet_unavailable", message: `Tailscale could not publish the Inbox. ${detail}` };
+    // Linux: `tailscale serve` needs root unless the person made their user the operator once.
+    const linux =
+      process.platform === "linux" && /access denied|permission|operator|not permitted/i.test(detail)
+        ? ' On Linux, run "sudo tailscale set --operator=$USER" once, then try again.'
+        : "";
+    return { code: "tailnet_unavailable", message: `Tailscale could not publish the Inbox. ${detail}${linux}` };
   };
 
-  /** Open the door listener and point the tailnet mapping at it; on failure both are closed and the error kept for the window. */
+  /**
+   * Open the door listener and point a tailnet mapping at it, on its port
+   * (inbox-tailnet-door.ts: the kept one, else the first free one). The
+   * record is written before `tailscale serve` runs, so a crash between the
+   * two never leaves a mapping the Inbox does not own; when serve fails, the
+   * record goes back to what it was. On failure the listener closes and the
+   * error is kept for the window.
+   */
   const publish = (): { ok: true } | { ok: false; code: string; message: string } => {
     try {
+      const status = tailscale(["serve", "status", "--json"], TAILSCALE_SERVE_TIMEOUT_MS);
+      if (status.error || status.status !== 0) throw new TailscaleServeError("unavailable", `--tailscale: ${describeTailscaleFailure(status)}`);
+      // An older build's inbox.json record, read once (inbox-tailnet-door.ts).
+      const record = adoptLegacyTailnetDoor(context.dataDir, context.registry().tailnet, status.stdout);
+      const port = chooseTailnetDoorPort(status.stdout, record);
+      if (port.state === "malformed") {
+        throw new TailscaleServeError(
+          "malformed",
+          "--tailscale: could not parse `tailscale serve status --json` output; refusing to modify the serve config. Inspect it with `tailscale serve status`.",
+        );
+      }
+      if (port.state === "taken") {
+        throw new DoorPortError(
+          "tailnet_port_taken",
+          `Other tailscale serve mappings already use every port the Inbox can take (${INBOX_TAILNET_PORT_RANGE}). The Inbox never replaces them: free one of them if nothing needs it ("tailscale serve status" lists them).`,
+        );
+      }
+      if (port.state === "held") {
+        // How the port can change on purpose. With Phones off and nothing linked, there is nothing to unlink:
+        // the port is let go of once nothing needs the door (closeTailnetIfUnused), and the next code chooses again.
+        const move = phonesOn
+          ? "To move this Inbox to a new port instead, turn Tailscale off and on again here, then pair your phones and link your machines again."
+          : context.machines?.()?.hasLinks()
+            ? "To move this Inbox to a new port instead, unlink each machine, then link it again."
+            : `Nothing is linked here, so the Inbox lets go of port ${port.port} on its own once no link code is open (a code lasts ${PAIRING_OFFER_MS / 60_000} minutes)${
+                owesRefusal() ? `, and the machine unlinked here has heard it was unlinked (at most ${UNLINKED_REFUSAL_KEPT_MS / 86_400_000} days)` : ""
+              }; the next code then takes a free port.`;
+        throw new DoorPortError(
+          "tailnet_port_held",
+          `Another tailscale serve mapping now uses port ${port.port}, where ${reachers()} reach this Inbox. The Inbox never replaces it, and does not move to another port on its own: free port ${port.port} if nothing needs it ("tailscale serve status" lists it). ${move}`,
+        );
+      }
       const doorPort = openDoorListener();
-      const { url } = enableTailscaleServe(doorPort, tailscale, { httpsPort: INBOX_TAILNET_HTTPS_PORT, ownTargets: ownTargets(), persist: true });
+      writeTailnetDoorRecord(context.dataDir, { https_port: port.port, target: `http://127.0.0.1:${doorPort}`, published: true });
+      let url: string;
+      try {
+        ({ url } = enableTailscaleServe(doorPort, tailscale, { httpsPort: port.port, ownTargets: port.own ? [port.own] : [], persist: true }));
+      } catch (error) {
+        if (record) writeTailnetDoorRecord(context.dataDir, record);
+        else clearTailnetDoorRecord(context.dataDir);
+        // Free a moment ago, someone else's now: the race between reading the status and serving.
+        if (error instanceof TailscaleServeError && error.code === "conflict") {
+          throw new DoorPortError("tailnet_port_raced", `Port ${port.port} was just taken by another tailscale serve mapping. Try again.`);
+        }
+        throw error;
+      }
+      doorHttpsPort = port.port;
       const served = new URL(url);
       tailnet.address = `${served.hostname}:${served.port || "443"}`;
       tailnet.error = null;
@@ -655,38 +1260,149 @@ export function createInboxDevices(context: InboxDevicesContext) {
     if (on) process.once("SIGHUP", onHangup);
   };
 
-  /** Take this Inbox's own mapping down (never someone else's); the listener closes unless the take-down failed. */
+  /** Take this Inbox's own mapping down (the recorded one, never someone else's); the listener closes unless the take-down failed. */
   const unpublish = (): "removed" | "none" | "failed" => {
-    const result = takeDownOwnMapping(tailscale, ownTargets());
+    const result = takeDownInboxTailnet(context.dataDir, tailscale, context.registry().tailnet);
     if (result === "failed") return result;
     closeDoorListener();
     hangup(false);
     tailnet.address = null;
+    doorHttpsPort = null;
     return result;
+  };
+
+  // ── A refusal owed (inbox-machines.md, "Unlink removes both sides") ──
+  //
+  // A machine unlinked here while it could not be told learns at its next
+  // contact, from its revoked token's `401 device_revoked`. With Phones off
+  // that contact needs the tailnet door, so the door stays published until
+  // that token has been refused once, the limit passes
+  // (`UNLINKED_REFUSAL_KEPT_MS`), or the person turns the tailnet off. The
+  // device record keeps `refusal_owed_until`, so a restart publishes it again.
+  // The door serves nothing new meanwhile: that token is revoked, and the
+  // door answers exactly as it does while a machine is linked.
+
+  const refusalKeptMs = context.refusalKeptMs ?? UNLINKED_REFUSAL_KEPT_MS;
+  const owesRefusal = () => devices.owedRefusals(now().getTime()).length > 0;
+  /** Fires when the soonest owed refusal reaches its limit. */
+  let owedTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The door's close once a refusal's answer has left (`REFUSED_DOOR_CLOSE_MS`). */
+  let refusedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Wake when the soonest owed refusal reaches its limit: the door then comes down unless something else needs it. */
+  const watchOwed = () => {
+    if (owedTimer) clearTimeout(owedTimer);
+    owedTimer = null;
+    const soonest = devices.owedRefusals(now().getTime())[0];
+    if (!soonest) return;
+    const wait = Math.max(Date.parse(soonest.refusal_owed_until!) - now().getTime(), 0) + 50;
+    owedTimer = setTimeout(
+      () => {
+        owedTimer = null;
+        closeTailnetIfUnused();
+        watchOwed();
+      },
+      Math.min(wait, 2 ** 31 - 1),
+    );
+    owedTimer.unref?.();
+  };
+
+  /** A machine unlinked here could not be told: its revoked token is owed one refusal, and the door stays for it. */
+  const oweRefusal = (deviceId: string) => {
+    devices.oweRefusal(deviceId, new Date(now().getTime() + refusalKeptMs).toISOString(), now().toISOString());
+    watchOwed();
+  };
+
+  /** That machine was refused (`401 device_revoked`): it removes its side now, and the door comes down after the answer. */
+  const refusalAnswered = (deviceId: string) => {
+    devices.oweRefusal(deviceId, null, now().toISOString());
+    watchOwed();
+    if (refusedTimer) clearTimeout(refusedTimer);
+    refusedTimer = setTimeout(() => {
+      refusedTimer = null;
+      closeTailnetIfUnused();
+    }, REFUSED_DOOR_CLOSE_MS);
+    refusedTimer.unref?.();
+  };
+
+  /**
+   * Phones off: once no machine is linked, no machine offer is open and no
+   * refusal is owed, the tailnet door has nothing to serve, so this Inbox's
+   * mapping comes down and the switch is cleared (after the last unlink that
+   * reached the other machine, an offer nobody used, or the refusal an
+   * unlinked machine was owed). Phones on: the person's own switch decides,
+   * so nothing changes.
+   */
+  const closeTailnetIfUnused = () => {
+    if (phonesOn || openMachineOffers().length > 0 || context.machines?.()?.hasLinks() || owesRefusal()) return;
+    if (tailnet.address === null && !doorServer && !context.registry().tailnet) return;
+    if (unpublish() === "failed") return;
+    tailnet.on = false;
+    tailnet.error = null;
+    saveSwitch(false);
+  };
+
+  /**
+   * At start, Phones off, nothing linked or owed, the switch kept, and a
+   * refusal whose limit passed while the Inbox was down. After a clean stop
+   * the record says the mapping is down, and nothing runs (the next link
+   * publishes the same port). After a crash during that week (kill -9, a
+   * panic, a dead battery) the record still says published, and no later
+   * start would take that mapping to a dead loopback port down: it comes
+   * down now, the switch is cleared and the lapsed refusals are forgotten. A
+   * take-down that failed changes nothing, so the next start tries again.
+   */
+  const settleLapsedRefusals = (kept: InboxRegistryEntry["tailnet"]) => {
+    // Nothing is owed now, so every refusal still recorded has lapsed.
+    const lapsed = devices.owedRefusals(Number.NEGATIVE_INFINITY);
+    if (lapsed.length === 0 || !readTailnetDoorRecord(context.dataDir)?.published) return;
+    if (takeDownInboxTailnet(context.dataDir, tailscale, kept) === "failed") return;
+    saveSwitch(false);
+    for (const device of lapsed) devices.oweRefusal(device.id, null, now().toISOString());
   };
 
   /**
    * At start: the switch was on, so point the mapping at a fresh door
    * listener before anything else uses it. If that fails, a mapping the last
    * run left (a crash, kill -9) is taken down, so it never points at a dead
-   * port for longer than this start.
+   * port for longer than this start. With Phones off, no machine linked and
+   * no refusal owed, the tailnet is not this Inbox's business: `tailscale`
+   * never runs (a leftover waits for a link, Phones, or `uninstall --purge`),
+   * except for a door kept for a refusal whose limit passed while the Inbox
+   * was down (`settleLapsedRefusals`).
    */
   const startTailnet = () => {
-    if (!context.registry().tailnet) return;
+    watchOwed();
+    const kept = context.registry().tailnet;
+    if (!kept) return;
+    // Phones off: the door is published only for linked machines, and for one unlinked while it could not be told.
+    if (!phonesOn && !context.machines?.()?.hasLinks() && !owesRefusal()) {
+      settleLapsedRefusals(kept);
+      return;
+    }
     tailnet.on = true;
     if (publish().ok) saveSwitch(true);
-    else takeDownOwnMapping(tailscale, ownTargets());
+    else takeDownInboxTailnet(context.dataDir, tailscale, kept);
   };
 
   /**
    * A clean stop (quit, the stop route, a restart to update, which runs this
    * before it starts the new binary) takes the mapping and the door listener
    * down, so nothing is published while the Inbox is stopped. The switch stays
-   * on in inbox.json (with door_port, so a take-down that failed here is done
-   * by the next start or `uninstall --purge`), and the next start publishes
-   * again.
+   * on in inbox.json, and the record keeps the port, so the next start
+   * publishes the same address; a take-down that failed here leaves the
+   * record saying the mapping may exist, so the next start or
+   * `uninstall --purge` does it.
    */
   const stopTailnet = () => {
+    if (owedTimer) clearTimeout(owedTimer);
+    owedTimer = null;
+    // A close still waiting for a refusal's answer runs now, so a stop never leaves the switch on for nothing.
+    if (refusedTimer) {
+      clearTimeout(refusedTimer);
+      refusedTimer = null;
+      closeTailnetIfUnused();
+    }
     if (tailnet.address === null && !doorServer) return;
     unpublish();
     closeDoorListener();
@@ -701,13 +1417,17 @@ export function createInboxDevices(context: InboxDevicesContext) {
       saveSwitch(true);
       return json({ tailnet });
     }
-    // A take-down that failed changes nothing: the switch stays on, door_port is kept, and the window says why.
+    // A take-down that failed changes nothing: the switch stays on, the record is kept, and the window says why.
+    const port = readTailnetDoorRecord(context.dataDir)?.https_port ?? INBOX_TAILNET_HTTPS_PORT;
     if (unpublish() === "failed") {
-      return refuse(409, "tailnet_unavailable", `Tailscale could not take the Inbox's address down. Try again, or run "tailscale serve --https=${INBOX_TAILNET_HTTPS_PORT} off".`);
+      return refuse(409, "tailnet_unavailable", `Tailscale could not take the Inbox's address down. Try again, or run "tailscale serve --https=${port} off".`);
     }
     tailnet.on = false;
     tailnet.error = null;
     saveSwitch(false);
+    // The person turned the tailnet off: no door is kept for an unlinked machine after this.
+    for (const device of devices.owedRefusals(Number.NEGATIVE_INFINITY)) devices.oweRefusal(device.id, null, now().toISOString());
+    watchOwed();
     return json({ tailnet });
   };
 
@@ -744,8 +1464,7 @@ export function createInboxDevices(context: InboxDevicesContext) {
       dataDir: context.dataDir,
       // Tests hand in a scripted runner; this computer's own `tailscale` runs as a child process, never blocking the Inbox.
       tailscale: context.checksTailscale ?? context.tailscale ?? runTailscaleQuietly,
-      httpsPort: INBOX_TAILNET_HTTPS_PORT,
-      ownTargets,
+      doorPort: doorPortIn,
       probes: context.probes,
       deadlineMs: deadline,
     });
@@ -764,6 +1483,7 @@ export function createInboxDevices(context: InboxDevicesContext) {
   };
 
   const windowRoute = async (req: Request, url: URL): Promise<Response | null> => {
+    if (!phonesOn) return null;
     const path = url.pathname;
     if (path === "/api/inbox/pairing") {
       // The last offer's state and what reached the door while it showed; never its secret or code.
@@ -781,7 +1501,7 @@ export function createInboxDevices(context: InboxDevicesContext) {
     }
     if (path === "/api/inbox/devices") {
       if (req.method !== "GET") return json({ error: "Use GET." }, 405);
-      return json({ devices: devices.list().map(publicDevice) });
+      return json({ devices: devices.list().filter((d) => d.platform !== AGENT_PLATFORM).map(publicDevice) });
     }
     const revokeMatch = /^\/api\/inbox\/devices\/([A-Za-z0-9_]+)\/revoke$/.exec(path);
     if (revokeMatch) {
@@ -820,5 +1540,70 @@ export function createInboxDevices(context: InboxDevicesContext) {
     return null;
   };
 
-  return { door, asDevice, windowRoute, startTailnet, stopTailnet, startLan: lan.start, stopLan: lan.stop, devices };
+  /** Linked machines (inbox-machines.ts): the door's side of linking. */
+  const machineDoor = {
+    openMachineOffer,
+    offerDevice,
+    /** `oweRefusal`: a machine unlinked while it could not be told; the door stays up until its token is refused once. */
+    revokeDevice: (id: string, options: { oweRefusal?: boolean } = {}) => {
+      const device = devices.get(id);
+      if (!device) return;
+      if (device.revoked_at === null) revoke(device);
+      if (options.oweRefusal && device.platform === MACHINE_PLATFORM) oweRefusal(id);
+    },
+    /** Close a machine offer that will not be used (a link that failed halfway); the device it made, if one was. */
+    closeMachineOffer: (secret: string): string | null => {
+      const found = machineOffers.find((o) => sameSecret(o.secret, secret));
+      if (!found) return null;
+      found.redeemed = true;
+      return found.deviceId ?? null;
+    },
+    tailnetAddress: () => tailnet.address,
+    /** Why the door is not published, while it should be (a port held, Tailscale stopped), in the window's words. */
+    tailnetError: () => tailnet.error,
+    publishTailnet: (): { ok: true; address: string } | { ok: false; message: string } => {
+      if (tailnet.address) return { ok: true, address: tailnet.address };
+      const result = publish();
+      if (!result.ok) return { ok: false, message: result.message };
+      tailnet.on = true;
+      saveSwitch(true);
+      return { ok: true, address: tailnet.address! };
+    },
+    closeTailnetIfUnused,
+    computerName: () => computer().name,
+  };
+
+  /** Cloud agents' devices: minted here because the person asked on this computer, so no offer is redeemed. */
+  const agentDevices = {
+    mint: (name: string): { device: InboxDevice; token: string; secret: string } => {
+      const token = `tok_${randomBytes(32).toString("base64url")}`;
+      const secret = randomBytes(32).toString("base64url");
+      const at = now().toISOString();
+      const device = devices.add({ id: inboxId("dev"), name, platform: AGENT_PLATFORM, token, secret, at });
+      devices.setCarriage(device.id, false, at);
+      return { device: devices.get(device.id) ?? device, token, secret };
+    },
+    relay: async (device: InboxDevice): Promise<{ url: string; mailbox_id: string } | null> => (await context.relay?.paired(device)) ?? null,
+    byToken: (token: string): InboxDevice | null => {
+      const device = devices.byToken(token);
+      return device?.platform === AGENT_PLATFORM ? device : null;
+    },
+    byId: (id: string): InboxDevice | null => {
+      const device = devices.get(id);
+      return device?.platform === AGENT_PLATFORM ? device : null;
+    },
+    /** A phone's or a machine's token, which the agent door refuses by name. */
+    isOtherDevice: (token: string): boolean => {
+      const device = devices.byToken(token);
+      return device !== null && device.platform !== AGENT_PLATFORM;
+    },
+    touch: (id: string) => devices.touch(id, now().toISOString()),
+    seenAt: (id: string): string | null => devices.get(id)?.last_seen_at ?? null,
+    revoke: (id: string) => {
+      const device = devices.get(id);
+      if (device?.platform === AGENT_PLATFORM && device.revoked_at === null) revoke(device);
+    },
+  };
+
+  return { door, asDevice, windowRoute, startTailnet, stopTailnet, startLan: lan.start, stopLan: lan.stop, devices, machineDoor, agentDevices };
 }

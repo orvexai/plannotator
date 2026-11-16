@@ -1,0 +1,80 @@
+/**
+ * The environment to hand a child process: a copy of the LIVE `process.env`.
+ *
+ * Why every spawn passes one explicitly: on Bun, `Bun.spawn`, `Bun.spawnSync`
+ * and node:child_process's synchronous calls (`spawnSync`, `execFileSync`,
+ * `execSync`) give a child the environment the process STARTED with when
+ * their `env` option is missing or `undefined` (documented on Bun's
+ * `SpawnOptions.env`). The CLI deletes secrets from `process.env` at startup
+ * (the pull bridge's `PLANNOTATOR_SESSION_BRIDGE_TOKEN`, the host result and
+ * messages files, the review id, …), so a spawn without `env` would hand them
+ * to git, gh and agent CLIs anyway. Node's async `spawn`/`execFile` and Bun
+ * Shell read the live env and are not affected, but use this helper anywhere
+ * code can run under Bun.
+ *
+ * `tests/child-env-guard.test.ts` fails on a Bun or synchronous spawn in the
+ * production trees that passes no `env`.
+ *
+ * Bun-free and Node-safe: vendored into the Pi extension.
+ */
+
+export type ChildEnv = Record<string, string | undefined>;
+
+/**
+ * What keeps a sandboxed child's git and gh away from the macOS Keychain and
+ * from prompts. A sandbox (`PLANNOTATOR_TEST_SANDBOX`) runs with a scratch
+ * HOME, where macOS finds no keychain, so any credential write there showed
+ * "Keychain Not Found" on the person's screen, once per process.
+ *
+ * - `GIT_CONFIG_NOSYSTEM`: git skips the system config, Xcode's included,
+ *   which sets `credential.helper=osxkeychain`.
+ * - `GCM_INTERACTIVE=never`: no Git Credential Manager window.
+ * - `GH_PROMPT_DISABLED`, `GH_NO_UPDATE_NOTIFIER`: gh never prompts and never
+ *   checks for its own update.
+ */
+export const SANDBOX_NO_KEYCHAIN_ENV: Readonly<Record<string, string>> = Object.freeze({
+  GIT_CONFIG_NOSYSTEM: "1",
+  GCM_INTERACTIVE: "never",
+  GH_PROMPT_DISABLED: "1",
+  GH_NO_UPDATE_NOTIFIER: "1",
+});
+
+/** Variables that point git at another repository's files, whatever its cwd. */
+export const GIT_REPO_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES"] as const;
+
+/**
+ * A fresh copy of the live `process.env`, with `extra` laid over it. A key in
+ * `extra` whose value is `undefined` removes that variable from the child's
+ * environment. Under the test sandbox, `SANDBOX_NO_KEYCHAIN_ENV` comes before
+ * `extra`; outside it nothing is added.
+ */
+export function childEnv(extra?: Readonly<ChildEnv>): ChildEnv {
+  const env: ChildEnv = { ...process.env, ...(process.env.PLANNOTATOR_TEST_SANDBOX ? SANDBOX_NO_KEYCHAIN_ENV : {}) };
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      if (value === undefined) delete env[key];
+      else env[key] = value;
+    }
+  }
+  return env;
+}
+
+/**
+ * Whether this process runs inside an agent Plannotator's Ask AI started:
+ * `PLANNOTATOR_ASK_AI_CHILD` is exactly "1" (set by `askAiChildEnv` in
+ * packages/ai/providers/ask-ai-env.ts). There, Plannotator's own integration
+ * stands down: the Inbox MCP shim lists no tools, the plan-review hook exits
+ * 0, and the OpenCode plugin registers nothing. Any other value, or none, is
+ * a person's session and changes nothing.
+ */
+export function isAskAiChild(env: Readonly<ChildEnv> = process.env): boolean {
+  return env.PLANNOTATOR_ASK_AI_CHILD === "1";
+}
+
+/**
+ * The live PATH, for `Bun.which(command, { PATH: childPath() })`: without the
+ * option Bun.which searches the startup PATH.
+ */
+export function childPath(): string {
+  return process.env.PATH ?? "";
+}

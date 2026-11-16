@@ -19,13 +19,14 @@
  * PNGs, light and dark, land in .local/proof/settings/.
  */
 
-import { devices, expect, test, webkit, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import { devices, expect, test, webkit, type Browser, type BrowserContext, type Page } from './inbox-test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { SimAgent } from '../../scripts/inbox-sim';
 import { E2E_MAGIC, fakeTailscale } from './fake-tailscale';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { NO_BROWSER } from '../helpers/no-browser';
 
 const repo = resolve(__dirname, '../..');
 const binary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
@@ -60,7 +61,7 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   mkdirSync(proofDir, { recursive: true });
   const root = inboxScratch('plannotator-inbox-settings-e2e-');
   const ts = fakeTailscale(join(root, 'ts'));
-  const env = { PATH: `${ts}:${process.env.PATH ?? ''}`, HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
+  const env = { PATH: `${ts}:${process.env.PATH ?? ''}`, HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: NO_BROWSER, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   // One agent thread, so "← Inbox" has somewhere to return to.
@@ -101,22 +102,25 @@ test('desktop: a focused page with a section nav; addresses, keyboard, focus, Ba
   await expect.poll(() => sidebarState(page)).toBe('collapsed');
   expect(await sidebarCookie(context)).toBe(cookieBefore);
   const nav = page.getByRole('navigation', { name: 'Settings sections' });
-  await expect(nav.getByRole('link')).toHaveText(['General', 'Agents', 'Devices', 'Archived', 'Storage', 'About']);
+  await expect(nav.getByRole('link')).toHaveText(['General', 'Rows', 'Agents', 'Prompts', 'Remote devices', 'Machines', 'Accounts', 'Voice', 'Capabilities', 'Activity', 'Archived', 'Storage', 'About']);
   await expect(nav.getByRole('link', { name: 'General' })).toHaveAttribute('aria-current', 'page');
   await shot(page, 'general');
 
   // The keyboard: Tab to a section link, Enter follows it, focus lands on the new heading.
   await nav.getByRole('link', { name: 'General' }).focus();
   await page.keyboard.press('Tab');
-  await expect(nav.getByRole('link', { name: 'Agents' })).toBeFocused();
+  await expect(nav.getByRole('link', { name: 'Rows' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(nav.getByRole('link', { name: 'Agents', exact: true })).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(page).toHaveURL(/#settings\/agents$/);
   await expect(page.getByRole('heading', { name: 'Agents', level: 1 })).toBeFocused();
-  await expect(nav.getByRole('link', { name: 'Agents' })).toHaveAttribute('aria-current', 'page');
+  await expect(nav.getByRole('link', { name: 'Agents', exact: true })).toHaveAttribute('aria-current', 'page');
   await shot(page, 'agents');
 
   for (const [name, check] of [
-    ['Devices', '[data-settings-phones]'],
+    ['Prompts', '[data-prompts-page]'],
+    ['Remote devices', '[data-settings-phones]'],
     ['Archived', '[data-settings-archived]'],
     ['Storage', '[data-store-bytes]'],
     ['About', '[data-settings-about]'],
@@ -158,13 +162,13 @@ test('iPhone (WebKit): the list of sections, a section with ‹ Settings, and Pa
     await page.goto(`${world.url}#settings`);
     const list = page.locator('[data-settings-list]');
     await expect(list.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await expect(list.getByRole('link')).toHaveCount(6);
+    await expect(list.getByRole('link')).toHaveCount(13);
     await expect(page.locator('.ib-snav')).toHaveCount(0);
     await shot(page, 'phone-1-list');
 
-    await list.getByRole('link', { name: /Devices/ }).click();
+    await list.getByRole('link', { name: /Remote devices/ }).click();
     await expect(page).toHaveURL(/#settings\/devices$/);
-    await expect(page.getByRole('heading', { name: 'Devices', level: 1 })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Remote devices', level: 1 })).toBeVisible();
     const back = page.locator('.ib-sphead .ib-pback');
     await expect(back).toContainText('Settings');
     await shot(page, 'phone-2-devices');

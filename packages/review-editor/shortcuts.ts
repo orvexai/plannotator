@@ -13,8 +13,10 @@ import {
   reviewSuggestionModalShortcuts,
   reviewTourDialogShortcuts,
   reviewMarkdownPreviewShortcuts,
+  reviewExplorerShortcuts,
   type ShortcutSurface,
 } from '@plannotator/ui/shortcuts';
+import { reviewCallTreeShortcuts } from './components/callTree/callTree.shortcuts';
 
 export const reviewEditorShortcuts = defineShortcutScope({
   id: 'review-editor',
@@ -26,6 +28,13 @@ export const reviewEditorShortcuts = defineShortcutScope({
       section: 'Actions',
       hint: 'Fires the adaptive header primary: Approve with no annotations, Send Feedback otherwise.',
       displayOrder: 10,
+    },
+    openDecisionNote: {
+      description: 'Send with a note',
+      bindings: ['Mod+Shift+Enter'],
+      section: 'Actions',
+      hint: 'Opens the note composer of the send menu; Mod+Enter then sends the review and note together.',
+      displayOrder: 15,
     },
     copyFeedback: {
       description: 'Copy feedback to clipboard',
@@ -105,6 +114,20 @@ export const reviewEditorShortcuts = defineShortcutScope({
       hint: 'Available when staging is supported (not in PR review mode).',
       displayOrder: 20,
     },
+    nextChange: {
+      description: 'Next change',
+      bindings: ['N'],
+      section: 'File Navigation',
+      hint: 'Scrolls to the next run of changed lines: in the open file, or in All files across the expanded files. Collapsed files and Markdown files shown rendered are skipped.',
+      displayOrder: 50,
+    },
+    prevChange: {
+      description: 'Previous change',
+      bindings: ['Shift+N'],
+      section: 'File Navigation',
+      hint: 'Scrolls to the previous run of changed lines.',
+      displayOrder: 60,
+    },
   },
 });
 
@@ -116,6 +139,8 @@ export const reviewSettingsShortcutRegistry = createShortcutRegistry([
   decisionControlShortcuts,
   historyShortcuts,
   reviewFileTreeShortcuts,
+  reviewExplorerShortcuts,
+  reviewCallTreeShortcuts,
   reviewAllFilesDiffShortcuts,
   reviewMarkdownPreviewShortcuts,
   reviewAnnotationToolbarShortcuts,

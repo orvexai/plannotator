@@ -18,8 +18,9 @@
 
 import { useEffect, useRef } from 'react';
 import type { InboxMessageWire } from '@plannotator/core/inbox-types';
-import { isPersonReply } from './folding';
+import { isPersonLook } from './folding';
 import { pageInFront } from './sound';
+import { usePaneScope } from './panes/scope';
 
 /** How long the first lines must stay on screen. */
 export const SEEN_DWELL_MS = 1000;
@@ -108,7 +109,7 @@ export function latestAgentSeq(thread: { messages: readonly InboxMessageWire[] }
 export function unseenArrivals(messages: readonly InboxMessageWire[], through: number | null): InboxMessageWire[] {
   if (through === null) return [];
   let floor = through;
-  for (const message of messages) if (isPersonReply(message) && typeof message.seq === 'number') floor = Math.max(floor, message.seq);
+  for (const message of messages) if (isPersonLook(message) && typeof message.seq === 'number') floor = Math.max(floor, message.seq);
   return messages.filter((m) => m.author.kind === 'agent' && typeof m.seq === 'number' && m.seq > floor);
 }
 
@@ -164,7 +165,7 @@ function entranceShift(article: HTMLElement): number {
 export function measureFirstLines(article: HTMLElement): FirstLines {
   const shift = entranceShift(article);
   const box = article.getBoundingClientRect();
-  const sender = article.querySelector<HTMLElement>('.ib-sender, .ib-fline');
+  const sender = article.querySelector<HTMLElement>('.ib-fline');
   const head = sender?.getBoundingClientRect() ?? null;
   return firstLines({ top: box.top - shift, bottom: box.bottom - shift }, head ? head.top - shift : null, head ? head.bottom - shift : null);
 }
@@ -199,10 +200,12 @@ export interface SeenOnSightOptions {
 /**
  * Watches the candidates and calls `onSeen` for each once its first lines
  * have been on screen for SEEN_DWELL_MS in a row with the window in front and
- * the thread uncovered. Any break (scrolled away, the tab hidden, the window
- * behind, a cover) restarts that message's dwell.
+ * the thread uncovered, in the active pane (panes/model.ts). Any break (scrolled
+ * away, the tab hidden, the window behind, a cover, another pane made active)
+ * restarts that message's dwell.
  */
-export function useSeenOnSight({ bodyRef, candidates, covered, pill, onSeen }: SeenOnSightOptions): void {
+export function useSeenOnSight({ bodyRef, candidates, covered: cover, pill, onSeen }: SeenOnSightOptions): void {
+  const covered = cover || !usePaneScope().active;
   const onSeenRef = useRef(onSeen);
   onSeenRef.current = onSeen;
   const state = useRef({ covered, pill });

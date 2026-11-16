@@ -23,10 +23,26 @@ export interface OctarineConfig {
 	folder: string;
 }
 
+export interface NotionConfig {
+	plan: string;
+	parentPageId: string;
+}
+
 export interface IntegrationResult {
 	success: boolean;
 	error?: string;
 	path?: string;
+	url?: string;
+}
+
+/**
+ * Whether an Obsidian folder setting would leave the vault: any `..` segment
+ * (either separator) does. The folder is a path INSIDE the vault ("plannotator",
+ * "Projects/plans"); `join(vault, "../x")` would otherwise write beside it.
+ * A leading separator is harmless (`join` keeps it inside the vault).
+ */
+export function obsidianFolderEscapesVault(folder: string): boolean {
+	return folder.split(/[\\/]+/).some((segment) => segment.trim() === "..");
 }
 
 /**

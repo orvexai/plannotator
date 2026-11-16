@@ -37,12 +37,14 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { decryptWithKey, deriveRelayKeys, encryptWithKey } from "@plannotator/core/crypto";
-import { inboxAgentName } from "@plannotator/core/inbox-types";
+import { decryptWithKey, deriveRelayKeys, deriveRelaySignalToken, encryptWithKey } from "@plannotator/core/crypto";
+import { displayInboxSubject, inboxAgentName } from "@plannotator/core/inbox-types";
 import { sha256Hex, type InboxDevice, type InboxDevices } from "@plannotator/shared/inbox/devices";
 import { inboxDir } from "@plannotator/shared/inbox/schema";
 import type { InboxLine } from "@plannotator/core/inbox-types";
 import type { InboxStore } from "@plannotator/shared/inbox/store";
+import { createInboxAgentRelayApplied } from "./inbox-agent-relay-applied";
+import { AGENT_PLATFORM } from "./inbox-devices";
 
 export const DEFAULT_RELAY_URL = "https://relay.plannotator.ai";
 export const INBOX_RELAY_FILE = "relay.json";
@@ -60,6 +62,21 @@ const APNS_BODY_LIMIT = 4096;
 const WEBSOCKET_MESSAGE_LIMIT = 32 * 1024 * 1024;
 /** The largest answer body the relay reads: base64 makes it 4/3 larger, so a larger one cannot fit one frame. */
 export const RELAY_BODY_LIMIT = Math.floor((WEBSOCKET_MESSAGE_LIMIT * 3) / 4);
+
+/**
+ * One command's result item as it goes up the socket: the answer's bytes as
+ * base64 inside the JSON result, sealed under the phone's key (AES-GCM, then
+ * base64url). Two base64 layers, so a body of n bytes makes a frame of about
+ * 16n/9: a message image at the 10 MB cap (MAX_REVIEW_IMAGE_PREVIEW_BYTES)
+ * is a frame of about 17.8 MiB, inside WEBSOCKET_MESSAGE_LIMIT.
+ */
+export async function sealRelayResult(deviceId: string, id: string, status: number, contentType: string, bytes: Buffer, key: string): Promise<string> {
+  const result = { v: 1, type: "result", id, status, content_type: contentType, body_b64: bytes.toString("base64") };
+  return JSON.stringify({ type: "item", device_id: deviceId, cursor: null, ciphertext: await encryptWithKey(JSON.stringify(result), key) });
+}
+
+/** Cloudflare's WebSocket message limit, exported for the bounds test. */
+export const RELAY_WEBSOCKET_MESSAGE_LIMIT = WEBSOCKET_MESSAGE_LIMIT;
 
 /**
  * An answer's body, or null when it is larger than `cap`: refused from its
@@ -197,6 +214,19 @@ interface CommandPlaintext {
   body?: unknown;
 }
 
+export interface InboxAgentCommandPlaintext {
+  v: 1;
+  type: "agent_call";
+  id: string;
+  tool: string;
+  arguments: unknown;
+}
+
+export interface InboxRelayAgents {
+  apply: (deviceId: string, request: { tool: string; arguments: unknown }, commandId: string) => Promise<Response>;
+  signalsFor: (line: InboxLine) => string[];
+}
+
 export interface InboxRelayContext {
   dataDir: string;
   store: InboxStore;
@@ -209,17 +239,24 @@ export interface InboxRelayContext {
   url?: string;
   /** One line per event, ids and status codes only (the Inbox's log). */
   log?: (line: string) => void;
+  phones?: boolean;
+  agents?: InboxRelayAgents;
 }
 
 export function createInboxRelay(context: InboxRelayContext) {
   const log = context.log ?? ((line: string) => process.stderr.write(`relay: ${line}\n`));
   const { store, devices } = context;
+  const phonesOn = context.phones !== false;
+  const isAgent = (deviceId: string) => devices.get(deviceId)?.platform === AGENT_PLATFORM;
+  const applied = context.agents ? createInboxAgentRelayApplied(context.dataDir) : null;
+  const served = () => devices.list().filter((device) => (device.platform === AGENT_PLATFORM ? context.agents !== undefined : phonesOn));
   let mailbox = readRelayFile(context.dataDir);
   let making: Promise<InboxRelayFile | null> | null = null;
   let socket: WebSocket | null = null;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let delay = RECONNECT_FIRST_MS;
   let stopped = false;
+  let reachable: boolean | null = null;
   let unsubscribe: (() => void) | null = null;
   /** Per phone with carriage on, on this socket: the store seq its items have reached. Cleared on each new socket. */
   const sent = new Map<string, number>();
@@ -247,6 +284,7 @@ export function createInboxRelay(context: InboxRelayContext) {
         const answer = await call("POST", "/v1/mailboxes", null, { secret_sha256: sha256Hex(secret) }, url);
         if (answer.status !== 201) {
           log(`mailbox not made: ${answer.status}`);
+          reachable = false;
           return null;
         }
         const { mailbox_id } = (await answer.json()) as { mailbox_id: string };
@@ -256,6 +294,7 @@ export function createInboxRelay(context: InboxRelayContext) {
         return mailbox;
       } catch (error) {
         log(`mailbox not made: ${error instanceof Error ? error.message : String(error)}`);
+        reachable = false;
         return null;
       } finally {
         making = null;
@@ -272,8 +311,13 @@ export function createInboxRelay(context: InboxRelayContext) {
     if (!mailbox || !secret) return;
     const { relaySecret } = await deriveRelayKeys(secret, device.id);
     const cursor = store.cursor();
-    const answer = await call("PUT", mailboxPath(`/devices/${device.id}`), mailbox.secret, { secret_sha256: sha256Hex(relaySecret), cursor });
+    const agent = device.platform === AGENT_PLATFORM;
+    const body = agent
+      ? { secret_sha256: sha256Hex(relaySecret), cursor, kind: "agent", signal_sha256: sha256Hex(await deriveRelaySignalToken(secret, device.id)) }
+      : { secret_sha256: sha256Hex(relaySecret), cursor };
+    const answer = await call("PUT", mailboxPath(`/devices/${device.id}`), mailbox.secret, body);
     log(`register ${device.id} ${answer.status}`);
+    if (agent) return;
     // On an open socket the phone is carried from here; otherwise the next hello lists it with this cursor.
     if (answer.ok && socket?.readyState === WebSocket.OPEN && !sent.has(device.id)) sent.set(device.id, cursor);
   };
@@ -292,15 +336,15 @@ export function createInboxRelay(context: InboxRelayContext) {
       listed.add(entry.device_id);
       const local = devices.get(entry.device_id);
       if (!local || local.revoked_at !== null) await remove(entry.device_id).catch(() => log(`remove ${entry.device_id} failed`));
-      else devices.setCarriage(local.id, entry.carriage, new Date().toISOString());
+      else if (local.platform !== AGENT_PLATFORM && phonesOn) devices.setCarriage(local.id, entry.carriage, new Date().toISOString());
     }
-    for (const device of devices.list()) {
-      if (device.carriage && !listed.has(device.id)) await register(device).catch(() => log(`register ${device.id} failed`));
+    for (const device of served()) {
+      if ((device.carriage || device.platform === AGENT_PLATFORM) && !listed.has(device.id)) await register(device).catch(() => log(`register ${device.id} failed`));
     }
     // Resume each listed phone with carriage on from the cursor the relay holds; a phone registered just now starts at the store's cursor then.
     for (const entry of frame.devices) {
       const local = devices.get(entry.device_id);
-      if (local && local.revoked_at === null && entry.carriage) sent.set(local.id, entry.cursor);
+      if (local && local.revoked_at === null && local.platform !== AGENT_PLATFORM && phonesOn && entry.carriage) sent.set(local.id, entry.cursor);
     }
     for (const id of sent.keys()) void pump(id);
   };
@@ -334,6 +378,10 @@ export function createInboxRelay(context: InboxRelayContext) {
    * line written meanwhile asks for another pass.
    */
   const pump = async (deviceId: string): Promise<void> => {
+    if (isAgent(deviceId)) {
+      sent.delete(deviceId);
+      return;
+    }
     if (pumping.has(deviceId)) {
       again.add(deviceId);
       return;
@@ -380,10 +428,7 @@ export function createInboxRelay(context: InboxRelayContext) {
 
   /** The result item for a command, sealed under the phone's key; past the WebSocket message limit, a 413 in its place. */
   const resultFrame = async (deviceId: string, id: string, answer: Response, key: string): Promise<string> => {
-    const seal = async (status: number, contentType: string, bytes: Buffer) => {
-      const result = { v: 1, type: "result", id, status, content_type: contentType, body_b64: bytes.toString("base64") };
-      return JSON.stringify({ type: "item", device_id: deviceId, cursor: null, ciphertext: await encryptWithKey(JSON.stringify(result), key) });
-    };
+    const seal = (status: number, contentType: string, bytes: Buffer) => sealRelayResult(deviceId, id, status, contentType, bytes, key);
     // base64 grows a body by 4/3 before the JSON and the seal: anything over
     // 3/4 of the frame limit can never fit, so it is refused without being
     // read, and a body without a length is read only up to that bound.
@@ -409,7 +454,47 @@ export function createInboxRelay(context: InboxRelayContext) {
    * applied. A sealed id that is not the relay's frame id is refused: the
    * relay must not be able to file one command's result under another's id.
    */
+  const openAgentCommand = async (frame: CommandFrame, upKey: string): Promise<InboxAgentCommandPlaintext | null> => {
+    try {
+      const opened = JSON.parse(await decryptWithKey(frame.ciphertext, upKey)) as InboxAgentCommandPlaintext;
+      return opened?.v === 1 && opened.type === "agent_call" && typeof opened.id === "string" && typeof opened.tool === "string" ? opened : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const onAgentCommand = async (frame: CommandFrame): Promise<void> => {
+    const secret = devices.secret(frame.device_id);
+    const keys = secret && context.agents ? await deriveRelayKeys(secret, frame.device_id) : null;
+    const opened = keys ? await openAgentCommand(frame, keys.upKey) : null;
+    if (keys && opened && opened.id === frame.id) {
+      const repeat = applied?.answerOf(frame.device_id, opened.id) ?? null;
+      let answer: Response;
+      if (repeat) {
+        log(`agent command ${frame.device_id} repeated`);
+        answer = repeat;
+      } else {
+        const first = await context.agents!.apply(frame.device_id, { tool: opened.tool, arguments: opened.arguments }, opened.id);
+        const body = await first.text();
+        applied?.record(frame.device_id, opened.id, first.status, body);
+        log(`agent command ${frame.device_id} ${first.status}`);
+        answer = new Response(body, { status: first.status, headers: { "Content-Type": first.headers.get("content-type") ?? "application/json; charset=utf-8" } });
+      }
+      const item = await resultFrame(frame.device_id, opened.id, answer, keys.key);
+      if (socket && socket.readyState === WebSocket.OPEN) socket.send(item);
+    } else {
+      log(`agent command ${frame.device_id} refused`);
+    }
+    send({ type: "applied", device_id: frame.device_id, id: frame.id });
+  };
+
   const onCommand = async (frame: CommandFrame): Promise<void> => {
+    if (isAgent(frame.device_id)) return onAgentCommand(frame);
+    if (!phonesOn) {
+      log(`command ${frame.device_id} refused`);
+      send({ type: "applied", device_id: frame.device_id, id: frame.id });
+      return;
+    }
     const secret = devices.secret(frame.device_id);
     const keys = secret ? await deriveRelayKeys(secret, frame.device_id) : null;
     const opened = keys ? await openCommand(frame, keys.upKey) : null;
@@ -440,6 +525,7 @@ export function createInboxRelay(context: InboxRelayContext) {
       delay = RECONNECT_FIRST_MS;
       await onHello(frame);
     } else if (frame?.type === "carriage" && typeof frame.device_id === "string" && typeof frame.on === "boolean") {
+      if (isAgent(frame.device_id) || !phonesOn) return;
       devices.setCarriage(frame.device_id, frame.on, new Date().toISOString());
       // On: resume after the cursor the phone holds. Off: nothing more goes to it.
       if (frame.on && typeof frame.cursor === "number") {
@@ -455,11 +541,16 @@ export function createInboxRelay(context: InboxRelayContext) {
 
   /** The one socket, open while the mailbox has a paired phone; it reconnects when it drops. */
   const connect = () => {
-    if (stopped || socket || retry || !mailbox || devices.list().length === 0) return;
+    if (stopped || socket || retry || !mailbox || served().length === 0) return;
     const url = `${mailbox.url.replace(/^http/, "ws")}${mailboxPath("/socket")}`;
     // Bun's WebSocket takes headers: the Inbox's bearer goes in Authorization, never in the URL.
     const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${mailbox.secret}` } } as unknown as string[]);
     socket = ws;
+    let opened = false;
+    ws.onopen = () => {
+      opened = true;
+      reachable = true;
+    };
     ws.onmessage = (event) => {
       if (typeof event.data !== "string") return;
       const text = event.data;
@@ -467,9 +558,10 @@ export function createInboxRelay(context: InboxRelayContext) {
     };
     ws.onclose = () => {
       if (socket !== ws) return;
+      if (!opened) reachable = false;
       socket = null;
       sent.clear();
-      if (stopped || devices.list().length === 0) return;
+      if (stopped || served().length === 0) return;
       retry = setTimeout(() => {
         retry = null;
         connect();
@@ -499,15 +591,15 @@ export function createInboxRelay(context: InboxRelayContext) {
     const questions = store.questionsOf(messageId);
     const supersedes = store.supersededBy(messageId).length > 0;
     if (questions.length === 0 && !message.guide && !supersedes) return;
-    // Only an open question is ever offered for a lock-screen answer.
-    const open = questions.filter((q) => q.state === "open");
+    // Only an open question is ever offered for a lock-screen answer (an action item, `kind: "action"`, pushes like one but has no lock-screen Done).
+    const open = questions.filter((q) => q.state === "open" && q.kind !== "action");
     const only = open.length === 1 ? open[0]! : null;
     const summary: PushPlaintext = {
       v: 1,
       type: "push",
       thread_id: message.thread_id,
       message_id: message.id,
-      subject: store.threadSubject(message.thread_id) ?? message.subject ?? "",
+      subject: store.threadSubject(message.thread_id) ?? displayInboxSubject(message.subject) ?? "",
       project: store.project(message.project_id)?.name ?? "",
       agent: inboxAgentName(message.author),
       // Apple shows at most four actions: one single-choice question with up to four choices is answered from the lock screen.
@@ -522,8 +614,9 @@ export function createInboxRelay(context: InboxRelayContext) {
             }
           : null,
     };
+    if (!phonesOn) return;
     for (const device of devices.list()) {
-      if (!device.carriage) continue;
+      if (!device.carriage || device.platform === AGENT_PLATFORM) continue;
       const secret = devices.secret(device.id);
       if (!secret) continue;
       try {
@@ -538,6 +631,12 @@ export function createInboxRelay(context: InboxRelayContext) {
         log(`push ${message.id} ${device.id} failed: ${error instanceof Error ? error.name : "error"}`);
       }
     }
+  };
+
+  const signal = async (deviceId: string): Promise<void> => {
+    if (!mailbox || !isAgent(deviceId)) return;
+    const answer = await call("POST", mailboxPath(`/devices/${deviceId}/signal`), mailbox.secret).catch(() => null);
+    log(`signal ${deviceId} ${answer?.status ?? "failed"}`);
   };
 
   return {
@@ -555,12 +654,15 @@ export function createInboxRelay(context: InboxRelayContext) {
       // One that fails here is removed when the socket next says hello.
       sent.delete(device.id);
       void remove(device.id).catch(() => log(`remove ${device.id} failed`));
-      if (devices.list().length === 0) disconnect();
+      if (served().length === 0) disconnect();
     },
+    signal,
+    reachable: (): boolean | null => (served().some((device) => device.platform === AGENT_PLATFORM && device.revoked_at === null) ? reachable : null),
     start(): void {
       unsubscribe = store.subscribe((line) => {
         // Every line goes down to each phone this socket is carrying.
         for (const id of sent.keys()) void pump(id);
+        if (context.agents && mailbox) for (const id of context.agents.signalsFor(line)) void signal(id);
         // A message's first line: `at` is its `created_at`. Its questions are written in the same turn, so they are read after it.
         if (line.kind !== "message" || line.record.author.kind !== "agent" || line.at !== line.record.created_at) return;
         const id = line.record.id;

@@ -87,13 +87,13 @@ let taken = false;
 
 /**
  * The only place a result record may be written: a `result.json` inside the
- * host's launch area of the data dir (`claude-code-mod/` or `t3-code/`). Anything
- * else is refused, so the variable can never be used to make the CLI create
+ * host's launch area of the data dir (`claude-code-mod/`, `t3-code/`, or `dsh/`
+ * for the DeepSeek Harness plugin). Anything else is refused, so the variable can never be used to make the CLI create
  * or replace an arbitrary file.
  */
 export function isAllowedHostResultPath(path: string, dataDir: string = getPlannotatorDataDir()): boolean {
   if (!isAbsolute(path) || basename(path) !== "result.json") return false;
-  return ["claude-code-mod", "t3-code"].some((host) => resolve(path).startsWith(resolve(dataDir, host) + sep));
+  return ["claude-code-mod", "t3-code", "dsh"].some((host) => resolve(path).startsWith(resolve(dataDir, host) + sep));
 }
 
 /** Read the side-channel path once and scrub it from the environment. */
@@ -165,9 +165,11 @@ function reviewHostRecord(result: ReviewOutcomeLike, output: ReviewOutput): Host
     return { v: 1, surface: "review", decision: "dismissed", message: "", noop: true, annotationCount: 0, ...closedByFields(result) };
   }
   if (output.decision === "approved") {
-    // A bare approval (LGTM) carries nothing the agent must act on.
+    // A bare approval (LGTM) carries nothing the agent must act on, so it is
+    // `noop`; its message is still the configured approved prompt (as for an
+    // annotate approval), which a gated review (#1907) delivers.
     const noop = !hasFeedback;
-    return { v: 1, surface: "review", decision: "approved", message: noop ? "" : output.message, noop, annotationCount };
+    return { v: 1, surface: "review", decision: "approved", message: output.message, noop, annotationCount };
   }
   // The platform path's status post (the review went to GitHub/GitLab/
   // Bitbucket): the review server marks it `platform: true`. Never inferred
