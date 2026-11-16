@@ -7,9 +7,10 @@ name: Deploy
 # starts this workflow, but every job below skips it, so no code from a PR ever
 # runs next to the deploy secrets.
 on:
-  push:
-    tags:
-    - '**'
+  workflow_run:  # zizmor: ignore[dangerous-triggers] Gated to push runs on main of this repository; PR runs skip every job.
+    workflows: [Test]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       target:
@@ -18,11 +19,10 @@ on:
         default: 'all'
         type: choice
         options:
-        - all
-        - marketing
-        - portal
-        - paste
-        - waitlist
+          - all
+          - marketing
+          - portal
+          - waitlist
 
 permissions:
   contents: read
@@ -137,7 +137,7 @@ jobs:
 
   deploy-marketing:
     needs: detect-changes
-    if: needs.detect-changes.outputs.marketing == 'true'
+    if: github.repository == 'orvexai/plannotator' && needs.detect-changes.outputs.marketing == 'true'
     # One deploy of a site at a time, queued and never cancelled, so two never
     # sync over each other. The group is on the deploy jobs, not the workflow:
     # a skipped Deploy run (a failed Test, a PR) must not replace a pending one.
@@ -215,7 +215,7 @@ jobs:
   # release runbook's post-release checklist for the exact commands.
   deploy-portal:
     needs: detect-changes
-    if: needs.detect-changes.outputs.portal == 'true'
+    if: github.repository == 'orvexai/plannotator' && needs.detect-changes.outputs.portal == 'true'
     concurrency:
       group: deploy-portal
       cancel-in-progress: false
@@ -255,9 +255,10 @@ jobs:
             --distribution-id EP0KB9EFUWYXR \
             --paths "/*"
 
+  # Disabled in the Orvex fork; this job publishes to upstream's paste worker.
   deploy-paste:
     needs: detect-changes
-    if: needs.detect-changes.outputs.paste == 'true'
+    if: false
     concurrency:
       group: deploy-paste
       cancel-in-progress: false
@@ -287,7 +288,7 @@ jobs:
 
   deploy-waitlist:
     needs: detect-changes
-    if: needs.detect-changes.outputs.waitlist == 'true'
+    if: github.repository == 'orvexai/plannotator' && needs.detect-changes.outputs.waitlist == 'true'
     concurrency:
       group: deploy-waitlist
       cancel-in-progress: false
