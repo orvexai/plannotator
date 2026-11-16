@@ -52,6 +52,13 @@ describe('Artifact Server CLI sharing', () => {
     expect(result.artifactId).toBe('art-1');
   });
 
+  it('publishes content when the CLI returns a tenant review link', async () => {
+    const result = await publishToArtifactServer('# Plan', 'Example plan', 'https://artifacts.orvex.ai', async () => ({
+      stdout: JSON.stringify({ artifact: { id: 'art-1', projectId: 'proj-1' }, version: { id: 'ver-1' }, links: { review: 'https://artifacts.orvex.ai/o/team-1/review?artifact=art-1&project=proj-1&version=ver-1' } }),
+    }));
+    expect(result.reviewUrl).toContain('/o/team-1/review?');
+  });
+
   it('reads comments for the exact configured Artifact Server review', async () => {
     let args: string[] = [];
     const result = await readArtifactServerComments('https://artifacts.orvex.ai/review?artifact=art-1&project=proj-1&version=ver-1', 'https://artifacts.orvex.ai', async (received) => {
@@ -62,6 +69,39 @@ describe('Artifact Server CLI sharing', () => {
     expect(args).toContain('--include-replies');
     expect(args).toContain('ver-1');
     expect(result.comments[0]?.body).toBe('Please revise');
+  });
+
+  it('reads comments from a tenant review link', async () => {
+    const result = await readArtifactServerComments('https://artifacts.orvex.ai/o/team-1/review?artifact=art-1&project=proj-1&version=ver-1', 'https://artifacts.orvex.ai', async () => ({
+      stdout: JSON.stringify({ items: [] }),
+    }));
+    expect(result.comments).toEqual([]);
+  });
+
+  it('accepts the maximum tenant slug length', async () => {
+    const slug = `a${'b'.repeat(38)}`;
+    const result = await readArtifactServerComments(`https://artifacts.orvex.ai/o/${slug}/review?artifact=a&project=p&version=v`, 'https://artifacts.orvex.ai', async () => ({
+      stdout: JSON.stringify({ items: [] }),
+    }));
+    expect(result.comments).toEqual([]);
+  });
+
+  it('rejects tenant review paths whose slug does not match the exact format', async () => {
+    const invalidPaths = [
+      '/o/a/review',
+      '/o/Team-1/review',
+      '/o/team_1/review',
+      '/o/-team/review',
+      `/o/${'a'.repeat(40)}/review`,
+      '/o/team-1/extra/review',
+    ];
+    for (const pathname of invalidPaths) {
+      await expect(readArtifactServerComments(
+        `https://artifacts.orvex.ai${pathname}?artifact=a&project=p&version=v`,
+        'https://artifacts.orvex.ai',
+        async () => ({ stdout: JSON.stringify({ items: [] }) }),
+      )).rejects.toThrow('Paste a Review link');
+    }
   });
 
   it('refuses Review URLs outside the configured server', async () => {
