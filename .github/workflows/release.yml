@@ -1628,7 +1628,8 @@ jobs:
       - smoke-binaries
       - pi-extension-ai-runtime-windows
       - install-script-smoke
-    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs['dry-run'] == 'false'))
+    # The Orvex fork never publishes packages to npm.
+    if: github.repository == 'backnotprop/plannotator' && startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs['dry-run'] == 'false'))
     runs-on: ubuntu-24.04
     environment: npm-publish
     permissions:
