@@ -30,6 +30,10 @@ function notLoggedIn(args: string[]): string {
 
 const PROJECT_REQUIRED = 'Artifact Server has several projects; set PLANNOTATOR_ARTIFACT_SERVER_PROJECT to the project ID to share into.';
 
+function isArtifactReviewPath(pathname: string): boolean {
+  return pathname === '/review' || /^\/o\/[a-z0-9][a-z0-9-]{1,38}\/review$/.test(pathname);
+}
+
 function cliFailure(args: string[], stderr: string, exitCode: number | null): Error {
   const operation = args[0] === 'comments' ? 'comments' : 'publish';
   if (isAuthenticationFailure(stderr)) return new ArtifactServerCliError(notLoggedIn(args));
@@ -80,7 +84,7 @@ export async function publishToArtifactServer(
       throw new Error('Artifact Server CLI returned an incomplete publish response.');
     }
     const review = new URL(publication.links.review);
-    if (review.origin !== origin || review.pathname !== '/review') {
+    if (review.origin !== origin || !isArtifactReviewPath(review.pathname)) {
       throw new Error('Artifact Server CLI returned a review link outside the configured server.');
     }
     return {
@@ -101,7 +105,7 @@ export async function readArtifactServerComments(
 ): Promise<{ title: string; comments: ArtifactComment[] }> {
   const origin = normalizeArtifactServerUrl(serverUrl);
   const review = new URL(reviewUrl);
-  if (review.origin !== origin || review.pathname !== '/review') {
+  if (review.origin !== origin || !isArtifactReviewPath(review.pathname)) {
     throw new Error(`Paste a Review link from ${origin}.`);
   }
   const artifactId = review.searchParams.get('artifact');
