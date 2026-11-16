@@ -19,56 +19,68 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
+    timeout-minutes: 30
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7.0.0
-      with:
-        persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
-    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6   # v2.2.0
-      with:
-        bun-version: 1.3.14
-        no-cache: true
+      # setup-bun downloads Bun without a token, and with no cache here it would
+      # do so on every run: install it first from an authenticated, checksummed
+      # download, which setup-bun then finds in place.
+      - name: Install Bun 1.4.4 (authenticated download)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-install-bun.sh 1.4.4
 
-    - name: Install dependencies
-      run: bun install --frozen-lockfile
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+          no-cache: true
 
-    - name: Format compatibility (every shipped fixture parses) + worker tests
-      run: bun test ./packages/core/guide-format.test.ts 
-        ./apps/guides-show/worker ./apps/guides-show/share 
-        ./apps/guides-show/viewer
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
-    - name: Build viewer
-      run: bun run --cwd apps/guides-show build:viewer
+      - name: Format compatibility (every shipped fixture parses) + worker tests
+        run: bun test ./packages/core/guide-format.test.ts ./apps/guides-show/worker ./apps/guides-show/share ./apps/guides-show/viewer ./apps/guides-show/build
 
-    - name: Size budgets
-      run: bun run --cwd apps/guides-show check:budgets
+      - name: Build viewer
+        run: bun run --cwd apps/guides-show build:viewer
 
-    - name: Checked-in manifest matches this build
-      run: bun run --cwd apps/guides-show check:manifest
+      - name: Size budgets
+        run: bun run --cwd apps/guides-show check:budgets
 
-    - name: Publish viewer files to R2 (add-only)
-      run: bun run --cwd apps/guides-show deploy:viewer
-      env:
-        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # The Worker bundles the viewer pin as its fallback for uploads that
+      # send none. The pin is generated, not committed: pin this build.
+      - name: Pin the Worker to this build
+        run: bun run --cwd apps/guides-show sync:manifest
 
-    - name: Deploy worker + landing
-      working-directory: apps/guides-show
-      run: bunx wrangler deploy
-      env:
-        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Publish viewer files to R2 (add-only)
+        id: publish
+        run: bun run --cwd apps/guides-show deploy:viewer
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-    - name: Smoke the published viewer entry
-      run: |
-        JS=$(bun -e "import { GUIDE_VIEWER_MANIFEST } from './packages/core/guide-viewer-manifest.ts'; console.log(GUIDE_VIEWER_MANIFEST.js)")
-        curl -fsSI "https://guides.show/v1/$JS" | tee /tmp/headers.txt
-        grep -qi 'cache-control: public, max-age=31536000, immutable' /tmp/headers.txt
-        grep -qi 'access-control-allow-origin: \*' /tmp/headers.txt
+      - name: Deploy worker + landing
+        working-directory: apps/guides-show
+        run: bunx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
-      with:
-        name: guides-show-viewer-manifest
-        path: apps/guides-show/dist/viewer/manifest.json
+      # Every file of this build (entries, worker, chunks/, assets) must answer
+      # on guides.show, and the entry must carry the immutable cache and CORS
+      # headers. Runs whenever the publish step succeeded, even when the Worker
+      # deploy failed, so a partial publish never passes unnoticed.
+      - name: Smoke the published viewer (every file + entry headers)
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        run: bun run --cwd apps/guides-show verify:viewer
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: guides-show-viewer-manifest
+          path: apps/guides-show/dist/viewer/manifest.json

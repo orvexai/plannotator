@@ -65,7 +65,7 @@ const shot = file('att_01K7AAAAAAAAAAAAAAAAAAAAAA', 'checkout.png', 'image', { m
 const spec = file('att_01K7BBBBBBBBBBBBBBBBBBBBBB', 'payments-api.pdf', 'pdf', { media_type: 'application/pdf' });
 const zip = file('att_01K7CCCCCCCCCCCCCCCCCCCCCC', 'fixtures.zip', 'file');
 // A kind a newer Inbox might write: this window treats it as a file to download.
-const future = file('att_01K7DDDDDDDDDDDDDDDDDDDDDD', 'clip.mov', 'video');
+const future = file('att_01K7DDDDDDDDDDDDDDDDDDDDDD', 'clip.holo', 'hologram');
 
 test.skipIf(!hasDom)('an image shows inline in the message and as a tile with its thumbnail, both from its image route', async () => {
   const opened: string[] = [];
@@ -74,14 +74,39 @@ test.skipIf(!hasDom)('an image shows inline in the message and as a tile with it
   const inline = host!.querySelector<HTMLButtonElement>(`[data-gallery-image="${shot.id}"]`)!;
   expect(inline).not.toBeNull();
   // (happy-dom fails every image load, so the frame's src is read off the frame.)
-  expect(inline.querySelector('.ib-gal-frame')!.getAttribute('data-src')).toBe(route);
+  // A frame is a few hundred pixels wide: the 1280-wide picture loads as a copy 800 wide.
+  expect(inline.querySelector('.ib-gal-frame')!.getAttribute('data-src')).toBe(`${route}?w=800`);
   expect(inline.getAttribute('aria-label')).toBe('View checkout.png, PNG image, 2 comments');
   expect(inline.textContent).toContain('1280 × 800');
   const tile = host!.querySelector<HTMLButtonElement>(`button[data-attachment-id="${shot.id}"]`)!;
-  expect(tile.querySelector('.ib-thumb img')!.getAttribute('src')).toBe(route);
+  // The 30-pixel icon loads a copy 128 wide, not the 1280-wide picture (images.ts `drawnImageUrl`).
+  expect(tile.querySelector('.ib-thumb img')!.getAttribute('src')).toBe(`${route}?w=128`);
   await act(async () => inline.click());
   await act(async () => tile.click());
   expect(opened).toEqual([shot.id, shot.id]);
+});
+
+// A tab with dozens of big screenshots died of decoding them at full size: where the window draws a picture small,
+// it asks for a smaller copy; a picture that is already small, or of unknown size, loads as it is.
+test.skipIf(!hasDom)('the gallery and the tile icons load a big picture as a smaller copy, lazily and decoded async', async () => {
+  const big = file('att_01K7EEEEEEEEEEEEEEEEEEEEEE', 'wide.png', 'image', { media_type: 'image/png', width: 3840, height: 2242 });
+  const small = file('att_01K7FFFFFFFFFFFFFFFFFFFFFF', 'small.png', 'image', { media_type: 'image/png', width: 640, height: 400 });
+  const unknown = file('att_01K7GGGGGGGGGGGGGGGGGGGGGG', 'unknown.png', 'image', { media_type: 'image/png' });
+  await render(<AttachmentTiles attachments={[big, small, unknown]} annotationCounts={new Map()} onOpen={() => {}} />);
+  // (happy-dom fails every image load, so the gallery's src is read off its frame.)
+  const gallery = (a: InboxAttachmentState) => host!.querySelector(`[data-gallery-image="${a.id}"] .ib-gal-frame`)!.getAttribute('data-src');
+  const icon = (a: InboxAttachmentState) => host!.querySelector(`button[data-attachment-id="${a.id}"] .ib-thumb img`)!;
+  const route = (a: InboxAttachmentState) => `/api/inbox/attachments/${a.id}/image`;
+  expect(gallery(big)).toBe(`${route(big)}?w=800`);
+  expect(icon(big).getAttribute('src')).toBe(`${route(big)}?w=128`);
+  expect(gallery(small)).toBe(route(small));
+  expect(icon(small).getAttribute('src')).toBe(`${route(small)}?w=128`);
+  expect(gallery(unknown)).toBe(route(unknown));
+  expect(icon(unknown).getAttribute('src')).toBe(route(unknown));
+  for (const img of host!.querySelectorAll('.ib-thumb img')) {
+    expect(img.getAttribute('loading')).toBe('lazy');
+    expect(img.getAttribute('decoding')).toBe('async');
+  }
 });
 
 test.skipIf(!hasDom)('a PDF, a plain file and an unknown kind are Download links, never opened in the window', async () => {
@@ -126,7 +151,7 @@ test.skipIf(!hasDom)('the image pane draws the image from its route and offers a
       onRemoved={noop}
       onOpenAt={noop}
       onClose={noop}
-      strip={{ picks: 0, annotations: 0, onBack: noop, onWriteReply: noop }}
+      strip={{ picks: 0, annotations: 0, onWriteReply: noop }}
     />,
   );
   expect(host!.querySelector('.ib-imgstage')!.getAttribute('data-src')).toBe(`/api/inbox/attachments/${shot.id}/image`);
@@ -163,7 +188,7 @@ test.skipIf(!hasDom)('a text file too large to show (413 attachment_too_large) o
       onRemoved={noop}
       onOpenAt={noop}
       onClose={noop}
-      strip={{ picks: 0, annotations: 0, onBack: noop, onWriteReply: noop }}
+      strip={{ picks: 0, annotations: 0, onWriteReply: noop }}
     />,
   );
   await act(async () => {
@@ -173,6 +198,85 @@ test.skipIf(!hasDom)('a text file too large to show (413 attachment_too_large) o
   expect(card).not.toBeNull();
   expect(card.querySelector('a[download]')!.getAttribute('href')).toBe(`/api/inbox/attachments/${log.id}/download`);
   expect(host!.querySelector('[role="alert"]')).toBeNull();
+});
+
+function renderPane(attachment: InboxAttachmentState, options: { phone?: boolean; others?: InboxAttachmentState[]; records?: InboxAnnotationRecord[] } = {}) {
+  globalThis.fetch = (async () => new Response('{}', { status: 404 })) as unknown as typeof fetch;
+  const noop = () => {};
+  return render(
+    <AttachmentPane
+      attachment={attachment}
+      attachments={[attachment, ...(options.others ?? [])]}
+      records={options.records ?? []}
+      agent="Claude Code"
+      projectName="api"
+      projectRoot="/work/api"
+      version="current"
+      onVersion={noop}
+      full={options.phone === true}
+      fullLocked={options.phone === true}
+      phone={options.phone}
+      onToggleFull={noop}
+      focusId={null}
+      readOnly={false}
+      onSaved={noop}
+      onRemoved={noop}
+      onOpenAt={noop}
+      onClose={noop}
+      strip={{ picks: 0, annotations: 0, onWriteReply: noop }}
+    />,
+  );
+}
+
+// Rows 47 and 61: a PDF takes no comments, so it has no panel beside it and no Comments count in a phone's full-screen toolbar.
+test.skipIf(!hasDom)('a PDF has no comments panel or Comments button, unless other files have comments to list', async () => {
+  await renderPane(spec);
+  expect(host!.querySelector('[data-attachment-pane]')!.classList.contains('ib-nopanel')).toBe(true);
+  act(() => root!.unmount());
+  host!.remove();
+
+  await renderPane(spec, { phone: true });
+  expect(host!.querySelector('[data-download-card]')).not.toBeNull();
+  expect(host!.querySelector('[data-full-view-comments]')).toBeNull();
+  act(() => root!.unmount());
+  host!.remove();
+
+  // Another file's comment: the panel lists it, so a phone's toolbar keeps the count that opens it.
+  const note = record(shot, imageCommentAnnotation({ id: 'ann-shot', name: 'checkout.png', text: 'Cut off.' }), 'ann-shot');
+  await renderPane(spec, { phone: true, others: [shot], records: [note] });
+  expect(host!.querySelector('[data-attachment-pane]')!.classList.contains('ib-nopanel')).toBe(false);
+  const button = host!.querySelector<HTMLButtonElement>('[data-full-view-comments]')!;
+  expect(button).not.toBeNull();
+  expect(button.getAttribute('aria-label')).toMatch(/^Comments, \d+$/);
+  const panel = host!.querySelector('.ib-apanel')!;
+  expect(button.getAttribute('aria-controls')).toBe(panel.id);
+  // The sheet's close, and Escape inside it, close it and give focus back to the button.
+  await act(async () => button.click());
+  expect(button.getAttribute('aria-expanded')).toBe('true');
+  const close = panel.querySelector<HTMLButtonElement>('button[aria-label="Close the comments"]')!;
+  await act(async () => close.click());
+  expect(button.getAttribute('aria-expanded')).toBe('false');
+  expect(document.activeElement).toBe(button);
+  await act(async () => button.click());
+  await act(async () => {
+    close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  });
+  expect(button.getAttribute('aria-expanded')).toBe('false');
+  expect(document.activeElement).toBe(button);
+});
+
+// Row 52: a 1×1 image was blown up to a block of one colour; row 51: a panorama became a sliver.
+test.skipIf(!hasDom)('a tiny image draws at its own size in its thumbnail, and a panorama is cropped to 4:1 from the left', async () => {
+  const dot = file('att_01K7HHHHHHHHHHHHHHHHHHHHHH', 'dot.png', 'image', { media_type: 'image/png', width: 1, height: 1 });
+  const pano = file('att_01K7JJJJJJJJJJJJJJJJJJJJJJ', 'pano.png', 'image', { media_type: 'image/png', width: 8000, height: 300 });
+  await render(<AttachmentTiles attachments={[dot, pano, shot]} annotationCounts={new Map()} onOpen={() => {}} />);
+  const thumb = (a: InboxAttachmentState) => host!.querySelector(`button[data-attachment-id="${a.id}"] .ib-thumb img`)!;
+  expect(thumb(dot).hasAttribute('data-small')).toBe(true);
+  expect(thumb(shot).hasAttribute('data-small')).toBe(false);
+  const frame = (a: InboxAttachmentState) => host!.querySelector<HTMLElement>(`[data-gallery-image="${a.id}"] .ib-gal-frame`)!;
+  expect(frame(pano).classList.contains('ib-wide')).toBe(true);
+  expect(frame(pano).getAttribute('style')).toMatch(/aspect-ratio: 4( \/ 1)?;/);
+  expect(frame(shot).classList.contains('ib-wide')).toBe(false);
 });
 
 function record(attachment: InboxAttachmentState, annotation: object, id: string): InboxAnnotationRecord {

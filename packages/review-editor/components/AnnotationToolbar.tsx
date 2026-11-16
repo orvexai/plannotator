@@ -9,6 +9,8 @@ import { ConventionalLabelPicker, type LabelDef } from './ConventionalLabelPicke
 import type { ConventionalLabel, ConventionalDecoration } from '@plannotator/ui/types';
 import type { AIChatEntry } from '../hooks/useAIChat';
 import { useDraggable } from '@plannotator/ui/hooks/useDraggable';
+import { useConfigValue } from '@plannotator/ui/config';
+import { isCommentSubmitKey } from '@plannotator/ui/utils/commentSubmitKey';
 import {
   hasPrimaryCoarsePointer,
   useVisibleViewportBounds,
@@ -47,6 +49,12 @@ interface AnnotationToolbarProps {
   onViewAIResponse?: (questionId?: string) => void;
   /** AI messages that overlap the current line selection */
   aiHistoryMessages?: AIChatEntry[];
+  /**
+   * A host where selected lines can only be asked about (the VS Code Guide
+   * tab: no comments there): the toolbar opens on the Ask box, with no way to
+   * switch to a comment.
+   */
+  askOnly?: boolean;
 }
 
 // The 338px border box contains the 320px composer, padding, and border.
@@ -122,6 +130,7 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   isAILoading = false,
   onViewAIResponse,
   aiHistoryMessages = [],
+  askOnly = false,
 }) => {
   const coarsePointer = hasPrimaryCoarsePointer();
   const visibleBounds = useVisibleViewportBounds(coarsePointer ? 16 : 0);
@@ -129,6 +138,7 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   const horizontalInset = toolbarWidth / 2;
   const suggestedCodeRef = useRef<HTMLTextAreaElement>(null);
   const [toolbarHeight, setToolbarHeight] = useState<number | null>(null);
+  const enterSavesComment = useConfigValue('enterSavesComment');
   const handleTabIndent = useTabIndent(setSuggestedCode);
   const { dragPosition, dragHandleProps, wasDragged, reset: resetDrag } = useDraggable(toolbarRef);
 
@@ -173,7 +183,9 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
 
   const handleAskAISubmit = (question: string) => {
     onAskAI?.(question);
-    // Stay in AI mode so the history updates
+    // An ask-only host answers somewhere else (a page beside): the toolbar is done.
+    if (askOnly) onCancel();
+    // Otherwise stay in AI mode so the history updates
   };
 
   const handleAskAIClose = () => {
@@ -184,6 +196,8 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   const content = (
     <div
       ref={toolbarRef}
+      // Ctrl+C in its empty fields copies the selected lines (utils/highlightCopy).
+      data-highlight-composer=""
       className="review-toolbar"
       style={dragPosition
         ? {
@@ -215,7 +229,7 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
           }
       }
     >
-      {askAIMode ? (
+      {askAIMode || askOnly ? (
         <AskAIInput
           lineStart={toolbarState.range.start}
           lineEnd={toolbarState.range.end}
@@ -224,7 +238,7 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
           isLoading={isAILoading}
           aiHistory={aiHistoryMessages}
           onViewResponse={onViewAIResponse}
-          onSwitchToComment={() => setAskAIMode(false)}
+          onSwitchToComment={askOnly ? undefined : () => setAskAIMode(false)}
           dragHandleProps={dragHandleProps}
         />
       ) : (
@@ -283,7 +297,9 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
               if (e.key === 'Escape') {
                 e.stopPropagation();
                 onDismiss();
-              } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.nativeEvent.isComposing) {
+              } else if (isCommentSubmitKey(e, enterSavesComment)) {
+                // Prevented so a plain Enter (the setting on) adds no newline.
+                e.preventDefault();
                 onSubmit();
               }
             }}

@@ -6,7 +6,8 @@
  * launch a browser session, wait, and receive a structured JSON result.
  */
 
-import { appHtmlResponse, likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
+import { likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
+import { openPackedApp, packedAppResponse } from "@plannotator/shared/packed-app";
 import type { Origin } from "@plannotator/shared/agents";
 import {
   createFactsResult,
@@ -18,6 +19,8 @@ import {
 } from "@plannotator/shared/goal-setup";
 import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
 import { createRequestHostGuard } from "./request-host-guard";
+import { withPlannotatorServerHeader } from "./plannotator-server-marker";
+import { refuseCrossOriginWrite } from "./request-origin-guard";
 import { getRepoInfo } from "./repo";
 import {
   handleFavicon,
@@ -81,6 +84,7 @@ export async function startGoalSetupServer(
 ): Promise<GoalSetupServerResult> {
   const { bundle, htmlContent, origin = "claude-code", onReady } = options;
   const isRemote = isRemoteSession();
+  const app = openPackedApp(htmlContent);
   const wslFlag = await isWSL();
   const repoInfo = await getRepoInfo();
   const gitUser = detectGitUser();
@@ -105,7 +109,7 @@ export async function startGoalSetupServer(
 
   const requestHostGuard = createRequestHostGuard();
   const server = await startBunServerOnAvailablePort((port) =>
-    Bun.serve({
+    Bun.serve(withPlannotatorServerHeader({
         hostname: getServerHostname(),
         port,
         // Bun's default 10s idleTimeout kills long-running requests.
@@ -115,6 +119,9 @@ export async function startGoalSetupServer(
           // Host allowlist first, before any route (request-host-guard.ts).
           const hostRefusal = requestHostGuard.check(req);
           if (hostRefusal) return hostRefusal;
+          // Then no write from another site, before any route (request-origin-guard.ts).
+          const originRefusal = refuseCrossOriginWrite(req);
+          if (originRefusal) return originRefusal;
 
           const url = new URL(req.url);
 
@@ -165,8 +172,8 @@ export async function startGoalSetupServer(
               if (body.conventionalLabels !== undefined) {
                 toSave.conventionalLabels = body.conventionalLabels;
               }
-              if (Object.keys(toSave).length > 0) {
-                saveConfig(toSave as Parameters<typeof saveConfig>[0]);
+              if (Object.keys(toSave).length > 0 && !saveConfig(toSave as Parameters<typeof saveConfig>[0])) {
+                return Response.json({ error: "config.json could not be saved; nothing changed. A config.json that is not valid JSON is never written over: fix or remove it." }, { status: 500 });
               }
               return Response.json({ ok: true });
             } catch {
@@ -203,9 +210,9 @@ export async function startGoalSetupServer(
             return Response.json({ ok: true });
           }
 
-          if (url.pathname === "/favicon.png") return handleFavicon();
+          if (url.pathname === "/favicon.png" || url.pathname === "/favicon.ico") return handleFavicon(url.pathname);
 
-          return appHtmlResponse(req, htmlContent, isRemote);
+          return packedAppResponse(app, req, url.pathname, isRemote);
         },
 
         error(err) {
@@ -215,14 +222,14 @@ export async function startGoalSetupServer(
             { status: 500, headers: { "Content-Type": "text/plain" } }
           );
         },
-    }),
+    })),
   );
 
   const port = server.port!;
   const serverUrl = buildAdvertisedUrl(port);
   // Remote sessions serve the app page compressed (#1617); start the likely
   // encoding (gzip over plain http) now so the first load does not wait.
-  if (isRemote) prewarmAppHtml(htmlContent, likelyAppHtmlEncoding(false));
+  if (isRemote) prewarmAppHtml(app.html, likelyAppHtmlEncoding(false));
   onReady?.(serverUrl, isRemote, port);
 
   return {

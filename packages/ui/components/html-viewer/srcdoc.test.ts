@@ -5,7 +5,8 @@
  * viewer writes NOTHING into the document's namespace — no bare CSS custom
  * properties (a host `--muted` clobbering an author `--muted` visibly corrupts
  * documents), no `color-scheme`, no root classes, no styling of author
- * elements. Host tokens travel only under the viewer-owned `--pn-*` prefix
+ * elements on screen. Print-only pagination defaults are the exception.
+ * Host tokens travel only under the viewer-owned `--pn-*` prefix
  * unless the document opts in via <meta name="plannotator-theme" content="host">.
  *
  * These tests are the mutation guard: reintroducing any bare-token injection
@@ -19,9 +20,16 @@ import {
   DIFF_HIGHLIGHT_CSS,
   buildSrcdocInjection,
   buildThemeTokenPayload,
+  NO_NETWORK_CSP_META,
   hasHostThemeOptIn,
+  hasNoNetworkMarker,
   injectIntoHead,
+  injectLinkGuard,
+  injectNoNetworkCsp,
+  injectPrintDefaults,
+  injectSandboxShim,
 } from "./srcdoc";
+import { linkGuardScriptTag } from "./linkGuard";
 
 const HOST_TOKENS = {
   "--background": "oklch(0.15 0.02 260)",
@@ -125,6 +133,90 @@ describe("hasHostThemeOptIn", () => {
   });
 });
 
+// The link guard (linkGuard.ts) must run before every script in the document,
+// a page's own head script included: it owns the only port the host takes
+// links on, and a script before it could take that port.
+describe("link guard placement", () => {
+  const KEY = "0123456789abcdef0123456789abcdef";
+  const GUARD = linkGuardScriptTag(KEY);
+  const INJECTION = "<style></style><script>bridge()</script>";
+
+  // Placement read by a spec parser, page tricks included: packages/shared/link-guard-placement.test.ts.
+  test("right after the doctype: before the sandbox shim, the page's head script and the bridge", () => {
+    const page = `<!DOCTYPE html><html><head><script>window.headScript = 1</script></head><body></body></html>`;
+    const out = injectLinkGuard(injectSandboxShim(injectIntoHead(page, INJECTION)), KEY);
+    const at = out.indexOf(GUARD);
+    expect(out.startsWith(`<!DOCTYPE html>${GUARD}<html><head>`)).toBe(true);
+    expect(at).toBeLessThan(out.indexOf("plannotatorSandboxShim"));
+    expect(at).toBeLessThan(out.indexOf("window.headScript"));
+    expect(at).toBeLessThan(out.indexOf("bridge()"));
+  });
+
+  test("a script ahead of <head>, or no <head> at all: still first", () => {
+    const early = injectLinkGuard(`<!doctype html><script>window.early = 1</script><html><head></head></html>`, KEY);
+    expect(early.indexOf(GUARD)).toBe("<!doctype html>".length);
+    const bare = injectLinkGuard(`<p>hi</p><script>window.late = 1</script>`, KEY);
+    expect(bare.startsWith(GUARD)).toBe(true);
+  });
+
+  test("a marked page keeps its policy first, then the guard", () => {
+    const out = injectNoNetworkCsp(injectLinkGuard(`<!DOCTYPE html><html><head><script>fetch("/x")</script></head></html>`, KEY));
+    expect(out.indexOf(NO_NETWORK_CSP_META)).toBe("<!DOCTYPE html>".length);
+    expect(out.indexOf(NO_NETWORK_CSP_META)).toBeLessThan(out.indexOf(GUARD));
+    expect(out.indexOf(GUARD)).toBeLessThan(out.indexOf('fetch("/x")'));
+  });
+});
+
+// A document its server opened outside the session's roots carries the
+// no-network marker (packages/shared HTML_NO_NETWORK_MARKER); the srcdoc then
+// starts with `connect-src 'none'`, ahead of every page script.
+describe("no-network documents", () => {
+  const MARKER = '<meta name="plannotator-network" content="none">';
+  const INJECTION = "<style></style><script>bridge()</script>";
+
+  test("the marker is read across attribute order and quoting, wherever the page put text around it", () => {
+    expect(hasNoNetworkMarker(`<!DOCTYPE html><html><head>${MARKER}</head></html>`)).toBe(true);
+    expect(hasNoNetworkMarker("<meta content='none' name='plannotator-network'/>")).toBe(true);
+    expect(hasNoNetworkMarker("<meta name=plannotator-network content=none>")).toBe(true);
+    // Inside a comment or a script string the page opened before it: still read.
+    expect(hasNoNetworkMarker(`<!-- ${MARKER} -->`)).toBe(true);
+    expect(hasNoNetworkMarker(`<script>var s = "${MARKER.replace(/"/g, "'")}";</script>`)).toBe(true);
+  });
+
+  test("no marker, another name or another value: no policy", () => {
+    expect(hasNoNetworkMarker("<!DOCTYPE html><html><body><p>hi</p></body></html>")).toBe(false);
+    expect(hasNoNetworkMarker('<meta name="plannotator-theme" content="none">')).toBe(false);
+    expect(hasNoNetworkMarker('<meta name="plannotator-network" content="all">')).toBe(false);
+  });
+
+  test("the policy goes right after the doctype, before any page script", () => {
+    const page = `<!DOCTYPE html><html lang="en"><head><script>fetch("/x")</script></head><body></body></html>`;
+    const out = injectNoNetworkCsp(page);
+    expect(out.startsWith(`<!DOCTYPE html>${NO_NETWORK_CSP_META}<html lang="en">`)).toBe(true);
+    expect(out.indexOf(NO_NETWORK_CSP_META)).toBeLessThan(out.indexOf("<script>"));
+    expect(NO_NETWORK_CSP_META).toContain(`content="connect-src 'none'"`);
+  });
+
+  test("comments and a BOM before the doctype stay before it; no doctype puts the policy first", () => {
+    expect(injectNoNetworkCsp("\uFEFF <!-- built --> <!doctype html><p>x</p>"))
+      .toBe(`\uFEFF <!-- built --> <!doctype html>${NO_NETWORK_CSP_META}<p>x</p>`);
+    expect(injectNoNetworkCsp("<script>fetch('/x')</script><p>x</p>"))
+      .toBe(`${NO_NETWORK_CSP_META}<script>fetch('/x')</script><p>x</p>`);
+    // A "</head>" in an early script string does not move it.
+    const tricky = `<!DOCTYPE html><html><head><script>var s = "</head>"; fetch("/x")</script></head></html>`;
+    expect(injectNoNetworkCsp(tricky).indexOf(NO_NETWORK_CSP_META)).toBe("<!DOCTYPE html>".length);
+  });
+
+  test("the page's own CSP is still removed, and the viewer's survives the head injection", () => {
+    const page = `<!DOCTYPE html><html><head>${MARKER}<meta http-equiv="Content-Security-Policy" content="default-src 'none'"></head><body></body></html>`;
+    const out = injectNoNetworkCsp(injectIntoHead(page, INJECTION));
+    expect(out).not.toContain("default-src 'none'");
+    expect(out.split("Content-Security-Policy").length - 1).toBe(1);
+    expect(out).toContain(NO_NETWORK_CSP_META);
+    expect(out).toContain(INJECTION);
+  });
+});
+
 // Exercises the real bridge theme handler (the inline-setProperty site): on a
 // host theme flip, nothing may land on the author's documentElement except
 // --pn-* properties — no bare tokens, no `light` class — unless the document
@@ -143,6 +235,13 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
    * the overlay host holds an SVG marker button (environment bug — see
    * bumpDomGeneration), so observer-scope tests assert the observed target
    * and drive the captured callback with synthetic records directly. */
+  /**
+   * The link guard the bridge hands a followed click to (linkGuard.ts; tested
+   * in linkGuard.test.ts). Here a recorder stands in for it, installed before
+   * the bridge runs as the inline guard is: what the bridge decides to follow.
+   */
+  const guardFollows: Array<Record<string, unknown>> = [];
+  const guardKinds: string[] = [];
   const capturedObservers: Array<{
     callback: (mutations: MutationRecord[], observer: MutationObserver) => void;
     targets: Node[];
@@ -163,6 +262,16 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
           super.observe(target, options);
         }
       };
+    Object.defineProperty(window, "__plannotatorLinkGuard", {
+      configurable: true,
+      value: {
+        follow: (kind: string, msg: Record<string, unknown>) => {
+          guardKinds.push(kind);
+          guardFollows.push({ ...msg });
+          return true;
+        },
+      },
+    });
     try {
       new Function(BRIDGE_SCRIPT)();
     } finally {
@@ -188,11 +297,41 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     );
   }
 
+  test("print requests run only for messages from the parent", () => {
+    const originalPrint = window.print;
+    let prints = 0;
+    window.print = () => { prints += 1; };
+    try {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { type: "plannotator-bridge-print" },
+        source: null,
+      }));
+      expect(prints).toBe(0);
+      postBridge({ type: "plannotator-bridge-print" });
+      expect(prints).toBe(1);
+    } finally {
+      window.print = originalPrint;
+    }
+  });
+
   /** find-and-mark renders through the rAF-coalesced overlay scheduler (a
    * batch restore renders once instead of once per annotation); happy-dom's
    * requestAnimationFrame is setImmediate-backed, so yielding one macrotask
    * turn (the suite's standard flush) settles the pending overlay render. */
   const flushOverlay = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  /** Poll until `probe` returns a value, up to 2 s. For what lands after the
+   * bridge's selection debounce or a queued postMessage: a fixed sleep there
+   * is too short on a loaded CI runner. */
+  async function waitUntil<T>(what: string, probe: () => T | null | undefined | false): Promise<T> {
+    const deadline = Date.now() + 2_000;
+    for (;;) {
+      const value = probe();
+      if (value) return value;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
 
   /** Failed dead-target searches also carry a wall-clock backoff (300ms
    * doubling to a 5s cap) on top of the generation gate. Tests asserting
@@ -1264,7 +1403,8 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     }));
   }
 
-  async function clickAndCollectSelection(el: Element, x: number, y: number) {
+  /** `init`: modifiers; a link pins only with Cmd or Ctrl held (a plain click follows it). */
+  async function clickAndCollectSelection(el: Element, x: number, y: number, init: MouseEventInit = {}) {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const messages: Array<Record<string, unknown>> = [];
     const collect = (event: MessageEvent) => {
@@ -1277,6 +1417,7 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
       cancelable: true,
       clientX: x,
       clientY: y,
+      ...init,
     });
     el.dispatchEvent(click);
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1859,7 +2000,7 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     // path, in every form: absolute and relative alike.
     const home = document.querySelector<HTMLElement>('a[href^="https://acme.test"]')!;
     hoverAt(home, 10, 10);
-    const link = await clickAndCollectSelection(home, 10, 10);
+    const link = await clickAndCollectSelection(home, 10, 10, { metaKey: true });
     const linkContext = link.messages[0]!.context as { attrs: Array<[string, string]>; role: string };
     expect(linkContext.attrs).toEqual([["href", "https://acme.test/home?…"]]);
     expect(linkContext.role).toBe("link");
@@ -1868,7 +2009,7 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     // Fresh coordinates: the hover hit-test is keyed on the pointer position.
     const about = document.querySelector<HTMLElement>('a[href="/about?tab=2"]')!;
     hoverAt(about, 90, 12);
-    const rel = await clickAndCollectSelection(about, 90, 12);
+    const rel = await clickAndCollectSelection(about, 90, 12, { metaKey: true });
     expect((rel.messages[0]!.context as { attrs: Array<[string, string]> }).attrs).toEqual([["href", "/about?…"]]);
     expect(JSON.stringify(rel.messages[0]!.context)).not.toContain("tab=2");
     postBridge({ type: "plannotator-bridge-cancel-selection" });
@@ -3011,7 +3152,7 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     sel.removeAllRanges();
     sel.addRange(range);
     p.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
-    await new Promise((resolve) => setTimeout(resolve, 25)); // handleSelection debounce
+    await waitUntil("the draft highlight", () => visibleHighlights("pn-hl-draft").length > 0);
 
     expect(visibleHighlights("pn-hl-draft").length).toBeGreaterThanOrEqual(1);
     // Draft state never mutates the page.
@@ -3020,6 +3161,155 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     postBridge({ type: "plannotator-bridge-cancel-selection" });
     expect(visibleHighlights("pn-hl-draft").length).toBe(0);
     document.body.replaceChildren();
+  });
+
+  test("rich copy: the selection only flags support; the markup is built when the parent asks", async () => {
+    document.body.innerHTML = '<p>Plain <strong>bold <a href="/docs">link</a></strong> tail</p>';
+    postBridge({ type: "plannotator-bridge-set-vim-mode", enabled: false });
+    postBridge({ type: "plannotator-bridge-set-input-method", method: "drag" });
+    const received: Record<string, unknown>[] = [];
+    const collect = (event: MessageEvent) => {
+      const data = bridgeMessageData(event);
+      if (data && /^plannotator-bridge-(selection|rich-copy)$/.test(String(data.type))) received.push(data);
+    };
+    window.addEventListener("message", collect);
+    try {
+      const strong = document.querySelector("strong")!;
+      const range = document.createRange();
+      range.selectNodeContents(strong);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      strong.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      const selection = await waitUntil("the selection message", () =>
+        received.find((m) => m.type === "plannotator-bridge-selection"),
+      );
+      expect(selection.richCopy).toBe(true);
+      expect(selection).not.toHaveProperty("html");
+
+      postBridge({ type: "plannotator-bridge-rich-copy-request", id: "rc-test" });
+      const answer = await waitUntil("the rich copy answer", () =>
+        received.find((m) => m.type === "plannotator-bridge-rich-copy"),
+      );
+      expect(answer.id).toBe("rc-test");
+      expect(answer.text).toBe("bold link");
+      expect(answer.tooLarge).toBe(false);
+      expect(String(answer.html)).toContain("<strong>bold <a href=");
+    } finally {
+      window.removeEventListener("message", collect);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+      document.body.replaceChildren();
+    }
+  });
+
+  test("rich copy: a throw while building the markup still answers, without markup", async () => {
+    document.body.innerHTML = "<p>Throwing target</p>";
+    postBridge({ type: "plannotator-bridge-set-vim-mode", enabled: false });
+    postBridge({ type: "plannotator-bridge-set-input-method", method: "drag" });
+    const received: Record<string, unknown>[] = [];
+    let selected = false;
+    const collect = (event: MessageEvent) => {
+      const data = bridgeMessageData(event);
+      if (data && data.type === "plannotator-bridge-selection") selected = true;
+      if (data && data.type === "plannotator-bridge-rich-copy") received.push(data);
+    };
+    window.addEventListener("message", collect);
+    const realClone = Range.prototype.cloneContents;
+    try {
+      const p = document.querySelector("p")!;
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      p.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      await waitUntil("the selection message", () => selected);
+      Range.prototype.cloneContents = () => { throw new Error("boom"); };
+      postBridge({ type: "plannotator-bridge-rich-copy-request", id: "rc-throw" });
+      await waitUntil("the rich copy answer", () => received.length > 0);
+      expect(received).toEqual([
+        { type: "plannotator-bridge-rich-copy", id: "rc-throw", html: "", text: "Throwing target", truncated: false, tooLarge: false },
+      ]);
+    } finally {
+      Range.prototype.cloneContents = realClone;
+      window.removeEventListener("message", collect);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+      document.body.replaceChildren();
+    }
+  });
+
+  test("rich copy: past 256 KiB the bridge sends the text cut and marked, and no markup", async () => {
+    document.body.innerHTML = `<p>${"y".repeat(300_000)}</p>`;
+    postBridge({ type: "plannotator-bridge-set-vim-mode", enabled: false });
+    postBridge({ type: "plannotator-bridge-set-input-method", method: "drag" });
+    const received: Record<string, unknown>[] = [];
+    const collect = (event: MessageEvent) => {
+      const data = bridgeMessageData(event);
+      if (data && /^plannotator-bridge-(selection|rich-copy)$/.test(String(data.type))) received.push(data);
+    };
+    window.addEventListener("message", collect);
+    try {
+      const p = document.querySelector("p")!;
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      p.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      const until = (type: string) => waitUntil(type, () => received.find((m) => m.type === type));
+      const selection = await until("plannotator-bridge-selection");
+      expect(selection.textCut).toBe(true);
+      expect(String(selection.text)).toHaveLength(10_000);
+
+      postBridge({ type: "plannotator-bridge-rich-copy-request", id: "rc-long" });
+      const answer = await until("plannotator-bridge-rich-copy");
+      expect(String(answer.text)).toHaveLength(262_144);
+      expect(answer).toMatchObject({ id: "rc-long", html: "", truncated: true, tooLarge: true });
+    } finally {
+      window.removeEventListener("message", collect);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+      document.body.replaceChildren();
+    }
+  });
+
+  test("rich copy: the plain text is the selection's own text, with its line breaks", async () => {
+    document.body.innerHTML = "<h1>Heading</h1>\n    <p>Para</p>\n    <ul><li>Item one</li><li>Item two</li></ul>";
+    postBridge({ type: "plannotator-bridge-set-vim-mode", enabled: false });
+    postBridge({ type: "plannotator-bridge-set-input-method", method: "drag" });
+    const received: Record<string, unknown>[] = [];
+    const collect = (event: MessageEvent) => {
+      const data = bridgeMessageData(event);
+      if (data && /^plannotator-bridge-(selection|rich-copy)$/.test(String(data.type))) received.push(data);
+    };
+    const until = async (type: string) => {
+      for (let i = 0; i < 200 && !received.some((m) => m.type === type); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return received.find((m) => m.type === type)!;
+    };
+    // happy-dom's Selection.toString() is the range's raw text; a browser's
+    // puts line breaks between blocks. Stand in for the browser here.
+    const rendered = "Heading\nPara\n\nItem one\nItem two";
+    const realToString = Selection.prototype.toString;
+    Selection.prototype.toString = function () { return rendered; };
+    window.addEventListener("message", collect);
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(document.body);
+      expect(range.toString()).not.toBe(rendered);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      document.querySelector("li")!.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      const selection = await until("plannotator-bridge-selection");
+      expect(selection.text).toBe(rendered);
+
+      postBridge({ type: "plannotator-bridge-rich-copy-request", id: "rc-blocks" });
+      const answer = await until("plannotator-bridge-rich-copy");
+      expect(answer).toMatchObject({ id: "rc-blocks", text: rendered, truncated: false, tooLarge: false });
+      expect(String(answer.html)).toContain("<li>Item one</li>");
+    } finally {
+      Selection.prototype.toString = realToString;
+      window.removeEventListener("message", collect);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+      document.body.replaceChildren();
+    }
   });
 
   test("hit-testing for new selections yields placed markers to reach the page beneath", async () => {
@@ -3116,6 +3406,145 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     });
     postBridge({ type: "plannotator-bridge-clear-marks" });
     document.body.replaceChildren();
+  });
+
+  test("pending pins hide with their slide, restore on return, and survive ordinary scrolling", async () => {
+    document.body.innerHTML = '<div id="draft-slide"><div id="draft-pin" aria-label="Diagram"></div></div>';
+    const slide = document.querySelector<HTMLElement>('#draft-slide')!;
+    const pin = document.querySelector<HTMLElement>('#draft-pin')!;
+    const visibility: boolean[] = [];
+    const listener = (event: MessageEvent) => {
+      const data = bridgeMessageData(event);
+      if (data?.type === 'plannotator-bridge-pin-visibility') visibility.push(data.visible as boolean);
+    };
+    window.addEventListener('message', listener);
+    try {
+      await withLayout(async () => {
+        let top = 100;
+        pin.getBoundingClientRect = () => slide.style.display === 'none'
+          ? rectOf(0, 0, 0, 0) : rectOf(100, top, 200, 100);
+        postBridge({ type: 'plannotator-bridge-set-input-method', method: 'pinpoint' });
+        const selected = await collectMessages(['plannotator-bridge-selection'], () => clickAt(pin, 110, 110, false));
+        const reconcile = async () => {
+          window.dispatchEvent(new Event('resize'));
+          await flushOverlay();
+          await flushOverlay();
+        };
+        slide.style.display = 'none';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(false);
+        expect(document.querySelector<HTMLElement>('[data-plannotator-pinpoint-box]')?.style.display).toBe('none');
+        slide.style.display = '';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        pin.style.visibility = 'hidden';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(false);
+        pin.style.visibility = '';
+        top = -1000;
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        // A removed target that cannot be found again keeps the composer
+        // visible: hiding it would leave the draft where nobody can reach it.
+        pin.remove();
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        slide.appendChild(pin);
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        // A draft spanning slides stays available while any target is shown.
+        const other = document.createElement('div');
+        other.setAttribute('aria-label', 'Other diagram');
+        slide.appendChild(other);
+        other.getBoundingClientRect = () => rectOf(400, 100, 100, 100);
+        postBridge({ type: 'plannotator-bridge-arm-multi-select', key: selected[0]!.targetKey, max: 16 });
+        pin.style.visibility = 'hidden';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(false);
+        clickAt(other, 410, 110, true);
+        await flushOverlay();
+        await flushOverlay();
+        expect(visibility.at(-1)).toBe(true);
+        other.style.visibility = 'hidden';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(false);
+        other.style.visibility = '';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        clickAt(other, 410, 110, true);
+        await flushOverlay();
+        await flushOverlay();
+        expect(visibility.at(-1)).toBe(false);
+      });
+    } finally {
+      window.removeEventListener('message', listener);
+      postBridge({ type: 'plannotator-bridge-cancel-selection' });
+      postBridge({ type: 'plannotator-bridge-set-input-method', method: 'drag' });
+      document.body.replaceChildren();
+    }
+  });
+
+  test("a pending pin the page replaces is found again through its anchor", async () => {
+    document.body.innerHTML = '<section id="deck-slide"><div id="deck-chart">Revenue chart</div></section>';
+    const slide = document.querySelector<HTMLElement>('#deck-slide')!;
+    const first = document.querySelector<HTMLElement>('#deck-chart')!;
+    const visibility: boolean[] = [];
+    const rects: Array<{ top: number }> = [];
+    const listener = (event: MessageEvent) => {
+      const data = bridgeMessageData(event);
+      if (data?.type === 'plannotator-bridge-pin-visibility') visibility.push(data.visible as boolean);
+      if (data?.type === 'plannotator-bridge-selection-rect') rects.push(data.rect as { top: number });
+    };
+    window.addEventListener('message', listener);
+    try {
+      await withLayout(async () => {
+        first.getBoundingClientRect = () => slide.style.display === 'none'
+          ? rectOf(0, 0, 0, 0) : rectOf(100, 100, 200, 100);
+        postBridge({ type: 'plannotator-bridge-set-input-method', method: 'pinpoint' });
+        await collectMessages(['plannotator-bridge-selection'], () => clickAt(first, 110, 110, false));
+        const reconcile = async () => {
+          await flushOverlay(); // let the mutation observer advance the generation
+          window.dispatchEvent(new Event('resize'));
+          await flushOverlay();
+          await flushOverlay();
+        };
+        // The deck hides the slide: the composer hides with it.
+        slide.style.display = 'none';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(false);
+        // Coming back, the framework renders a NEW element for the same chart.
+        const second = document.createElement('div');
+        second.id = 'deck-chart';
+        second.textContent = 'Revenue chart';
+        second.getBoundingClientRect = () => rectOf(100, 260, 200, 100);
+        first.replaceWith(second);
+        slide.style.display = '';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        // The composer is re-anchored on the new element.
+        expect(rects.at(-1)?.top).toBe(260);
+        const box = document.querySelector<HTMLElement>('[data-plannotator-pinpoint-box][data-pinned]');
+        expect(box?.style.display).toBe('block');
+        expect(box?.style.top).toBe('260px');
+        // The new element hiding hides the composer again: it is the target now.
+        second.style.visibility = 'hidden';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(false);
+        second.style.visibility = '';
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        // Gone with nothing to find: the composer stays visible, the outline goes.
+        second.remove();
+        await reconcile();
+        expect(visibility.at(-1)).toBe(true);
+        expect(box?.style.display).toBe('none');
+      });
+    } finally {
+      window.removeEventListener('message', listener);
+      postBridge({ type: 'plannotator-bridge-cancel-selection' });
+      postBridge({ type: 'plannotator-bridge-set-input-method', method: 'drag' });
+      document.body.replaceChildren();
+    }
   });
 
   test("style-hidden targets are unresolved-for-display (M2 visibility gate)", async () => {
@@ -4244,14 +4673,20 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
   // app itself: the whole editor rendered inside the annotated document.
   // The bridge must therefore never let this frame navigate.
   describe("link navigation", () => {
-    let capturedLinkPosts: Array<Record<string, unknown>> = [];
+    /** Link-clicks the bridge handed to the link guard. */
+    let capturedLinkPosts: Array<Record<string, unknown>> = guardFollows;
+    /** Link-clicks posted on the window, where the host never takes them. */
+    let windowLinkPosts: Array<Record<string, unknown>> = [];
     let stopCapture: (() => void) | null = null;
 
     function startCapture() {
-      capturedLinkPosts = [];
+      guardFollows.length = 0;
+      guardKinds.length = 0;
+      capturedLinkPosts = guardFollows;
+      windowLinkPosts = [];
       const capture = (event: MessageEvent) => {
         const data = bridgeMessageData(event);
-        if (data && data.type === "plannotator-bridge-link-click") capturedLinkPosts.push(data);
+        if (data && data.type === "plannotator-bridge-link-click") windowLinkPosts.push(data);
       };
       window.addEventListener("message", capture);
       stopCapture = () => window.removeEventListener("message", capture);
@@ -4260,10 +4695,16 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
     /** postMessage delivery is queued; one macrotask turn settles it. */
     const flushPosts = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
+    /** A person's click: `isTrusted`, which only the browser sets (a page script's a.click() is untrusted). */
+    function trusted<T extends Event>(event: T): T {
+      Object.defineProperty(event, "isTrusted", { value: true });
+      return event;
+    }
+
     function clickLink(selector: string): MouseEvent {
       const el = document.querySelector<HTMLElement>(selector);
       if (!el) throw new Error("missing link " + selector);
-      const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+      const event = trusted(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
       el.dispatchEvent(event);
       return event;
     }
@@ -4290,6 +4731,15 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
       // The default action is what would load the app into this frame.
       expect(event.defaultPrevented).toBe(true);
       expect(capturedLinkPosts.map((p) => p.href)).toEqual(["01-entry-point.html"]);
+    });
+
+    test("a person's click goes to the link guard as a link, never on the window a page script shares", async () => {
+      setUp('<a id="rel" href="next.html">Next</a>', false);
+      clickLink("#rel");
+      await flushPosts();
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["next.html"]);
+      expect(guardKinds).toEqual(["link"]);
+      expect(windowLinkPosts).toEqual([]);
     });
 
     test("Interact: the RAW href travels — resolution belongs to the parent", async () => {
@@ -4338,12 +4788,358 @@ describe.if(hasDom)("bridge theme handler (DOM)", () => {
       expect(scrolled).toBe(1);
     });
 
-    test("armed pinpoint: the click annotates — no navigation, and no link report", async () => {
-      setUp('<a id="rel" href="01-entry-point.html">Entry</a>', true);
+    function collectSelections() {
+      const selections: Array<Record<string, unknown>> = [];
+      const collect = (event: MessageEvent) => {
+        const data = bridgeMessageData(event);
+        if (data?.type === "plannotator-bridge-selection") selections.push(data);
+      };
+      window.addEventListener("message", collect);
+      return { selections, stop: () => window.removeEventListener("message", collect) };
+    }
+
+    function clickWith(selector: string, init: MouseEventInit): MouseEvent {
+      const el = document.querySelector<HTMLElement>(selector)!;
+      const event = trusted(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0, ...init }));
+      el.dispatchEvent(event);
+      return event;
+    }
+
+    for (const armed of [false, true]) {
+      test(`${armed ? "armed" : "Interact"}: the page's own script clicking its link on a timer never follows it`, async () => {
+        setUp('<a id="rel" href="next.html">Next</a>', armed);
+        await flushPosts();
+        let prevented: boolean | null = null;
+        const link = document.querySelector<HTMLAnchorElement>("#rel")!;
+        link.addEventListener("click", (e) => { prevented = e.defaultPrevented; });
+        // What a page would do: a.click() from its own script, later.
+        await new Promise<void>((resolve) => setTimeout(() => { link.click(); resolve(); }, 5));
+        await flushPosts();
+        expect(prevented).toBe(true); // the frame still never navigates itself
+        expect(capturedLinkPosts).toEqual([]);
+      });
+    }
+
+    for (const [label, markup] of [
+      ['href="#"', '<a id="go" href="#" class="btn">Save</a>'],
+      ['href=""', '<a id="go" href="" class="btn">Save</a>'],
+      ["javascript:", '<a id="go" href="javascript:void 0" class="btn">Save</a>'],
+      ["no href", '<a id="go" class="btn">Save</a>'],
+    ] as const) {
+      test(`armed pinpoint: a link that goes nowhere (${label}) pins on a plain click, as before`, async () => {
+        setUp(`<p>Intro</p>${markup}`, true);
+        await flushPosts();
+        const { selections, stop } = collectSelections();
+        const event = clickLink("#go");
+        await flushPosts();
+        stop();
+        expect(event.defaultPrevented).toBe(true);
+        expect(capturedLinkPosts).toEqual([]);
+        expect(selections.length).toBe(1);
+        expect(selections[0]!.pinpoint).toBe(true);
+        postBridge({ type: "plannotator-bridge-cancel-selection" });
+      });
+    }
+
+    test("armed pinpoint: no pin outline over a link a click follows, until Cmd/Ctrl is held (key or pointer)", () => {
+      setUp('<p id="intro">Intro</p><a id="rel" href="next.html">Next</a><a id="btn" href="#">Button</a>', true);
+      postBridge({ type: "plannotator-bridge-set-vim-mode", enabled: false });
+      let at = 0;
+      const box = () => document.querySelector<HTMLElement>("[data-plannotator-pinpoint-box]")?.style.display ?? "none";
+      const move = (selector: string, init: MouseEventInit = {}) =>
+        document.querySelector(selector)!.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, clientX: 5 + (at += 7), clientY: 5, ...init }));
+      move("#intro");
+      expect(box()).toBe("block");
+      move("#rel");
+      expect(box()).toBe("none");
+      expect(document.body.hasAttribute("data-plannotator-pin-modifier")).toBe(false);
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Meta", metaKey: true, bubbles: true }));
+      expect(document.body.hasAttribute("data-plannotator-pin-modifier")).toBe(true);
+      expect(box()).toBe("block");
+      document.dispatchEvent(new KeyboardEvent("keyup", { key: "Meta", bubbles: true }));
+      expect(box()).toBe("none");
+      // Held during the move itself (focus elsewhere when the key went down).
+      move("#rel", { ctrlKey: true });
+      expect(box()).toBe("block");
+      move("#rel");
+      expect(box()).toBe("none");
+      // A link that goes nowhere outlines like any element.
+      move("#btn");
+      expect(box()).toBe("block");
+    });
+
+    // One rule while armed (owner's ruling html-link-click, 2026-10-20): a plain click follows, the modifier pins.
+    test("armed pinpoint: a plain click on a link follows it, exactly as in Interact, and pins nothing", async () => {
+      setUp('<a id="rel" href="./sub/02-detail.html#top">Entry</a>', true);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
       const event = clickLink("#rel");
       await flushPosts();
+      stop();
+      expect(event.defaultPrevented).toBe(true);
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["./sub/02-detail.html#top"]);
+      expect(selections).toEqual([]);
+    });
+
+    test("armed pinpoint: a click on a child of the link follows the link too", async () => {
+      setUp('<a id="rel" href="a.html"><span id="inner">deep</span></a>', true);
+      clickLink("#inner");
+      await flushPosts();
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["a.html"]);
+    });
+
+    for (const [name, init] of [["Cmd", { metaKey: true }], ["Ctrl", { ctrlKey: true }]] as const) {
+      test(`armed pinpoint: ${name}-click pins the link for a comment, with its anchor, and never follows it`, async () => {
+        setUp('<p>Intro</p><a id="rel" href="01-entry-point.html">Entry point</a>', true);
+        await flushPosts();
+        const { selections, stop } = collectSelections();
+        const event = clickWith("#rel", init);
+        await flushPosts();
+        stop();
+        expect(event.defaultPrevented).toBe(true);
+        expect(capturedLinkPosts).toEqual([]);
+        expect(selections.length).toBe(1);
+        expect(selections[0]!.pinpoint).toBe(true);
+        const anchor = selections[0]!.anchor as { selector: string; tagName: string };
+        expect(anchor.tagName).toBe("a");
+        expect(document.querySelector(anchor.selector)).toBe(document.querySelector("#rel"));
+        postBridge({ type: "plannotator-bridge-cancel-selection" });
+      });
+    }
+
+    test("Interact: Cmd-click still follows (the modifier pins only while armed)", async () => {
+      setUp('<a id="rel" href="a.html">A</a>', false);
+      clickWith("#rel", { metaKey: true });
+      await flushPosts();
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["a.html"]);
+    });
+
+    test("armed pinpoint: a #fragment link scrolls on a plain click and pins on a Cmd-click", async () => {
+      setUp('<a id="frag" href="#target">Jump</a><h2 id="target">Target</h2>', true);
+      const target = document.querySelector<HTMLElement>("#target")!;
+      let scrolled = 0;
+      target.scrollIntoView = () => { scrolled += 1; };
+      clickLink("#frag");
+      expect(scrolled).toBe(1);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
+      clickWith("#frag", { metaKey: true });
+      await flushPosts();
+      stop();
+      expect(scrolled).toBe(1);
+      expect(selections.length).toBe(1);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+    });
+
+    test("armed pinpoint: a drag that selected text and ended on a link neither follows nor pins", async () => {
+      setUp('<p id="p">Read <a id="rel" href="a.html">the detail page</a> next.</p>', true);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
+      const text = document.querySelector("#rel")!.firstChild!;
+      // A real drag: mousedown, a move past the 4 px threshold, a selection, mouseup, then the trailing click.
+      document.querySelector("#rel")!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, clientX: 10, clientY: 10 }));
+      document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, buttons: 1, clientX: 40, clientY: 10 }));
+      const range = document.createRange();
+      range.setStart(text, 0);
+      range.setEnd(text, 8);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      document.querySelector("#rel")!.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0, clientX: 40, clientY: 10 }));
+      const event = clickLink("#rel");
+      await new Promise((r) => setTimeout(r, 30));
+      stop();
       expect(event.defaultPrevented).toBe(true);
       expect(capturedLinkPosts).toEqual([]);
+      // The drag's own text comment may post; the link element is never pinned.
+      expect(selections.filter((s) => s.pinpoint === true)).toEqual([]);
+      window.getSelection()!.removeAllRanges();
+    });
+
+    // Touch (owner's amendment to html-link-click, 2026-10-20): a tap follows, press-and-hold pins.
+    function touch(type: string, selector: string, x: number, y: number, live = true): Event {
+      const el = document.querySelector(selector)!;
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      const point = { identifier: 1, clientX: x, clientY: y, target: el };
+      Object.defineProperty(event, "touches", { value: live ? [point] : [] });
+      Object.defineProperty(event, "changedTouches", { value: [point] });
+      el.dispatchEvent(event);
+      return event;
+    }
+    const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+    test("touch, armed: a tap on a link follows it and pins nothing", async () => {
+      setUp('<p>Intro</p><a id="rel" href="next.html">Next</a>', true);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
+      touch("touchstart", "#rel", 10, 10);
+      await wait(60);
+      const end = touch("touchend", "#rel", 10, 10, false);
+      clickLink("#rel");
+      await wait(600);
+      stop();
+      expect(end.defaultPrevented).toBe(false);
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["next.html"]);
+      expect(selections).toEqual([]);
+      expect(document.body.hasAttribute("data-plannotator-touch")).toBe(true);
+      document.body.removeAttribute("data-plannotator-touch");
+    });
+
+    test("touch, armed: press-and-hold pins the link for a comment, and the release never follows it", async () => {
+      setUp('<p>Intro</p><a id="rel" href="next.html">Entry point</a>', true);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
+      touch("touchstart", "#rel", 10, 10);
+      await wait(400);
+      expect(selections).toEqual([]); // not yet: the hold is 500 ms
+      await wait(200);
+      await flushPosts();
+      expect(selections.length).toBe(1);
+      expect(selections[0]!.pinpoint).toBe(true);
+      const anchor = selections[0]!.anchor as { selector: string; tagName: string };
+      expect(anchor.tagName).toBe("a");
+      expect(document.querySelector(anchor.selector)).toBe(document.querySelector("#rel"));
+      // The same pin a Cmd-click makes: the link's words as a text range, not a bare element.
+      expect(selections[0]!.text).toBe("Entry point");
+      expect(selections[0]!.element).toBeUndefined();
+      // Selection is off on links only while the finger is down.
+      expect(document.body.hasAttribute("data-plannotator-link-hold")).toBe(true);
+      // The release: cancelled, so no click is synthesized; one that arrives anyway is swallowed.
+      const end = touch("touchend", "#rel", 10, 10, false);
+      expect(end.defaultPrevented).toBe(true);
+      const click = clickLink("#rel");
+      await flushPosts();
+      stop();
+      expect(click.defaultPrevented).toBe(true);
+      expect(capturedLinkPosts).toEqual([]);
+      expect(selections.length).toBe(1);
+      expect(document.body.hasAttribute("data-plannotator-link-hold")).toBe(false);
+      // The next tap is a tap again.
+      touch("touchstart", "#rel", 10, 10);
+      touch("touchend", "#rel", 10, 10, false);
+      clickLink("#rel");
+      await flushPosts();
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["next.html"]);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+      document.body.removeAttribute("data-plannotator-touch");
+    });
+
+    function pointer(type: string, selector: string, pointerType: string, pointerId = 1): Event {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "pointerType", { value: pointerType });
+      Object.defineProperty(event, "pointerId", { value: pointerId });
+      document.querySelector(selector)!.dispatchEvent(event);
+      return event;
+    }
+
+    for (const [label, next] of [
+      ["a mouse press", () => pointer("pointerdown", "#rel", "mouse", 9)],
+      ["a key", () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))],
+      ["a new touch", () => { touch("touchstart", "#rel", 10, 10); touch("touchend", "#rel", 10, 10, false); }],
+    ] as const) {
+      test(`touch, armed: after a hold's release with no click, ${label} ends the swallow, so its click follows`, async () => {
+        setUp('<a id="rel" href="next.html">Next</a>', true);
+        await flushPosts();
+        touch("touchstart", "#rel", 10, 10);
+        await wait(560);
+        touch("touchend", "#rel", 10, 10, false);
+        postBridge({ type: "plannotator-bridge-cancel-selection" });
+        await flushPosts();
+        next();
+        const click = clickLink("#rel");
+        await flushPosts();
+        expect(click.defaultPrevented).toBe(true); // the frame never navigates itself
+        expect(capturedLinkPosts.map((p) => p.href)).toEqual(["next.html"]);
+        document.body.removeAttribute("data-plannotator-touch");
+      });
+    }
+
+    test("touch, armed: a hold whose release was never seen (the page stopped touchend) does not eat the next tap", async () => {
+      setUp('<a id="rel" href="next.html">Next</a>', true);
+      await flushPosts();
+      touch("touchstart", "#rel", 10, 10);
+      await wait(560);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+      // No touchend reached the bridge. The next tap is a tap.
+      touch("touchstart", "#rel", 10, 10);
+      touch("touchend", "#rel", 10, 10, false);
+      clickLink("#rel");
+      await flushPosts();
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["next.html"]);
+      document.body.removeAttribute("data-plannotator-touch");
+    });
+
+    test("touch, armed: a tap never turns selection off, so link text stays quotable by a drag", async () => {
+      setUp('<p>Start with <a id="rel" href="next.html">the detail page</a> today.</p>', true);
+      await flushPosts();
+      touch("touchstart", "#rel", 10, 10);
+      expect(document.body.hasAttribute("data-plannotator-link-hold")).toBe(true);
+      touch("touchend", "#rel", 10, 10, false);
+      expect(document.body.hasAttribute("data-plannotator-link-hold")).toBe(false);
+      clickLink("#rel");
+      await flushPosts();
+      // The only rule that turns link selection off is scoped to a hold in progress.
+      const css = ANNOTATION_HIGHLIGHT_CSS.replace(/\/\*[\s\S]*?\*\//g, "");
+      const rules = css.split("}").filter((r) => /user-select:\s*none/.test(r));
+      expect(rules.length).toBeGreaterThan(0);
+      for (const rule of rules) {
+        const selectors = rule.slice(0, rule.indexOf("{"));
+        if (/:is\(a, area\)/.test(selectors)) {
+          for (const sel of selectors.split(/,\s*\n/)) expect(sel).toContain("data-plannotator-link-hold");
+        }
+      }
+      document.body.removeAttribute("data-plannotator-touch");
+    });
+
+    test("touch, armed: a finger that moves past the slop (a scroll) cancels the hold", async () => {
+      setUp('<a id="rel" href="next.html">Next</a>', true);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
+      touch("touchstart", "#rel", 10, 10);
+      await wait(100);
+      touch("touchmove", "#rel", 10, 34);
+      await wait(550);
+      const end = touch("touchend", "#rel", 10, 34, false);
+      await flushPosts();
+      stop();
+      expect(selections).toEqual([]);
+      expect(end.defaultPrevented).toBe(false);
+      document.body.removeAttribute("data-plannotator-touch");
+    });
+
+    test("touch, armed: Android's long-press contextmenu fires the hold at once and shows no menu", async () => {
+      setUp('<a id="rel" href="next.html">Next</a>', true);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
+      touch("touchstart", "#rel", 10, 10);
+      await wait(50);
+      const menu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 10, clientY: 10 });
+      document.querySelector("#rel")!.dispatchEvent(menu);
+      await flushPosts();
+      expect(menu.defaultPrevented).toBe(true);
+      expect(selections.length).toBe(1);
+      await wait(500); // the timer does not pin a second time
+      touch("touchend", "#rel", 10, 10, false);
+      await flushPosts();
+      stop();
+      expect(selections.length).toBe(1);
+      postBridge({ type: "plannotator-bridge-cancel-selection" });
+      document.body.removeAttribute("data-plannotator-touch");
+    });
+
+    test("touch, Interact: a hold pins nothing (the platform's own long-press), a tap follows", async () => {
+      setUp('<a id="rel" href="next.html">Next</a>', false);
+      await flushPosts();
+      const { selections, stop } = collectSelections();
+      touch("touchstart", "#rel", 10, 10);
+      await wait(600);
+      const end = touch("touchend", "#rel", 10, 10, false);
+      clickLink("#rel");
+      await flushPosts();
+      stop();
+      expect(selections).toEqual([]);
+      expect(end.defaultPrevented).toBe(false);
+      expect(capturedLinkPosts.map((p) => p.href)).toEqual(["next.html"]);
+      document.body.removeAttribute("data-plannotator-touch");
     });
 
     test("javascript: hrefs stay the page's own scripting", async () => {
@@ -4387,5 +5183,54 @@ describe("injectIntoHead", () => {
     // Other meta tags survive untouched.
     const keep = '<meta http-equiv="refresh" content="0"><meta charset="utf-8">';
     expect(injectIntoHead(`<head>${keep}</head>`, "[X]")).toContain(keep);
+  });
+});
+
+describe("injectPrintDefaults", () => {
+  const STYLE = /<style>[\s\S]*?<\/style>/;
+  const styleAt = (html: string) => html.search(STYLE);
+
+  // Before the doctype, the page would render in quirks mode on screen.
+  test("a document with a doctype and no <head> gets the style after the doctype", () => {
+    const out = injectPrintDefaults("<!DOCTYPE html>\n<p>no head</p>");
+    expect(out.startsWith("<!DOCTYPE html>")).toBe(true);
+    expect(styleAt(out)).toBe("<!DOCTYPE html>".length);
+    expect(out.endsWith("\n<p>no head</p>")).toBe(true);
+  });
+
+  test("a comment before the doctype is not mistaken for the insertion point", () => {
+    const out = injectPrintDefaults("<!-- built by x --><!doctype html><p>body</p>");
+    expect(styleAt(out)).toBe("<!-- built by x --><!doctype html>".length);
+  });
+
+  test("a <head> inside a comment or an early script is skipped for the real one", () => {
+    const real = "<head><title>t</title>";
+    const commented = `<!doctype html><!-- <head> moved below --><html>${real}</head><body></body></html>`;
+    const out = injectPrintDefaults(commented);
+    expect(out).toContain("<!-- <head> moved below -->");
+    expect(styleAt(out)).toBe(commented.indexOf(real) + "<head>".length);
+
+    const scripted = `<script>document.write("<head>")</script><html>${real}</head></html>`;
+    expect(styleAt(injectPrintDefaults(scripted))).toBe(scripted.indexOf(real) + "<head>".length);
+  });
+
+  test("a <head> with attributes takes the style just inside it, ahead of author styles", () => {
+    const html = '<!doctype html><html><head lang="en"><style>@layer a{}</style></head></html>';
+    const out = injectPrintDefaults(html);
+    expect(styleAt(out)).toBe(html.indexOf('<head lang="en">') + '<head lang="en">'.length);
+  });
+
+  test("a fragment with no doctype and no <head> gets the style first", () => {
+    expect(styleAt(injectPrintDefaults("<p>x</p>"))).toBe(0);
+  });
+
+  test("without sectionBreaks only the no-clip and pre-wrap rules are added, no pagination", () => {
+    const out = injectPrintDefaults("<!doctype html><html><head></head><body><section>a</section></body></html>");
+    const css = out.match(STYLE)?.[0] ?? "";
+    expect(css).toContain("overflow: visible");
+    expect(css).toContain("pre-wrap");
+    expect(css).not.toContain("break-inside");
+    expect(css).not.toContain("break-after");
+    expect(css).not.toContain("min-height");
   });
 });

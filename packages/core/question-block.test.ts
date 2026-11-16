@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildQuestionAnswerAnnotation,
+  capQuestionPrompt,
+  MAX_QUESTION_PROMPT_CHARS,
   canonicalQuestionAnswer,
   formatQuestionAnswerText,
   formatQuestionAnswersSection,
@@ -75,6 +77,46 @@ iOS background execution is unreliable.
     expect(q.choices.map((c) => c.recommended)).toEqual([true, true, false]);
   });
 
+  test("a multi recommendation naming a choice whole, its description holding a comma, matches every choice", () => {
+    const body = [
+      "What should the first Inbox release carry?",
+      "",
+      "- [ ] Reply box",
+      "- [ ] Mark read",
+      "- [ ] Comments on attached files — about one line of work, could ship first",
+      "- [ ] Search",
+      "",
+      "Recommended: Reply box, Mark read, Comments on attached files — about one line of work, could ship first",
+    ].join("\n");
+    const q = parseQuestionBlock("question-multi", body)!;
+    expect(q.choices.map((c) => c.recommended)).toEqual([true, true, true, false]);
+    expect(q.suggestedText).toBeUndefined();
+    // The same with `;` between items.
+    const semi = parseQuestionBlock("question-multi", body.replace(/Recommended: .*/, "Recommended: Search; Comments on attached files — about one line of work, could ship first"))!;
+    expect(semi.choices.map((c) => c.recommended)).toEqual([false, false, true, true]);
+  });
+
+  test("parts are joined back only into a choice's full text, and only when every part is covered", () => {
+    const choices = `Which?\n- [ ] Alpha — cheap, fast\n- [ ] Beta\n- [ ] Gamma`;
+    const rec = (line: string) => parseQuestionBlock("question-multi", `${choices}\nRecommended: ${line}`)!;
+    // `Alpha — cheap, fast` is joined back because it is that choice's full text.
+    expect(rec("Beta, Alpha — cheap, fast").choices.map((c) => c.recommended)).toEqual([true, true, false]);
+    // `Beta — sure` is not a full text: it stays its own part (named by its head).
+    expect(rec("Gamma, Alpha — cheap, fast, Beta — sure").choices.map((c) => c.recommended)).toEqual([true, true, true]);
+    // A part naming nothing still names nothing: the whole line is a suggestion.
+    const none = rec("Beta, Alpha — cheap, fast, Delta");
+    expect(none.choices.every((c) => !c.recommended)).toBe(true);
+    expect(none.suggestedText).toBe("Beta, Alpha — cheap, fast, Delta");
+  });
+
+  test("lettered plain bullets: a whole lettered choice with a comma in its description is joined back too", () => {
+    // Before the join, the split failed (`steady` names nothing) and the final
+    // lettered fallback named only `a.`; now both are named.
+    const q = parseQuestionBlock("question-multi", "Which?\n\n- a. Alpha\n- b. Beta — slow, steady\n\nRecommended: a. Alpha first, b. Beta — slow, steady")!;
+    expect(q.choices.map((c) => [c.label, c.recommended])).toEqual([["a. Alpha", true], ["b. Beta", true]]);
+    expect(q.suggestedText).toBeUndefined();
+  });
+
   test("a recommendation that names no choice becomes a suggested answer", () => {
     const q = parseQuestionBlock("question", `Pick\n- [ ] A\n- [ ] B\nRecommended: something else entirely`)!;
     expect(q.choices.every((c) => !c.recommended)).toBe(true);
@@ -110,7 +152,6 @@ iOS background execution is unreliable.
     expect(parseQuestionBlock("question", "")).toBeNull();
     expect(parseQuestionBlock("question", "- [ ] only choices\n- [ ] no prompt")).toBeNull();
     expect(parseQuestionBlock("question", "Recommended: nothing to ask")).toBeNull();
-    expect(parseQuestionBlock("question", `Q?\n${"x".repeat(25_000)}`)).toBeNull();
     expect(parseQuestionBlock("question", undefined as unknown as string)).toBeNull();
   });
 });
@@ -498,11 +539,24 @@ describe("parseQuestionAnswer", () => {
     }
   });
 
-  test("truncates to the caps", () => {
-    const parsed = parseQuestionAnswer(answer({ prompt: "p".repeat(900), text: "t".repeat(9000), selected: Array.from({ length: 30 }, (_, i) => `c${i}`) }))!;
+  test("keeps the person's long answer, Other and note whole; only the prompt copy is cut", () => {
+    const long = "t".repeat(50_000);
+    const parsed = parseQuestionAnswer(answer({ prompt: "p".repeat(900), text: long, other: long, note: long }))!;
     expect(parsed.prompt.length).toBe(400);
-    expect(parsed.text!.length).toBe(4000);
-    expect(parsed.selected.length).toBe(20);
+    expect(parsed.text).toBe(long);
+    expect(parsed.other).toBe(long);
+    expect(parsed.note).toBe(long);
+  });
+
+  test("never cuts a prompt inside an emoji, and the Inbox's check cuts it the same way", () => {
+    // The 400th code unit is the first half of a surrogate pair.
+    const prompt = `${"p".repeat(399)}😀 and more`;
+    const capped = capQuestionPrompt(prompt);
+    expect(capped).toBe("p".repeat(399));
+    expect(parseQuestionAnswer(answer({ prompt }))!.prompt).toBe(capped);
+    expect(capped.length).toBeLessThanOrEqual(MAX_QUESTION_PROMPT_CHARS);
+    // A prompt that fits is kept whole.
+    expect(capQuestionPrompt("Ship it? 😀")).toBe("Ship it? 😀");
   });
 });
 
@@ -605,6 +659,36 @@ Answer:
     expect(multi).toContain("Answer: Nowhere\nNote:\n> First line.\n> Second line.\n");
     const single = formatQuestionAnswersSection(items, [answer({ key: key(1), prompt: "Where", selected: ["Nowhere"], note: "one line" })]);
     expect(single).toContain("Answer: Nowhere\nNote: one line\n");
+  });
+
+  test("a multi-line Other answer keeps its line breaks, quoted the way a multi-line note is", () => {
+    const three = "Keep the loser locally.\nShow it under History.\nPurge it after a week.";
+    const single = formatQuestionAnswersSection(items, [answer({ key: key(2), prompt: "Background sync?", other: three })]);
+    expect(single).toContain(
+      "### Q2. Background sync? (line 34)\nAnswer: Other:\n> Keep the loser locally.\n> Show it under History.\n> Purge it after a week.\n\n",
+    );
+    // A blank line inside it and Windows line ends: still one quote, never a blank line that would end the block.
+    const gaps = formatQuestionAnswersSection(items, [answer({ key: key(2), prompt: "Background sync?", other: "First.\r\n\r\nThird." })]);
+    expect(gaps).toContain("Answer: Other:\n> First.\n> \n> Third.\n\n");
+    // With picks (pick any): the quote sits under its bullet, Other last as today.
+    const picks = formatQuestionAnswersSection(items, [
+      answer({ key: key(3), kind: "multi", prompt: "Which indicators?", selected: ["Dot"], other: "A sound\nOnly when muted" }),
+    ]);
+    expect(picks).toContain("### Q3. Which indicators? (line 45)\nAnswer:\n- Dot\n- Other:\n  > A sound\n  > Only when muted\n\n");
+    // With a multi-line note too: each keeps its own quote.
+    const both = formatQuestionAnswersSection(items, [
+      answer({ key: key(2), prompt: "Background sync?", other: "One.\nTwo.", note: "Why.\nBecause." }),
+    ]);
+    expect(both).toContain("Answer: Other:\n> One.\n> Two.\nNote:\n> Why.\n> Because.\n");
+  });
+
+  test("a one-line Other answer reads exactly as before, whatever spaces or a last Enter it carries", () => {
+    for (const other of ["foreground only", "foreground  only", "foreground only\n", "\n  foreground\tonly  \n\n"]) {
+      const out = formatQuestionAnswersSection(items, [answer({ key: key(2), prompt: "Background sync?", other })]);
+      expect(out).toContain("### Q2. Background sync? (line 34)\nAnswer: Other: foreground only\n\n");
+    }
+    const picks = formatQuestionAnswersSection(items, [answer({ key: key(3), kind: "multi", prompt: "Which indicators?", selected: ["Dot"], other: "A sound\n" })]);
+    expect(picks).toContain("Answer:\n- Dot\n- Other: A sound\n\n");
   });
 
   test("no reportable answer means no section", () => {
@@ -737,8 +821,210 @@ describe("long task-list choices (picked as written)", () => {
     expect(canonicalQuestionAnswer(q, cutLoose)).toBe(cutLoose);
   });
 
-  test("selected stays bounded: a label longer than any block body is cut", () => {
-    const parsed = parseQuestionAnswer(answer({ selected: ["x".repeat(30_000)] }))!;
-    expect(parsed.selected[0].length).toBe(20_000);
+  test("a question over 20,000 characters with 25 choices keeps every choice, and each can be picked whole", () => {
+    const labels = Array.from({ length: 25 }, (_, i) => `Option ${i + 1} ${"x".repeat(1_000)}`);
+    const q = parseQuestionBlock("question-multi", `Which ones?\n\n${labels.map((l) => `- [ ] ${l}`).join("\n")}`)!;
+    expect(q).not.toBeNull();
+    expect(q.choices.map((c) => c.label)).toEqual(labels);
+    const plain = parseQuestionBlock("question", `Which one?\n\n${labels.map((l) => `- ${l.slice(0, 20)}`).join("\n")}`)!;
+    expect(plain.choices).toHaveLength(25);
+    const parsed = parseQuestionAnswer(answer({ kind: "multi", selected: labels }))!;
+    expect(parsed.selected).toEqual(labels);
+  });
+});
+
+// The owner's 2026-10-24 report: an agent wrote the block below; the card drew
+// a "Suggested · Unpin it" row with its own Use button beside Accept
+// recommended (the recommendation named no choice exactly), and glued the
+// `Context:` line onto the last choice's label.
+const OWNERS_BLOCK = [
+  "What happens to a pin when you archive the thread?",
+  "Recommended: Unpin it",
+  '- Unpin it: the toast says "Archived · Unpinned", and Undo restores both',
+  "- Keep it pinned",
+  "Context: an archived thread gets nothing new, because the agent's next message starts a new thread.",
+].join("\n");
+const OWNERS_CONTEXT = "Context: an archived thread gets nothing new, because the agent's next message starts a new thread.";
+
+describe("a recommendation naming the start of a choice", () => {
+  test("the owner's block: the recommended choice is the one it begins, no suggestion, the key unchanged", () => {
+    const q = parseQuestionBlock("question", OWNERS_BLOCK)!;
+    expect(q.choices.map((c) => [c.label, c.recommended])).toEqual([
+      ['Unpin it: the toast says "Archived · Unpinned", and Undo restores both', true],
+      ["Keep it pinned", false],
+    ]);
+    expect(q.suggestedText).toBeUndefined();
+    expect(q.recommendation).toBe("Unpin it");
+    expect(q.key).toBe(questionKey("single", "What happens to a pin when you archive the thread?"));
+    // Accept recommended picks that choice.
+    expect(recommendedQuestionAnswer({ line: 1, question: q })!.selected).toEqual([q.choices[0]!.label]);
+  });
+
+  for (const [sep, label] of [
+    [":", "Unpin it: the toast says so"],
+    ["(", "Unpin it (Undo restores it)"],
+    [" - ", "Unpin it - Undo restores it"],
+    ["–", "Unpin it– Undo restores it"],
+    ["—", "Unpin it—Undo restores it"],
+  ] as const) {
+    test(`a task-list label that goes on after ${JSON.stringify(sep)}`, () => {
+      const q = parseQuestionBlock("question", ["Pin on archive?", "", `- [ ] ${label}`, "- [ ] Keep it pinned", "", "Recommended: Unpin it"].join("\n"))!;
+      expect(q.choices.find((c) => c.recommended)?.label).toBe(label.split(/\s+-\s/)[0]!.trim());
+      expect(q.suggestedText).toBeUndefined();
+    });
+  }
+
+  test("compared case-insensitively, emphasis and a trailing period aside", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- [ ] **Unpin it**: toast says so", "- [ ] Keep it", "Recommended: _unpin IT_."].join("\n"))!;
+    expect(q.choices[0]!.recommended).toBe(true);
+    expect(q.suggestedText).toBeUndefined();
+  });
+
+  test("a recommendation with its own reason still names the choice it begins", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- Unpin it: toast says so", "- Keep it", "Recommended: Unpin it — Undo restores both"].join("\n"))!;
+    expect(q.choices[0]!.recommended).toBe(true);
+  });
+
+  test("two choices it begins: ambiguous, so it stays a suggested answer", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- [ ] Unpin it: now", "- [ ] Unpin it (later)", "Recommended: Unpin it"].join("\n"))!;
+    expect(q.choices.some((c) => c.recommended)).toBe(false);
+    expect(q.suggestedText).toBe("Unpin it");
+  });
+
+  test("no separator after it (the label only starts with the same words): a suggested answer", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- [ ] Unpin it now", "- [ ] Keep it", "Recommended: Unpin it"].join("\n"))!;
+    expect(q.choices.some((c) => c.recommended)).toBe(false);
+    expect(q.suggestedText).toBe("Unpin it");
+  });
+
+  test("names no choice at all: a suggested answer, as before", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- [ ] Unpin it: now", "- [ ] Keep it", "Recommended: Ask me later"].join("\n"))!;
+    expect(q.suggestedText).toBe("Ask me later");
+  });
+
+  test("an exact label wins over a label it begins", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- [ ] Unpin it: and tell me", "- [ ] Unpin it", "Recommended: Unpin it"].join("\n"))!;
+    expect(q.choices.map((c) => c.recommended)).toEqual([false, true]);
+  });
+
+  test("a pick-any list names each choice by its start", () => {
+    const q = parseQuestionBlock("question-multi", ["Which ship?", "- Dot: per document", "- Banner: global", "- Toasts: on error", "Recommended: Dot, Banner"].join("\n"))!;
+    expect(q.choices.map((c) => c.recommended)).toEqual([true, true, false]);
+    expect(q.suggestedText).toBeUndefined();
+  });
+});
+
+describe("a Context: line", () => {
+  test("the owner's block: it is context, never the last choice's label", () => {
+    const q = parseQuestionBlock("question", OWNERS_BLOCK)!;
+    expect(q.choices[1]!.label).toBe("Keep it pinned");
+    expect(q.context).toBe(OWNERS_CONTEXT);
+    expect(q.prompt).toBe("What happens to a pin when you archive the thread?");
+  });
+
+  test("an answer stored under the label older builds read (the context joined on) still selects the choice", () => {
+    const q = parseQuestionBlock("question", OWNERS_BLOCK)!;
+    const stored = `Keep it pinned ${OWNERS_CONTEXT}`;
+    expect(q.choices[1]!.aliases).toContain(stored);
+    const answer: QuestionAnswer = { v: 1, key: q.key, kind: "single", prompt: q.prompt, selected: [stored] };
+    expect(canonicalQuestionAnswer(q, answer).selected).toEqual(["Keep it pinned"]);
+  });
+
+  test("it ends a plain bullet even when it wraps over lines; the wrapped lines are context too", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- Unpin it", "- Keep it pinned", "Context: an archived thread", "gets nothing new."].join("\n"))!;
+    expect(q.choices.map((c) => c.label)).toEqual(["Unpin it", "Keep it pinned"]);
+    expect(q.context).toBe("Context: an archived thread\ngets nothing new.");
+  });
+
+  test("indented under a task-list choice it is context, not that choice's description", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- [ ] Unpin it", "- [ ] Keep it pinned", "  Context: archived threads get nothing new."].join("\n"))!;
+    expect(q.choices[1]).toEqual({ label: "Keep it pinned", settled: false, recommended: false });
+    expect(q.context).toBe("Context: archived threads get nothing new.");
+  });
+
+  test("in bold too", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- Unpin it", "- Keep it pinned", "**Context:** archived threads get nothing new."].join("\n"))!;
+    expect(q.choices[1]!.label).toBe("Keep it pinned");
+    expect(q.context).toBe("**Context:** archived threads get nothing new.");
+  });
+
+  test("it never wraps a recommendation", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- [ ] Unpin it", "- [ ] Keep it", "Recommended: Unpin it", "context: archived threads get nothing new"].join("\n"))!;
+    expect(q.recommendation).toBe("Unpin it");
+    expect(q.choices[0]!.recommended).toBe(true);
+    expect(q.context).toBe("context: archived threads get nothing new");
+  });
+
+  test("first in the block it is still the prompt (keys do not move)", () => {
+    const q = parseQuestionBlock("question", ["Context: which pin rule?", "- [ ] Unpin", "- [ ] Keep"].join("\n"))!;
+    expect(q.prompt).toBe("Context: which pin rule?");
+    expect(q.key).toBe(questionKey("single", "Context: which pin rule?"));
+  });
+
+  test("other `Word:` lines are unchanged: a lazy `Note:` line still continues a plain bullet", () => {
+    const q = parseQuestionBlock("question", ["Pin on archive?", "- Unpin it", "- Keep it pinned", "Note: this wraps."].join("\n"))!;
+    expect(q.choices[1]!.label).toBe("Keep it pinned Note: this wraps.");
+  });
+});
+
+describe("review of #2139", () => {
+  test("pick any: a recommendation naming the start of one choice whole is that choice, not its split parts", () => {
+    const q = parseQuestionBlock("question-multi", ["Pick?", "Recommended: Search and replace", "- [ ] Search (fast)", "- [ ] Replace (slow)", "- [ ] Search and replace: both"].join("\n"))!;
+    expect(q.choices.map((c) => c.recommended)).toEqual([false, false, true]);
+    expect(q.suggestedText).toBeUndefined();
+  });
+
+  test("pick any: a list still names each choice", () => {
+    const q = parseQuestionBlock("question-multi", ["Pick?", "Recommended: Search and Replace", "- [ ] Search (fast)", "- [ ] Replace (slow)", "- [ ] Both"].join("\n"))!;
+    expect(q.choices.map((c) => c.recommended)).toEqual([true, true, false]);
+  });
+
+  test("a Context: line inside a code fence in a choice's continuation is code, not context", () => {
+    const task = parseQuestionBlock("question", ["Pick?", "- [ ] A", "  ```", "  Context: x", "  ```", "- [ ] B"].join("\n"))!;
+    expect(task.choices[0]).toMatchObject({ label: "A", description: "``` Context: x ```" });
+    expect(task.context).toBe("");
+    const plain = parseQuestionBlock("question", ["Pick?", "- A", "  ```", "  Context: x", "  ```", "- B", "Context: real"].join("\n"))!;
+    expect(plain.choices.map((c) => c.label)).toEqual(["A ``` Context: x ```", "B"]);
+    expect(plain.context).toBe("Context: real");
+    // After the fence closes the rule holds again.
+    const after = parseQuestionBlock("question", ["Pick?", "- [ ] A", "  ```", "  code", "  ```", "  Context: after", "- [ ] B"].join("\n"))!;
+    expect(after.choices[0]!.description).toBe("``` code ```");
+    expect(after.context).toBe("Context: after");
+  });
+
+  test("(your recommendation): a plan-review draft that holds the recommendation's words as Other", () => {
+    const md = [":::question", "What happens to a pin when you archive the thread?", "Recommended: Unpin it", "- [ ] Unpin it: the toast says so", "- [ ] Keep it pinned", ":::"].join("\n");
+    const indexed = indexQuestionBlocks([{ id: "b1", type: "directive", content: md.split("\n").slice(1, -1).join("\n"), directiveKind: "question", order: 0, startLine: 1 } as never]);
+    expect(indexed).toHaveLength(1);
+    const q = indexed[0]!.question;
+    expect(q.choices[0]!.recommended).toBe(true);
+    const draft: QuestionAnswer = { v: 1, key: q.key, kind: "single", prompt: q.prompt, selected: [], other: "Unpin it" };
+    expect(formatQuestionAnswersSection(questionExportItems(indexed), [draft])).toContain("(your recommendation)");
+    // Other words in Other are not the recommendation.
+    expect(formatQuestionAnswersSection(questionExportItems(indexed), [{ ...draft, other: "Ask me later" }])).not.toContain("(your recommendation)");
+  });
+
+  test("(your recommendation): an item with no recommended label whose suggestion begins one choice", () => {
+    const item = { key: "q-11111111", number: 1, prompt: "Pin?", recommendedLabels: [], suggestedText: "Unpin it", choiceLabels: ["Unpin it: the toast says", "Keep it pinned"], settled: false };
+    const pick = (selected: string[]): QuestionAnswer => ({ v: 1, key: item.key, kind: "single", prompt: item.prompt, selected });
+    expect(formatQuestionAnswersSection([item], [pick(["Unpin it: the toast says"])])).toContain("(your recommendation)");
+    expect(formatQuestionAnswersSection([item], [pick(["Keep it pinned"])])).not.toContain("(your recommendation)");
+    // Two choices it begins: ambiguous, never marked.
+    const two = { ...item, choiceLabels: ["Unpin it: now", "Unpin it (later)"] };
+    expect(formatQuestionAnswersSection([two], [pick(["Unpin it: now"])])).not.toContain("(your recommendation)");
+  });
+
+  test("(your recommendation): the suggestion's head is matched against each choice's aliases too", () => {
+    // The stored label is the old one; its alias is what the suggestion begins.
+    const item = { key: "q-33333333", number: 1, prompt: "Pin?", recommendedLabels: [], suggestedText: "Unpin it", choiceLabels: ["Drop it", "Keep it pinned"], choiceAliases: [["Unpin it: the toast says"], undefined], settled: false };
+    const pick: QuestionAnswer = { v: 1, key: item.key, kind: "single", prompt: item.prompt, selected: ["Drop it"] };
+    expect(formatQuestionAnswersSection([item], [pick])).toContain("(your recommendation)");
+    expect(formatQuestionAnswersSection([{ ...item, choiceAliases: undefined }], [pick])).not.toContain("(your recommendation)");
+  });
+
+  test("the recommended row's answer (the suggestion as Other) exports as the recommendation", () => {
+    const item = { key: "q-22222222", number: 1, prompt: "Store?", recommendedLabels: [], suggestedText: "SQLite on the box", recommendation: "SQLite on the box", choiceLabels: ["Redis", "Memcached"], settled: false };
+    const other: QuestionAnswer = { v: 1, key: item.key, kind: "single", prompt: item.prompt, selected: [], other: "SQLite on the box" };
+    expect(formatQuestionAnswersSection([item], [other])).toContain("Other: SQLite on the box (your recommendation)");
   });
 });

@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
-import { createPiSessionBridgeHub, PI_INBOX_REMINDER_CUSTOM_TYPE, PLANNOTATOR_ASK_CUSTOM_TYPE } from "./pi-session-bridge.ts";
+import { createPiSessionBridgeHub, PI_INBOX_BRIEFING_CUSTOM_TYPE, PI_INBOX_REMINDER_CUSTOM_TYPE, PLANNOTATOR_ASK_CUSTOM_TYPE } from "./pi-session-bridge.ts";
 import {
 	SESSION_ASK_HEADER,
 	SESSION_ASK_TAKEN_OVER_INTERRUPT_TEXT,
@@ -386,20 +386,26 @@ describe("Pi session bridge", () => {
 	// The failure this guards: the Inbox's session-start reminder rides the
 	// session's first run, which can be the run answering our question; read
 	// as a take-over it would cut the answer off before it started.
-	test("the Inbox's session-start reminder in the run answering our question is not a take-over", () => {
-		const host = fakePi();
-		const bridge = createPiSessionBridgeHub(host.pi).createBridge(host.ctx as never, {});
-		const out = sink();
-		bridge.ask({ askId: "ask-1", text: "Question text", mode: "turn" }, out.sink, new AbortController().signal);
-		host.startTurn("ask-1");
-		host.emit("message_start", { type: "message_start", message: { role: "custom", customType: PI_INBOX_REMINDER_CUSTOM_TYPE, details: {} } });
-		host.assistantText("Because of X.");
-		host.endTurn();
-		expect(out.calls).toEqual([
-			["delta", "Because of X."],
-			["done", "Because of X."],
-		]);
-	});
+	// /plannotator-inbox's hidden briefing rides the next prompt the same way.
+	for (const [name, customType] of [
+		["the Inbox's session-start reminder", PI_INBOX_REMINDER_CUSTOM_TYPE],
+		["/plannotator-inbox's Inbox briefing", PI_INBOX_BRIEFING_CUSTOM_TYPE],
+	] as const) {
+		test(`${name} in the run answering our question is not a take-over`, () => {
+			const host = fakePi();
+			const bridge = createPiSessionBridgeHub(host.pi).createBridge(host.ctx as never, {});
+			const out = sink();
+			bridge.ask({ askId: "ask-1", text: "Question text", mode: "turn" }, out.sink, new AbortController().signal);
+			host.startTurn("ask-1");
+			host.emit("message_start", { type: "message_start", message: { role: "custom", customType, details: {} } });
+			host.assistantText("Because of X.");
+			host.endTurn();
+			expect(out.calls).toEqual([
+				["delta", "Because of X."],
+				["done", "Because of X."],
+			]);
+		});
+	}
 
 	test("through the provider: a take-over keeps the partial answer and ends with the note", async () => {
 		const host = fakePi();
@@ -479,6 +485,78 @@ describe("Pi annotate server with Ask this session", () => {
 		for (const key of keys) {
 			if (saved[key] === undefined) delete process.env[key];
 			else process.env[key] = saved[key];
+		}
+	});
+
+	test("superseding an Ask answer leaves Pi running until the reviewer chooses to interrupt", async () => {
+		const host = fakePi();
+		const hub = createPiSessionBridgeHub(host.pi);
+		const server = await startAnnotateServer({
+			filePath: join(dir, "notes.md"),
+			markdown: "# Notes\n",
+			htmlContent: "<html></html>",
+			sessionBridge: hub.createBridge(host.ctx as never, {}),
+		});
+		const post = (path: string, body: unknown) => fetch(`${server.url}/api/ai/${path}`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+		try {
+			const { sessionId } = await (await post("session", {
+				providerId: "session-bridge",
+				context: { mode: "annotate", annotate: { content: "# Notes\n" } },
+			})).json() as { sessionId: string };
+			const first = post("query", { sessionId, prompt: "Correct the first passage" }).then(r => r.text());
+			for (let i = 0; host.sent.length === 0 && i < 100; i++) await Bun.sleep(5);
+			expect(host.sent).toHaveLength(1);
+			host.startTurn(host.sent[0].message.details!.askId!);
+			host.assistantText("Working on it.");
+
+			expect((await post("abort", { sessionId, reason: "supersede" })).status).toBe(200);
+			await first;
+			expect(host.aborts).toHaveLength(0);
+			expect(hub.hasActiveAsk).toBe(true);
+
+			const busy = await (await post("query", { sessionId, prompt: "And the next passage?" })).text();
+			expect(busy).toContain('"code":"agent_busy"');
+			expect(host.sent).toHaveLength(1);
+			expect(host.aborts).toHaveLength(0);
+
+			const waiting = post("query", { sessionId, prompt: "And the next passage?", busyPolicy: "wait" });
+			const reader = (await waiting).body!.getReader();
+			const status = new TextDecoder().decode((await reader.read()).value);
+			expect(status).toContain('"status":"waiting"');
+			expect(host.aborts).toHaveLength(0);
+			expect(host.sent).toHaveLength(1);
+			host.assistantText("First correction complete.");
+			host.endTurn();
+			for (let i = 0; host.sent.length === 1 && i < 100; i++) await Bun.sleep(5);
+			expect(host.sent).toHaveLength(2);
+			host.startTurn(host.sent[1].message.details!.askId!);
+			host.assistantText("Working on the second correction.");
+			await post("abort", { sessionId, reason: "supersede" });
+			while (!(await reader.read()).done) { /* Drain the superseded answer. */ }
+			expect(host.aborts).toHaveLength(0);
+
+			const interrupting = await post("query", { sessionId, prompt: "Do this instead", busyPolicy: "interrupt" });
+			const interruptedReader = interrupting.body!.getReader();
+			const interruptedStatus = new TextDecoder().decode((await interruptedReader.read()).value);
+			expect(interruptedStatus).toContain('"status":"interrupting"');
+			expect(host.aborts).toHaveLength(1);
+			host.endTurn("aborted");
+			for (let i = 0; host.sent.length === 2 && i < 100; i++) await Bun.sleep(5);
+			expect(host.sent).toHaveLength(3);
+			host.startTurn(host.sent[2].message.details!.askId!);
+			host.assistantText("Replacement answer.");
+
+			// The Stop button still cancels the question that is now running.
+			await post("abort", { sessionId });
+			expect(host.aborts).toHaveLength(2);
+			host.endTurn("aborted");
+			while (!(await interruptedReader.read()).done) { /* Drain the stopped answer. */ }
+		} finally {
+			host.endTurn();
+			server.stop();
 		}
 	});
 

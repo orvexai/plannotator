@@ -5,6 +5,7 @@
  * slash commands. Extracted from the event hook for modularity.
  */
 
+import { diagramEngineSourcesFromDir } from "@plannotator/shared/diagram-engine-assets";
 import {
   startReviewServer,
   handleReviewServerReady,
@@ -17,7 +18,7 @@ import { type DiffType, prepareLocalReviewDiff, detectManagedVcs, gitRuntime } f
 import { resolveReviewOpenState } from "@plannotator/shared/review-open-state";
 import { detectProjectName } from "@plannotator/server/project";
 import { parsePRUrl, checkPRAuth, fetchPR, getCliName, getMRLabel, getMRNumberLabel, getDisplayRepo } from "@plannotator/server/pr";
-import { loadConfig, resolveDefaultDiffType, resolveUseJina } from "@plannotator/shared/config";
+import { loadConfig, resolveDefaultDiffType, resolveDefaultDiffTypeFor, resolveUseJina } from "@plannotator/shared/config";
 import {
   composeReviewApprovedMessage,
   getAnnotateApprovedWithNotesPrompt,
@@ -52,18 +53,23 @@ import path from "path";
 import { resolveValidatedTargetAgent } from "./agent-switch";
 import { deliverOpenCodePrompt } from "./prompt-delivery-error";
 import { announceSessionUrl } from "./session-url";
+import { scheduleOpenCodeDailyPing } from "./daily-ping";
+import { decideListed } from "./session-registry";
 import {
   readLastUserAgent,
-  readMessageAgent,
   resolveAddressableAgent,
   resolveAnnotatedMessageAgent,
 } from "./message-agent";
+import { pickRecentAssistantMessages } from "./recent-messages";
 
 /** Shared dependencies injected by the plugin */
 export interface CommandDeps {
   client: any;
   htmlContent: string;
   reviewHtmlContent: string;
+  /** Code review's diagram engine folder (shipped beside review-editor.html);
+   *  absent or missing, diagram fences in the review show as code. */
+  reviewDiagramEngineDir?: string;
   getSharingEnabled: () => Promise<boolean>;
   getShareBaseUrl: () => string | undefined;
   getPasteApiUrl: () => string | undefined;
@@ -120,6 +126,7 @@ export async function handleReviewCommand(
   // plugin's existing log path and refuse to start a session.
   const openStatePinned = reviewArgs.base !== undefined || reviewArgs.diffType !== undefined;
   let initialBaseFromFlags: string | undefined;
+  let initialBaseExplicit = false;
 
   let rawPatch: string;
   let gitRef: string;
@@ -154,7 +161,10 @@ export async function handleReviewCommand(
     client.app.log({ level: "info", message: `Fetching ${getMRLabel(prRef)} ${getMRNumberLabel(prRef)} from ${getDisplayRepo(prRef)}...` });
 
     try {
-      await checkPRAuth(prRef);
+      // A GitHub PR the active gh account can't see runs as another signed-in
+      // account that can (#2157); the provider scopes its gh calls to this repo.
+      const access = await checkPRAuth(prRef);
+      if (access.notice) client.app.log({ level: "info", message: `[Plannotator] ${access.notice}` });
     } catch (err) {
       const cliName = getCliName(prRef);
       client.app.log({ level: "error", message: err instanceof Error ? err.message : `${cliName} auth check failed` });
@@ -216,7 +226,7 @@ export async function handleReviewCommand(
           vcsType: reviewArgs.vcsType,
           requestedDiffType: openState.requestedDiffType,
           requestedBase: openState.requestedBase,
-          configuredDiffType: resolveDefaultDiffType(config),
+          configuredDiffType: resolveDefaultDiffTypeFor(config, managedVcs?.id),
           hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
         });
         gitContext = diffResult.gitContext;
@@ -227,8 +237,9 @@ export async function handleReviewCommand(
         initialFingerprint = diffResult.fingerprint;
         // Forward the base the patch was computed against — without it the
         // server serves this patch under the detected default: a mixed-base
-        // review.
-        if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
+        // review. Evolution diff opens on the change's previous state.
+        if (openState.requestedBase !== undefined || diffResult.diffType === "jj-evolog") initialBaseFromFlags = diffResult.base;
+        initialBaseExplicit = openState.requestedBase !== undefined;
         initialFileIdentities = diffResult.fileIdentities;
       } catch (err) {
         client.app.log({ level: "error", message: err instanceof Error ? err.message : "Failed to prepare local review diff" });
@@ -267,17 +278,20 @@ export async function handleReviewCommand(
   const sessionId = event.properties?.sessionID;
 
   const startServer = deps.startReviewServer ?? startReviewServer;
+  // The daily ping (daily-ping.ts): in the background, never awaited.
+  scheduleOpenCodeDailyPing("review");
+  const reviewProject = (await detectProjectName(reviewDirectory ? reviewCwd : undefined)) ?? undefined;
   const server = await startServer({
     rawPatch,
     gitRef,
     error: diffError,
     origin: "opencode",
-    project: (await detectProjectName(reviewDirectory ? reviewCwd : undefined)) ?? undefined,
+    project: reviewProject,
     includeReviewDirectory: !!reviewDirectory,
     diffType: isPRMode ? undefined : userDiffType,
     gitContext,
     initialBase: initialBaseFromFlags,
-    initialBaseExplicit: initialBaseFromFlags !== undefined,
+    initialBaseExplicit,
     openStatePinned,
     // `--no-git-remote-check` (#1553): session-only, and only ever a disable —
     // undefined leaves PLANNOTATOR_GIT_REMOTE_CHECK / config.gitRemoteCheck deciding.
@@ -293,17 +307,18 @@ export async function handleReviewCommand(
     // prompt into — same per-session gating as the annotate command's advert.
     approvalNotesSupported: Boolean(sessionId),
     htmlContent: reviewHtmlContent,
+    diagramEngine: deps.reviewDiagramEngineDir ? diagramEngineSourcesFromDir(deps.reviewDiagramEngineDir) : undefined,
     opencodeClient: client,
     onReady: (url, isRemote, port) => {
-      handleReviewServerReady(url, isRemote, port);
+      // announce: false. The embedded runtime shares stderr with OpenCode's
+      // TUI renderer; announceSessionUrl is its visible channel for the URL.
+      handleReviewServerReady(url, isRemote, port, { announce: false });
       announceSessionUrl(client, "code review", url);
     },
   });
 
-  const result = await server.waitForDecision();
+  const result = await decideListed(server, "review", reviewProject);
   result.feedback = withReviewDirectory(result.feedback, result.reviewDirectory);
-  await Bun.sleep(1500);
-  server.stop();
 
   if (result.exit) {
     return;
@@ -354,6 +369,7 @@ export async function handleAnnotateCommand(
 ) {
   const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl, directory } = deps;
   const startServer = deps.startAnnotateServer ?? startAnnotateServer;
+  scheduleOpenCodeDailyPing("annotate");
 
   // @ts-ignore - Event properties contain arguments
   const rawArgs = event.properties?.arguments || event.arguments || "";
@@ -550,14 +566,14 @@ export async function handleAnnotateCommand(
     agentCwd,
     htmlContent,
     onReady: (url, isRemote, port) => {
-      handleAnnotateServerReady(url, isRemote, port);
+      // announce: false. The embedded runtime shares stderr with OpenCode's
+      // TUI renderer; announceSessionUrl is its visible channel for the URL.
+      handleAnnotateServerReady(url, isRemote, port, { announce: false });
       announceSessionUrl(client, "annotation UI", url);
     },
   });
 
-  const result = await server.waitForDecision();
-  await Bun.sleep(1500);
-  server.stop();
+  const result = await decideListed(server, "annotate", annotateProject);
 
   // A Done with nothing to send (#1701) carries the zero-state sentence as
   // feedback; it is not something the agent should act on.
@@ -623,6 +639,7 @@ export async function handleAnnotateLastCommand(
 ): Promise<{ approved: boolean; feedback: string; agent?: string } | null> {
   const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl, directory } = deps;
   const startServer = deps.startAnnotateServer ?? startAnnotateServer;
+  scheduleOpenCodeDailyPing("last");
 
   // @ts-ignore - Event properties contain arguments
   const rawArgs = event.properties?.arguments || event.arguments || "";
@@ -642,28 +659,11 @@ export async function handleAnnotateLastCommand(
   });
   const messages = messagesResponse.data;
 
-  const RECENT_LIMIT = 25;
-  const recentMessages: { messageId: string; text: string; timestamp?: string }[] = [];
+  const picked = pickRecentAssistantMessages(messages);
+  const recentMessages = picked.map(({ agent: _agent, ...message }) => message);
   // Who wrote each candidate message (#1612), kept beside the payload rather
   // than in it: the annotate server has no use for it.
-  const messageAgents: { messageId: string; agent?: string }[] = [];
-  if (messages) {
-    for (let i = messages.length - 1; i >= 0 && recentMessages.length < RECENT_LIMIT; i--) {
-      const msg = messages[i];
-      if (msg.info.role !== "assistant") continue;
-      const textParts = msg.parts
-        .filter((p: any) => p.type === "text" && p.text?.trim())
-        .map((p: any) => p.text);
-      if (textParts.length === 0) continue;
-      const messageId = msg.info.id ?? `opencode-${i}`;
-      recentMessages.push({
-        messageId,
-        text: textParts.join("\n"),
-        timestamp: msg.info.time?.created ? new Date(msg.info.time.created).toISOString() : undefined,
-      });
-      messageAgents.push({ messageId, agent: readMessageAgent(msg.info) });
-    }
-  }
+  const messageAgents = picked.map(({ messageId, agent }) => ({ messageId, agent }));
 
   const lastText = recentMessages[0]?.text ?? null;
   if (!lastText) {
@@ -690,14 +690,14 @@ export async function handleAnnotateLastCommand(
     approvalNotesSupported: true,
     htmlContent,
     onReady: (url, isRemote, port) => {
-      handleAnnotateServerReady(url, isRemote, port);
+      // announce: false. The embedded runtime shares stderr with OpenCode's
+      // TUI renderer; announceSessionUrl is its visible channel for the URL.
+      handleAnnotateServerReady(url, isRemote, port, { announce: false });
       announceSessionUrl(client, "annotation UI", url);
     },
   });
 
-  const result = await server.waitForDecision();
-  await Bun.sleep(1500);
-  server.stop();
+  const result = await decideListed(server, "annotate", lastProject);
 
   if (result.exit || (result.approved && !result.feedback) || result.nothingToSend === true) {
     return null;

@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ChevronDown, Check, Copy, MoreHorizontal } from 'lucide-react';
 import { AppIcon } from './icons/AppIcon';
-import { getLastOpenInApp, setLastOpenInApp } from '../utils/storage';
+import { useOpenInApps, useRememberedOpenInApp } from '../hooks/useOpenInApps';
 import { copyTextToClipboard } from '../utils/clipboard';
-import type { OpenInKind } from '@plannotator/core/open-in-apps';
+import { noteServerSessionMismatch, withServerSession } from '../utils/serverSession';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -27,13 +27,6 @@ import {
  * nothing when there is neither an app to open nor a diff to copy.
  */
 
-interface DetectedApp {
-  id: string;
-  label: string;
-  kind: OpenInKind;
-  icon: string;
-}
-
 interface OpenInAppButtonProps {
   filePath: string | null | undefined;
   base?: string | null;
@@ -47,31 +40,18 @@ interface OpenInAppButtonProps {
   /** When true, render the primary label text alongside the icon. */
   showLabel?: boolean;
   disabled?: boolean;
+  /**
+   * 1-based line to open at, when the catalog app's launcher takes one. A
+   * function is read at the moment of the click (the selection or the comment
+   * picked then), and may answer undefined: the file opens at its top.
+   */
+  line?: number | (() => number | undefined);
 }
 
 // The host app catalog is static for the session, but the all-files view
-// renders one OpenInAppButton per file — so fetch /api/open-in/apps once and
-// share the promise across every instance instead of N identical requests.
-interface OpenInAppsResponse {
-  available: boolean;
-  apps: DetectedApp[];
-}
-let openInAppsPromise: Promise<OpenInAppsResponse> | null = null;
-function loadOpenInApps(): Promise<OpenInAppsResponse> {
-  if (!openInAppsPromise) {
-    openInAppsPromise = fetch('/api/open-in/apps')
-      .then((r) => r.json())
-      .then((data: OpenInAppsResponse) => ({
-        available: !!data.available,
-        apps: Array.isArray(data.apps) ? data.apps : [],
-      }))
-      .catch(() => {
-        openInAppsPromise = null; // don't memoize failure — let the next mount retry
-        return { available: false, apps: [] };
-      });
-  }
-  return openInAppsPromise;
-}
+// renders one OpenInAppButton per file — so /api/open-in/apps is fetched once
+// and the promise shared across every instance (useOpenInApps).
+const OPEN_IN_APPS_URL = '/api/open-in/apps';
 
 export const OpenInAppButton: React.FC<OpenInAppButtonProps> = ({
   filePath,
@@ -80,26 +60,18 @@ export const OpenInAppButton: React.FC<OpenInAppButtonProps> = ({
   canOpen = true,
   showLabel = false,
   disabled = false,
+  line,
 }) => {
-  const [apps, setApps] = useState<DetectedApp[] | null>(null);
-  const [available, setAvailable] = useState<boolean | null>(null);
-  const [currentId, setCurrentId] = useState<string>(() => getLastOpenInApp());
+  const detected = useOpenInApps(OPEN_IN_APPS_URL);
+  const apps = detected?.apps ?? null;
+  const available = detected ? detected.available : null;
+  const [storedId, rememberApp] = useRememberedOpenInApp();
+  // Nothing picked yet: the file manager, as before.
+  const currentId = storedId ?? 'reveal';
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const errorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    loadOpenInApps().then((data) => {
-      if (cancelled) return;
-      setAvailable(data.available);
-      setApps(data.apps);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -137,12 +109,23 @@ export const OpenInAppButton: React.FC<OpenInAppButtonProps> = ({
     if (!filePath || busy) return;
     setBusy(true);
     setError(null);
+    const at = typeof line === 'function' ? line() : line;
     try {
       const res = await fetch('/api/open-in', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath, base: base ?? null, appId }),
+        // The stale-tab guard: a server that took over this port refuses it.
+        body: JSON.stringify(withServerSession({
+          filePath,
+          base: base ?? null,
+          appId,
+          ...(typeof at === 'number' && Number.isSafeInteger(at) && at > 0 ? { line: at } : {}),
+        })),
       });
+      if (await noteServerSessionMismatch(res)) {
+        flashError('This review was replaced. Reload the page.');
+        return;
+      }
       const data = (await res.json().catch(() => null)) as
         | { ok: boolean; error?: string }
         | null;
@@ -157,8 +140,7 @@ export const OpenInAppButton: React.FC<OpenInAppButtonProps> = ({
   };
 
   const selectApp = (appId: string) => {
-    setLastOpenInApp(appId);
-    setCurrentId(appId);
+    rememberApp(appId);
     setMenuOpen(false);
     void open(appId);
   };

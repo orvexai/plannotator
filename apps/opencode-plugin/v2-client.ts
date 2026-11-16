@@ -11,7 +11,7 @@ import type { OpenCodeBridgeAgent } from "./cli-bridge";
 
 /** The subset of the V2 session domain this plugin touches. */
 export interface V2SessionDomain {
-  get?: (input: { sessionID: string }) => Promise<{ location?: { directory?: string } }>;
+  get?: (input: { sessionID: string }) => Promise<{ location?: { directory?: string }; title?: string }>;
   prompt?: (input: {
     sessionID: string;
     text: string;
@@ -132,6 +132,13 @@ export interface V2BridgeClient {
    * transcript notice that starts no model turn (`createCommandFailureNotifier`).
    */
   notifyFailure?: (input: { command: string; message: string }) => Promise<unknown>;
+  /**
+   * Present with `notifyFailure`: `/plannotator-inbox` shows where the Inbox
+   * is, as a transcript notice that starts no model turn.
+   */
+  notifyInbox?: (input: { url: string; detail?: string }) => Promise<unknown>;
+  /** Present with `onInboxOpened`: `/plannotator-inbox` opened the Inbox (the session's briefing, `createInboxBriefings`). */
+  briefInbox?: () => void;
   app: {
     log: (entry: { level: "info" | "error"; message: string }) => void;
     agents: () => Promise<{ data: OpenCodeBridgeAgent[] }>;
@@ -245,8 +252,14 @@ export function toBridgeMessages(context: unknown): unknown[] {
       // V2 assistant messages record their writer (`Session.Message.Assistant`
       // carries `agent: Agent.ID`); /plannotator-last routes feedback to it.
       ...(typeof message.agent === "string" && message.agent ? { agent: message.agent } : {}),
+      // `pickRecentAssistantMessages` reads where a turn ends from these.
+      ...(message.error !== undefined ? { error: message.error } : {}),
+      ...(typeof message.finish === "string" ? { finish: message.finish } : {}),
     },
-    parts: Array.isArray(message.content) ? message.content : [],
+    // User and synthetic rows carry `text`, not `content`.
+    parts: Array.isArray(message.content) ? message.content
+      : typeof message.text === "string" ? [{ type: "text", text: message.text }]
+      : [],
   }));
 }
 
@@ -549,19 +562,57 @@ export function commandFailureNoticeText(command: string, message: string): stri
   return `${formatCommandFailureNotice(command, message)}${COMMAND_FAILURE_NOTICE_MARKER}`;
 }
 
-const COMMAND_FAILURE_NOTICE_RE = /^Plannotator \/plannotator-(?:review|annotate|last) failed: \S[\s\S]*\n\n\(Plannotator notice for the person; not a request\.\)$/;
+const COMMAND_FAILURE_NOTICE_RE = /^Plannotator \/plannotator-(?:review|annotate|last|inbox) failed: \S[\s\S]*\n\n\(Plannotator notice for the person; not a request\.\)$/;
 
-/** Is this model-context message one of our transcript notices (session URL or command failure)? */
-function isSessionUrlNoticeMessage(message: unknown): boolean {
-  if (!isRecord(message) || message.role !== "user") return false;
+/** What `/plannotator-inbox` shows the person: where the Inbox is (plus the CLI's note, e.g. how to reach it over SSH). */
+export function formatInboxNotice(url: string, detail?: string): string {
+  const note = detail?.trim();
+  return `Plannotator Inbox: ${url}${note ? `\n${note}` : ""}`;
+}
+
+/** The `text` of the Inbox notice: the visible lines plus the marker. */
+export function inboxNoticeText(url: string, detail?: string): string {
+  return `${formatInboxNotice(url, detail)}${COMMAND_FAILURE_NOTICE_MARKER}`;
+}
+
+const INBOX_NOTICE_RE = /^Plannotator Inbox: https?:\/\/\S+[\s\S]*\n\n\(Plannotator notice for the person; not a request\.\)$/;
+
+/** The text of a one-text-part user message, else undefined. */
+function userMessageText(message: unknown): string | undefined {
+  if (!isRecord(message) || message.role !== "user") return undefined;
   const content = message.content;
   const text = typeof content === "string"
     ? content
     : Array.isArray(content) && content.length === 1 && isRecord(content[0]) && content[0].type === "text"
       ? content[0].text
       : undefined;
+  return typeof text === "string" ? text : undefined;
+}
+
+/** Whether a request's messages hold `/plannotator-inbox`'s notice (the session opened the Inbox, maybe before a restart). */
+export function hasInboxNotice(messages: readonly unknown[]): boolean {
+  return messages.some((message) => INBOX_NOTICE_RE.test(userMessageText(message) ?? ""));
+}
+
+/**
+ * The OpenCode 2 sessions that opened the Inbox with `/plannotator-inbox`:
+ * from then on their requests carry the Inbox briefing (`addInboxBriefing` in
+ * server.ts), with no turn of its own. A session whose messages hold the
+ * command's notice counts too, so the briefing survives a restart.
+ */
+export function createInboxBriefings(): { mark(sessionID: string): void; wants(event: { sessionID: string; messages: readonly unknown[] }): boolean } {
+  const sessions = new Set<string>();
+  return {
+    mark: (sessionID) => void sessions.add(sessionID),
+    wants: (event) => sessions.has(event.sessionID) || hasInboxNotice(event.messages),
+  };
+}
+
+/** Is this model-context message one of our transcript notices (session URL or command failure)? */
+function isSessionUrlNoticeMessage(message: unknown): boolean {
+  const text = userMessageText(message);
   if (typeof text !== "string") return false;
-  if (COMMAND_FAILURE_NOTICE_RE.test(text)) return true;
+  if (COMMAND_FAILURE_NOTICE_RE.test(text) || INBOX_NOTICE_RE.test(text)) return true;
   return text.startsWith(SESSION_URL_NOTICE_PREFIX)
     && /^https?:\/\/\S+$/.test(text.slice(SESSION_URL_NOTICE_PREFIX.length));
 }
@@ -764,6 +815,20 @@ export function createCommandFailureNotifier(
   };
 }
 
+/** `/plannotator-inbox`'s notice: like the failure notice, for the person only, never a model turn. */
+export function createInboxNotifier(
+  ctx: V2ContextLike,
+  sessionID: string | undefined,
+): ((input: { url: string; detail?: string }) => Promise<unknown>) | undefined {
+  const synthetic = ctx.session?.synthetic;
+  if (typeof synthetic !== "function" || !sessionID) return undefined;
+  return async ({ url, detail }) => {
+    const description = formatInboxNotice(url, detail);
+    const text = inboxNoticeText(url, detail);
+    return await synthetic({ sessionID, text, description, resume: false, delivery: CO_PROMOTED_DELIVERY });
+  };
+}
+
 /**
  * Build the V1-shaped client `handleCliCommand` and `resolveValidatedTargetAgent`
  * expect, backed by the V2 context. Delivering feedback goes through
@@ -805,6 +870,8 @@ export function createV2BridgeClient(input: {
    * the slash commands; a tool launch reports its failure as the tool result.
    */
   failureNotices?: boolean;
+  /** `/plannotator-inbox` opened the Inbox: mark the session for the Inbox briefing. */
+  onInboxOpened?: () => void;
 }): V2BridgeClient {
   const warn = input.warn ?? ((message: string) => console.error(message));
   const loggedUrls = new Set<string>();
@@ -830,9 +897,12 @@ export function createV2BridgeClient(input: {
     ? async (url: { url: string; message: string }) => (noticeOpen() ? postNotice(url) : undefined)
     : postNotice;
   const notifyFailure = input.failureNotices ? createCommandFailureNotifier(input.ctx, input.sessionID) : undefined;
+  const notifyInbox = input.failureNotices ? createInboxNotifier(input.ctx, input.sessionID) : undefined;
   return {
     ...(notifyUrl && { notifyUrl }),
     ...(notifyFailure && { notifyFailure }),
+    ...(notifyInbox && { notifyInbox }),
+    ...(input.onInboxOpened && { briefInbox: input.onInboxOpened }),
     dispose: notice.dispose,
     app: {
       agents: async () => ({ data: await input.getAgents() }),

@@ -17,13 +17,15 @@
  *   - terminal               -> open the file's parent directory
  */
 
+import { childEnv, childPath } from "@plannotator/shared/child-env";
 import path from "node:path";
-import fs from "node:fs";
-import os from "node:os";
 import { spawn } from "node:child_process";
 import {
   OPEN_IN_APPS,
-  getOpenInApp,
+  checkOpenInAppId,
+  openInFileArgv,
+  openInMacArgv,
+  parseOpenInLine,
   resolveRevealLabel,
   resolveRevealIcon,
   type OpenInApp,
@@ -31,11 +33,15 @@ import {
   type OpenInPlatform,
 } from "@plannotator/shared/open-in-apps";
 import { resolveOpenInTarget } from "@plannotator/shared/html-assets-node";
+import { locateOpenInApp } from "@plannotator/shared/open-in-locate";
+import { isSameOriginOrNoOrigin } from "@plannotator/shared/request-origin";
+import { checkServerSession, serverSessionMismatchBody } from "@plannotator/shared/server-session";
 import { isRemoteSession } from "./remote";
 
 export type OpenInLaunchResult = { ok: true } | { ok: false; error: string };
 
-function currentPlatform(): OpenInPlatform {
+/** The catalog's name for this host's platform. */
+export function currentPlatform(): OpenInPlatform {
   switch (process.platform) {
     case "darwin":
       return "mac";
@@ -83,6 +89,7 @@ function runArgv(
 
     let child: ReturnType<typeof spawn>;
     try {
+      // windows-hide-guard: starts the app window the person asked for, which windowsHide would start hidden.
       child = spawn(cmd, args, {
         detached: true,
         stdio: ["ignore", "ignore", "pipe"],
@@ -169,7 +176,8 @@ function spawnDetached(
   friendlyName: string,
 ): Promise<OpenInLaunchResult> {
   try {
-    Bun.spawn([cmd, ...args], { stdout: "ignore", stderr: "ignore" });
+    // windows-hide-guard: starts the app window the person asked for, which windowsHide would start hidden.
+    Bun.spawn([cmd, ...args], { env: childEnv(), stdout: "ignore", stderr: "ignore" });
     return Promise.resolve({ ok: true });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -181,27 +189,9 @@ function spawnDetached(
 }
 
 /**
- * Launch the system-default handler for a path.
- */
-function openSystemDefault(target: string): Promise<OpenInLaunchResult> {
-  const platform = currentPlatform();
-  if (platform === "mac") {
-    return runArgv("open", [target], "default app");
-  }
-  if (platform === "win") {
-    // `start` is a cmd builtin; the empty-string title arg avoids the quoted
-    // target being treated as a window title.
-    return runArgv("cmd", ["/c", "start", "", path.basename(target)], "default app", {
-      cwd: path.dirname(target),
-    });
-  }
-  return runArgv("xdg-open", [target], "default app");
-}
-
-/**
  * Reveal a file in the OS file manager.
  */
-function revealFile(absPath: string): Promise<OpenInLaunchResult> {
+export function revealFile(absPath: string): Promise<OpenInLaunchResult> {
   const platform = currentPlatform();
   if (platform === "mac") {
     return runArgv("open", ["-R", absPath], "Finder");
@@ -213,27 +203,35 @@ function revealFile(absPath: string): Promise<OpenInLaunchResult> {
   return runArgv("xdg-open", [path.dirname(absPath)], "file manager");
 }
 
+/** The catalog binary's argv for a file, at `line` when the app's launcher takes one. */
+function fileArgv(app: OpenInApp, target: string, line?: number): string[] {
+  return openInFileArgv(app, target, line);
+}
+
 /**
  * Launch an editor/terminal app from the catalog.
- *   - editor   -> open the file itself
+ *   - editor   -> open the file itself, at `line` when its launcher can (the catalog's `line`)
  *   - terminal -> open the file's parent directory
  */
-function openWithApp(
+export function openWithApp(
   app: OpenInApp,
   absPath: string,
+  line?: number,
 ): Promise<OpenInLaunchResult> {
   const platform = currentPlatform();
   const target = app.kind === "terminal" ? path.dirname(absPath) : absPath;
 
   if (platform === "mac") {
-    const appName = app.mac?.appName;
-    if (!appName) {
+    if (!app.mac?.appName) {
       return Promise.resolve({
         ok: false,
         error: `${app.label} is not available on macOS`,
       });
     }
-    return runArgv("open", ["-a", appName, target], app.label);
+    // The installed bundle's name (an app may install under more than one).
+    const appName = locateApp(app, platform) ?? app.mac.appName;
+    // A line rides a URL scheme, or the app launcher's own `--line` (openInMacArgv).
+    return runArgv("open", openInMacArgv(app, appName, target, line), app.label);
   }
 
   if (platform === "win") {
@@ -250,7 +248,13 @@ function openWithApp(
       // parser; `start` inherits that cwd. bin is a trusted catalog value.
       return runArgv("cmd", ["/c", "start", "", bin], app.label, { cwd: target });
     }
-    return runArgv(bin, [target], app.label);
+    // An `exeOnly` app runs only its own .exe, by absolute path: never a
+    // .cmd/.bat, which cmd.exe would run with the file path on its command line.
+    const winBin = app.win?.exeOnly ? locateApp(app, platform) : bin;
+    if (!winBin) {
+      return Promise.resolve({ ok: false, error: `${app.label} not found` });
+    }
+    return runArgv(winBin, fileArgv(app, target, line), app.label);
   }
 
   const bin = app.linux?.bin;
@@ -260,83 +264,72 @@ function openWithApp(
       error: `${app.label} is not available on Linux`,
     });
   }
-  return runArgv(bin, [target], app.label);
+  // The first of its names on PATH (a snap command, say); else its catalog bin.
+  return runArgv(locateApp(app, platform) ?? bin, fileArgv(app, target, line), app.label);
 }
 
 /**
- * Open a file in the given app (by catalog id). An unknown or undefined id
- * falls back to the OS default handler.
+ * Hand a file to the OS default handler: `open <file>` on macOS,
+ * `explorer <file>` on Windows (no cmd parser between the path and the
+ * launch), `xdg-open <file>` on Linux.
+ *
+ * DANGEROUS by design: the default handler of `.command`, `.app`, `.sh`,
+ * `.exe` and friends runs them. Nothing reaches this implicitly (#1915 took
+ * the fallback out of openFileInApp). Its one caller is the Inbox's launch
+ * route, which allows it only for the kinds its per-kind policy names
+ * (`inboxOpenInPolicy`: images and PDFs whose bytes and extension agree, and
+ * a few text formats on macOS and Windows).
+ */
+export function openWithSystemDefault(absPath: string): Promise<OpenInLaunchResult> {
+  const platform = currentPlatform();
+  if (platform === "mac") return runArgv("open", [absPath], "the default app");
+  // explorer.exe exits non-zero even on success; launch fire-and-forget.
+  if (platform === "win") return spawnDetached("explorer", [absPath], "the default app");
+  return runArgv("xdg-open", [absPath], "the default app");
+}
+
+/**
+ * Open a file in the given app (by catalog id). A missing or unknown id is a
+ * failure, never a launch: there is deliberately no fallback to the OS
+ * default handler, which could execute the file (see checkOpenInAppId).
  */
 export async function openFileInApp(
   absPath: string,
-  appId?: string,
+  appId: string,
+  line?: number,
 ): Promise<OpenInLaunchResult> {
-  if (!appId) {
-    return openSystemDefault(absPath);
-  }
-
-  const app = getOpenInApp(appId);
-  if (!app) {
-    // Unknown id — fall back to system default.
-    return openSystemDefault(absPath);
-  }
+  const checked = checkOpenInAppId(appId);
+  if (!checked.ok) return { ok: false, error: checked.error };
+  const app = checked.app;
 
   if (app.kind === "file-manager") {
     return revealFile(absPath);
   }
 
-  return openWithApp(app, absPath);
+  return openWithApp(app, absPath, line);
 }
 
-/**
- * Whether a macOS app bundle named `<appName>.app` exists in one of the
- * standard application directories.
- */
-function macAppBundleExists(appName: string): boolean {
-  const bundle = `${appName}.app`;
-  const candidates = [
-    path.join("/Applications", bundle),
-    path.join(os.homedir(), "Applications", bundle),
-    path.join("/System/Applications", bundle),
-    // Terminal.app and other built-ins live in the Utilities subfolder.
-    path.join("/System/Applications/Utilities", bundle),
-  ];
-  return candidates.some((p) => {
-    try {
-      return fs.existsSync(p);
-    } catch {
-      return false;
-    }
+/** Where `app` is installed here (shared with Pi): see locateOpenInApp. */
+function locateApp(app: OpenInApp, platform: OpenInPlatform): string | null {
+  return locateOpenInApp(app, {
+    platform,
+    which: (bin) => Bun.which(bin, { PATH: childPath() }),
   });
 }
 
 /**
  * Whether the given catalog app is launchable on this host.
  *   - 'reveal' is always available.
- *   - mac: the `.app` bundle exists (we launch via `open -a "<appName>"`).
- *   - win/linux: its bin resolves on PATH.
+ *   - mac: one of its `.app` bundles exists (we launch via `open -a "<appName>"`;
+ *     a CLI shim on PATH without the bundle would show and then fail to launch).
+ *   - win/linux: one of its bins resolves on PATH (an `exeOnly` app: a real
+ *     `.exe`, on PATH or in an install folder).
  */
 function isAppAvailable(app: OpenInApp, platform: OpenInPlatform): boolean {
   if (app.id === "reveal") {
     return true;
   }
-
-  if (platform === "mac") {
-    // We launch via `open -a "<appName>"`, so availability must mean the .app
-    // bundle is present — a CLI shim on PATH without the bundle would show the
-    // app in the menu and then fail to launch.
-    const appName = app.mac?.appName;
-    return !!appName && macAppBundleExists(appName);
-  }
-
-  if (platform === "win") {
-    const bin = app.win?.bin;
-    return !!bin && !!Bun.which(bin);
-  }
-
-  // linux
-  const bin = app.linux?.bin;
-  return !!bin && !!Bun.which(bin);
+  return locateApp(app, platform) !== null;
 }
 
 export interface AvailableOpenInApp {
@@ -372,14 +365,25 @@ export function getAvailableOpenInApps(): AvailableOpenInApp[] {
 }
 
 /**
+ * Whether open-in is off for this session: remote mode, or a session
+ * published over the tailnet (`--tailscale`), which other devices reach. A
+ * launch opens an app on THIS machine for whoever sent it, so it is offered
+ * only to a session only this computer reaches (the update route's
+ * `update_exposed` rule).
+ */
+function openInExposed(exposed: boolean | undefined): boolean {
+  return isRemoteSession() || exposed === true;
+}
+
+/**
  * GET /api/open-in/apps handler.
  *
- * `available` is false in remote/headless sessions (the UI hides the control
- * entirely). `apps` is the host-filtered catalog (always includes 'reveal');
- * empty when unavailable.
+ * `available` is false in remote/headless sessions and in sessions published
+ * over the tailnet (`exposed`; the UI hides the control entirely). `apps` is
+ * the host-filtered catalog (always includes 'reveal'); empty when unavailable.
  */
-export function handleOpenInApps(): Response {
-  if (isRemoteSession()) {
+export function handleOpenInApps(options: { exposed?: boolean } = {}): Response {
+  if (openInExposed(options.exposed)) {
     return Response.json({ available: false, apps: [] });
   }
   return Response.json({ available: true, apps: getAvailableOpenInApps() });
@@ -395,28 +399,69 @@ export interface HandleOpenInOptions {
    * several roots (annotate passes the session's reference roots).
    */
   resolveRoot?: () => string | string[];
+  /**
+   * This server's stale-tab nonce (packages/core/server-session.ts). A body
+   * carrying a different `serverSession` is refused with 409 before anything
+   * launches; a body without one is accepted.
+   */
+  serverSession?: string;
+  /**
+   * The session is published over the tailnet (`--tailscale`): other devices
+   * reach it, so nothing is launched (400), as in remote mode.
+   */
+  exposed?: boolean;
 }
 
 /**
- * POST /api/open-in handler. Resolves + containment-checks the target via
- * resolveOpenInTarget (shared), then launches via openFileInApp.
+ * POST /api/open-in handler. Refuses another site's page (including the
+ * sandboxed annotated-HTML frame, which sends `Origin: null`) and a stale tab,
+ * requires a catalog `appId`, resolves + containment-checks the target via
+ * resolveOpenInTarget (shared), then launches via openFileInApp. Optional
+ * `line` (1-based) is passed through when the catalog app's launcher takes one.
  */
 export async function handleOpenIn(
   req: Request,
   options: HandleOpenInOptions = {},
 ): Promise<Response> {
-  if (isRemoteSession()) {
+  if (openInExposed(options.exposed)) {
     return Response.json(
-      { ok: false, error: "Open in app is unavailable in remote sessions" },
+      { ok: false, error: "Open in app is unavailable in sessions other devices can reach" },
       { status: 400 },
     );
   }
 
-  let body: { filePath?: unknown; base?: unknown; appId?: unknown };
+  // Launching an app is a state change on the user's machine: a page on
+  // another site must never reach it with a preflight-free text/plain POST.
+  if (
+    !isSameOriginOrNoOrigin(
+      req.headers.get("origin"),
+      new URL(req.url).host,
+      req.headers.get("sec-fetch-site"),
+    )
+  ) {
+    return Response.json(
+      { ok: false, error: "Cross-origin requests are not allowed" },
+      { status: 403 },
+    );
+  }
+
+  let body: { filePath?: unknown; base?: unknown; appId?: unknown; line?: unknown };
   try {
     body = (await req.json()) as typeof body;
   } catch {
     return Response.json({ ok: false, error: "Invalid request" }, { status: 400 });
+  }
+  if (!body || typeof body !== "object") {
+    return Response.json({ ok: false, error: "Invalid request" }, { status: 400 });
+  }
+
+  // Stale-tab guard: a tab left open on a reused port must not launch apps
+  // for a session it never showed. Missing is accepted.
+  if (
+    options.serverSession !== undefined &&
+    checkServerSession(body, options.serverSession) === "mismatch"
+  ) {
+    return Response.json(serverSessionMismatchBody(), { status: 409 });
   }
 
   const filePath = typeof body.filePath === "string" ? body.filePath : "";
@@ -424,14 +469,17 @@ export async function handleOpenIn(
     return Response.json({ ok: false, error: "Missing filePath" }, { status: 400 });
   }
   const base = typeof body.base === "string" ? body.base : null;
-  const appId = typeof body.appId === "string" ? body.appId : undefined;
+  const app = checkOpenInAppId(body.appId);
+  if (!app.ok) {
+    return Response.json({ ok: false, error: app.error }, { status: 400 });
+  }
 
   const abs = resolveOpenInTarget(filePath, base, options.resolveRoot);
   if (abs == null) {
     return Response.json({ ok: false, error: "Access denied" }, { status: 403 });
   }
 
-  const result = await openFileInApp(abs, appId);
+  const result = await openFileInApp(abs, app.app.id, parseOpenInLine(body.line));
   // A failed launch is a valid request with the result in the body (ok:false),
   // not a server error — return 200 and let the client read `ok`. Matches Pi.
   return Response.json(result);

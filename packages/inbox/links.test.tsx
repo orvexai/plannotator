@@ -8,7 +8,9 @@ import { afterEach, expect, test } from 'bun:test';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import type { InboxAttachment, InboxMessageWire } from '@plannotator/core/inbox-types';
-import { attachmentDeepLink, attachmentDisplayPath, attachmentForLink, normalizeLinkPath } from './links';
+import { attachmentDeepLink, attachmentDisplayPath, attachmentForLink, normalizeLinkPath, projectFileOfLink } from './links';
+import { setComponentTooltips, resetComponentTooltips } from '@plannotator/ui/components/HostTitle';
+import { tooltipOf, unhover } from './testing/tooltip';
 
 const hasDom = typeof document !== 'undefined';
 // Viewer pulls in web-highlighter, which reads `window` at module-eval time.
@@ -83,6 +85,7 @@ let root: Root | null = null;
 let host: HTMLElement | null = null;
 
 afterEach(() => {
+  resetComponentTooltips();
   act(() => root?.unmount());
   host?.remove();
   root = null;
@@ -111,6 +114,8 @@ async function mount(node: React.ReactNode) {
 }
 
 test.skipIf(!hasDom)('in a message, an attached file opens beside the thread; an unattached one is inert; an external link is unchanged', async () => {
+  // The Inbox draws ui's hover text as component tooltips (App.tsx configurePlannotatorUI).
+  setComponentTooltips(true);
   const opened: string[] = [];
   const fetched: string[] = [];
   const realFetch = globalThis.fetch;
@@ -142,9 +147,6 @@ test.skipIf(!hasDom)('in a message, an attached file opens beside the thread; an
         answers={new Map()}
         onPick={() => {}}
         footerFor={() => null}
-        recordingOf={() => undefined}
-        onToggleDecision={() => {}}
-        onOpenDecision={() => {}}
       />,
     );
 
@@ -153,8 +155,12 @@ test.skipIf(!hasDom)('in a message, an attached file opens beside the thread; an
     expect(mock).toBeDefined();
     // Its href is the window's own deep link to the file, so a new tab opens it there.
     expect(mock.getAttribute('href')).toBe('#thread=msg_01K7ZZZZZZZZZZZZZZZZZZZZZZ&file=att_mock');
-    // The tooltip names the file by its path in the project, not its bare name.
-    expect(mock.getAttribute('title')).toBe('Open design/mock.html beside the thread');
+    // The tooltip (a component, never a native title) names the file by its path in the project, not its bare name.
+    expect(mock.hasAttribute('title')).toBe(false);
+    expect(await tooltipOf(mock)).toBe('Open design/mock.html beside the thread');
+    unhover(mock);
+    // A screen reader still hears it, as the link's description.
+    expect(document.getElementById(mock.getAttribute('aria-describedby') ?? '')?.textContent).toBe('Open design/mock.html beside the thread');
     await act(async () => mock.click());
     expect(opened).toEqual(['att_mock']);
 
@@ -178,7 +184,10 @@ test.skipIf(!hasDom)('in a message, an attached file opens beside the thread; an
     const notes = host!.querySelector<HTMLElement>('[data-local-link="unavailable"]')!;
     expect(notes.textContent).toBe('my notes');
     expect(notes.tagName).toBe('SPAN');
-    expect(notes.getAttribute('title')).toContain('Not attached');
+    expect(notes.hasAttribute('title')).toBe(false);
+    expect(await tooltipOf(notes)).toContain('Not attached');
+    unhover(notes);
+    expect(document.getElementById(notes.getAttribute('aria-describedby') ?? '')?.textContent).toContain('Not attached');
     const rawOther = [...host!.querySelectorAll<HTMLElement>('[data-local-link="unavailable"]')].find((el) => el.textContent === 'raw other')!;
     expect(rawOther.hasAttribute('href')).toBe(false);
     await act(async () => {
@@ -197,6 +206,54 @@ test.skipIf(!hasDom)('in a message, an attached file opens beside the thread; an
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// The owner, 2026-11-11 ("why don't those URLs work"): `[the mock](mock.html?variant=2)` opens the page with that
+// query, as a tab would. The query used to be dropped, so every such link opened the same default page.
+test.skipIf(!hasDom)("a link to an attached HTML page hands over the link's query and fragment; a Markdown file's are not", async () => {
+  const opened: Array<[string, string | undefined]> = [];
+  const body = '[two](mock.html?variant=2) [two at top](design/mock.html?variant=2#top) [plain](mock.html) [plan](docs/current-plan.md?x=1)';
+  await mount(
+    <MessageBody
+      message={message(body, [MOCK, PLAN])}
+      projectRoot={ROOT}
+      onOpenAttachment={(a, start) => opened.push([a.id, start])}
+      readOnly={false}
+      answers={new Map()}
+      onPick={() => {}}
+      footerFor={() => null}
+    />,
+  );
+  for (const link of host!.querySelectorAll<HTMLAnchorElement>('a[data-local-link="open"]')) await act(async () => link.click());
+  expect(opened).toEqual([
+    ['att_mock', '?variant=2'],
+    ['att_mock', '?variant=2#top'],
+    ['att_mock', undefined],
+    ['att_plan', undefined],
+  ]);
+});
+
+test.skipIf(!hasDom)('with component tooltips off (other hosts), a resolved local link keeps its native title and gains no aria attributes', async () => {
+  await mount(
+    <MessageBody
+      message={message('See [the mock](mock.html) and [my notes](notes.md).', [MOCK])}
+      projectRoot={ROOT}
+      onOpenAttachment={() => {}}
+      readOnly={false}
+      answers={new Map()}
+      onPick={() => {}}
+      footerFor={() => null}
+    />,
+  );
+  const mock = host!.querySelector<HTMLAnchorElement>('a[data-local-link="open"]')!;
+  expect(mock.getAttribute('title')).toBe('Open design/mock.html beside the thread');
+  const notes = host!.querySelector<HTMLElement>('[data-local-link="unavailable"]')!;
+  expect(notes.getAttribute('title')).toContain('Not attached');
+  for (const node of [mock, notes]) {
+    expect(node.hasAttribute('aria-describedby')).toBe(false);
+    expect(node.hasAttribute('aria-label')).toBe(false);
+  }
+  expect(host!.querySelectorAll('[data-host-title-description]').length).toBe(0);
 });
 
 test.skipIf(!hasDom)('a Viewer without resolveLocalLink draws a local link as it always has', async () => {
@@ -220,4 +277,20 @@ test.skipIf(!hasDom)('a Viewer without resolveLocalLink draws a local link as it
   expect(host!.querySelector('[data-local-link]')).toBeNull();
   expect(host!.querySelector('a[href="mock.html"]')).not.toBeNull();
   expect(host!.querySelector('a[href="notes.md"]')).not.toBeNull();
+});
+
+test('the project file a link that names no attachment may mean: relative to the root, with its line; nothing outside the project', () => {
+  expect(projectFileOfLink('src/a.ts')).toEqual({ path: 'src/a.ts' });
+  expect(projectFileOfLink('src/a.ts#L12')).toEqual({ path: 'src/a.ts', line: 12 });
+  expect(projectFileOfLink('src/a.ts:12')).toEqual({ path: 'src/a.ts', line: 12 });
+  expect(projectFileOfLink('src/a.ts:12-20')).toEqual({ path: 'src/a.ts', line: 12, lineEnd: 20 });
+  expect(projectFileOfLink('src/a.ts#L12-L20')).toEqual({ path: 'src/a.ts', line: 12, lineEnd: 20 });
+  expect(projectFileOfLink('src/a.ts:12:4')).toEqual({ path: 'src/a.ts', line: 12 });
+  expect(projectFileOfLink('src/a.ts:12:4')).toEqual({ path: 'src/a.ts', line: 12 });
+  expect(projectFileOfLink('my%20file.ts')).toEqual({ path: 'my file.ts' });
+  // The path stays as written: the server knows the folder the agent wrote from.
+  expect(projectFileOfLink('/work/wt/src/a.ts')).toEqual({ path: '/work/wt/src/a.ts' });
+  expect(projectFileOfLink('../a.ts')).toEqual({ path: '../a.ts' });
+  expect(projectFileOfLink('#top')).toBeNull();
+  expect(projectFileOfLink('src/')).toBeNull();
 });

@@ -67,6 +67,15 @@ describe('mentionMatches', () => {
       .toEqual(['user_2']);
   });
 
+  test('a host that tags agents says so with `kinds` (the Inbox), and may match on names only', () => {
+    const pi = person({ id: 'pi-1', label: 'Pi', detail: 'infra · idle', kind: 'agent' });
+    expect(mentionMatches([marcus, bot, pi], trigger(''), new Set(), ['agent']).map((p) => p.id)).toEqual(['cred_1', 'pi-1']);
+    expect(mentionMatches([marcus, bot, pi], trigger(''), new Set(), ['user', 'agent']).map((p) => p.id)).toEqual(['user_1', 'cred_1', 'pi-1']);
+    // "i" is in Pi's detail ("infra · idle") and in the bot's label; with matchDetail false only labels count.
+    expect(mentionMatches([bot, pi], trigger('infra'), new Set(), ['agent']).map((p) => p.id)).toEqual(['pi-1']);
+    expect(mentionMatches([bot, pi], trigger('infra'), new Set(), ['agent'], false).map((p) => p.id)).toEqual([]);
+  });
+
   test('someone already tagged in this draft is not offered again', () => {
     expect(mentionMatches([marcus, dana], trigger(''), new Set(['user_1'])).map((p) => p.id))
       .toEqual(['user_2']);
@@ -94,5 +103,29 @@ describe('survivingMentions', () => {
     const tagged = [marcus, dana];
     expect(survivingMentions('hi @Dana Ruiz', tagged).map((p) => p.id)).toEqual(['user_2']);
     expect(survivingMentions('nobody here', tagged)).toEqual([]);
+  });
+
+  test('a longer tagged token owns its start: deleting @Fix untags it while @Fix login stays', () => {
+    const fix = person({ id: 'a', label: 'Fix' });
+    const fixLogin = person({ id: 'b', label: 'Fix login' });
+    const tagged = [fix, fixLogin];
+    expect(survivingMentions('@Fix and @Fix login', tagged).map((p) => p.id)).toEqual(['a', 'b']);
+    expect(survivingMentions('only @Fix login now', tagged).map((p) => p.id)).toEqual(['b']);
+    expect(survivingMentions('@Fix login @Fix', tagged).map((p) => p.id)).toEqual(['a', 'b']);
+  });
+
+  test('with no longer tagged token, a tag survives exactly as the substring rule kept it', () => {
+    // The rule before: a token anywhere in the text. Nothing it kept may be dropped.
+    const before = (text: string, tagged: readonly MentionPerson[]) => tagged.filter((p) => text.includes(mentionToken(p)));
+    const ann = person({ id: 'ann', label: 'Ann' });
+    const paren = person({ id: 'p', label: 'Review (Claude Code)' });
+    const texts = ['@Ann你好', '@Annさん', '@Anns', '@Ann2', '@Ann, hi', '(@Ann).', 'cc @Ann', '@Ann🎉', '🎉@Ann🎉', '@Ann_x', 'no tag here', '@Review (Claude Code)x', '@Review (Claude Code).'];
+    for (const text of texts) {
+      for (const tagged of [[ann], [paren], [ann, paren]]) {
+        expect(survivingMentions(text, tagged).map((p) => p.id), text).toEqual(before(text, tagged).map((p) => p.id));
+      }
+    }
+    expect(survivingMentions('@Ann你好', [ann]).map((p) => p.id)).toEqual(['ann']);
+    expect(survivingMentions('@Review (Claude Code)x', [paren]).map((p) => p.id)).toEqual(['p']);
   });
 });

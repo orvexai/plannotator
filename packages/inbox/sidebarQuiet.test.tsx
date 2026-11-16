@@ -5,7 +5,7 @@
  * The failure this catches is the folder sharing a class with any question
  * card style again: it must not match `.pn-inbox .ib-q`.
  *
- * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from the test.yml DOM list.
+ * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from tests/dom-test-list.txt.
  */
 import { afterEach, expect, test } from 'bun:test';
 import { act } from 'react';
@@ -37,7 +37,6 @@ test.skipIf(!hasDom)('a quiet project folder is not styled as a question card', 
           page="inbox"
           projectId={null}
           inboxCount={1}
-          decisionsCount={0}
           projects={[project, busy] as never}
           projectCounts={new Map([['prj_b', 1]])}
           update={null}
@@ -46,7 +45,6 @@ test.skipIf(!hasDom)('a quiet project folder is not styled as a question card', 
           onInbox={noop}
           onProject={noop}
           onSettings={noop}
-          onDecisions={noop}
           onUpdate={noop}
           onWhatsNew={noop}
         />

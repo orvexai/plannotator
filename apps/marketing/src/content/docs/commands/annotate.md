@@ -13,8 +13,9 @@ The `/plannotator-annotate` command opens files, URLs, or folders in the Plannot
 | Input | Command | What happens |
 |-------|---------|--------------|
 | Markdown file | `plannotator annotate README.md` | Opens the file directly |
-| Plain-text file | `plannotator annotate config.yaml` | Opens the file directly, rendered as plain text |
+| Config or data file | `plannotator annotate config.yaml` | Opens the file directly, shown as its own text with syntax highlighting |
 | Diagram file | `plannotator annotate flow.mmd` | Renders the whole file as one diagram in the diagram viewer |
+| AsciiDoc file | `plannotator annotate docs/guide.adoc` | Renders the AsciiDoc document |
 | HTML file | `plannotator annotate docs/guide.html` | Renders the HTML directly |
 | URL | `plannotator annotate https://docs.stripe.com/api` | Fetches the page, converts to markdown, then opens |
 | Local app URL | `plannotator annotate http://localhost:5173` | Opens your running dev app live and annotates it in place |
@@ -22,7 +23,26 @@ The `/plannotator-annotate` command opens files, URLs, or folders in the Plannot
 
 ### Supported file types
 
-Beyond `.md`, `.mdx`, `.txt`, `.html`, and `.htm`, annotate accepts common plain-text config and data formats: `.yaml`, `.yml`, `.json`, `.jsonc`, `.json5`, `.toml`, `.ini`, `.cfg`, `.conf`, `.properties`, `.csv`, `.tsv`, `.log`, `.xml`, and `.env.example`. These render exactly like `.txt` — as plain text you can select and annotate.
+Beyond `.md`, `.mdx`, `.txt`, `.html`, and `.htm`, annotate accepts common plain-text config and data formats: `.yaml`, `.yml`, `.json`, `.jsonc`, `.json5`, `.toml`, `.ini`, `.cfg`, `.conf`, `.properties`, `.csv`, `.tsv`, `.log`, `.xml`, and `.env.example`. These show as their own text, monospace and line by line, syntax-highlighted in their language (`.cfg` and `.conf` stay plain, since the name doesn't say which syntax is inside). You select and annotate them like any other document, and a `#` comment stays a comment. A file over 128 KB shows without highlighting, so a large log or JSON dump opens quickly.
+
+### Coloured text in Markdown
+
+To colour a few words, wrap them in `<span style="color: …">` or `<font color="…">`. This works in a sentence, in a table cell and in raw HTML, the same in plan review, annotate and the Inbox:
+
+```markdown
+| Model | Pass rate |
+| --- | --- |
+| alpha | <span style="color: #d00000">73.0%</span> |
+| beta | <font color="orange">93.5%</font> |
+```
+
+The colour can be a hex colour (`#d00`, `#d00000`, with or without alpha), `rgb()`, `rgba()`, `hsl()` or `hsla()` with plain numbers, or a CSS colour name such as `green` or `rebeccapurple`. A colour less than half opaque (alpha below 0.5) is not kept, so text cannot be made see-through. Only the text colour is kept. If a style holds anything else (a background, a size, `url()`, `var()`), the whole style is dropped and the words show uncoloured. Nothing is coloured unless you wrap it.
+
+If a colour is too dark or too light to read on the current theme (below a 3:1 contrast), Plannotator moves its lightness just enough to be readable and keeps the hue. Colours that are readable stay exactly as written. Copying a table as Markdown or CSV gives the words without the tags.
+
+### AsciiDoc files
+
+`.adoc` and `.asciidoc` files render as AsciiDoc: sections, lists, listings with syntax highlighting, admonitions, tables and quotes. Exported feedback names the real lines in the `.adoc` file. `include::` and `ifdef::` lines are shown as written rather than resolved, and nested content inside admonition blocks and table cells shows as plain text.
 
 ### Diagram files
 
@@ -148,7 +168,7 @@ Live app annotation runs on the standalone CLI, the Claude Code slash command, a
 
 Live app and HTML sessions share one interaction model:
 
-- The session opens with the pen **armed**, so a click pins the element under the cursor and a drag selects text to comment on.
+- The session opens with the pen **armed**, so a click pins the element under the cursor and a drag selects text to comment on. A click on a link follows it, as in any page; hold `Cmd` (`Ctrl` on Windows and Linux) and click to pin the link for a comment instead. On a phone, tap a link to follow it, or press and hold it to comment on it. Live apps (`plannotator annotate http://localhost:…`) work the same way: a click navigates the app, `Cmd`/`Ctrl`-click comments on the link.
 - `Esc` steps back one rung at a time: it closes an open draft, then clears the hover outline, then drops you into **Interact** mode, where clicks, forms, links, and navigation reach the page normally.
 - The pen button in the header (or `Cmd/Ctrl+Shift+A`) toggles annotation back on, and off again. Existing comment markers stay visible in both modes, and clicking one still opens it.
 - Selecting text to comment works in **both** modes, so you can leave a note without arming the pen.
@@ -192,7 +212,17 @@ The annotation UI in annotate mode works the same as plan review, with a few cha
 - `Cmd/Ctrl+Enter` sends annotations instead of approving
 - The completion screen says "Annotations Sent" instead of "Plan Approved"
 
-All annotation types work identically: deletions, comments, global comments, quick labels, "looks good" approvals, and image attachments. HTML and live app surfaces are the exception: they are comment-only, so deletions and quick labels are unavailable there, though deletions saved earlier still restore.
+All annotation types work identically: deletions, comments, global comments, quick labels, "looks good" approvals, image attachments, and [comments on part of an image](/docs/commands/plan-review/#comments-on-part-of-an-image) in a markdown file. HTML and live app surfaces are the exception: they are comment-only, so deletions and quick labels are unavailable there, though deletions saved earlier still restore.
+
+## Naming the tab (`--title`)
+
+The tab names the open document, so several reviews of the same repository stay apart. When the caller knows better what the review is for, `--title` names it instead:
+
+```bash
+plannotator annotate docs/changes/add-refund-flow/ --title "add-refund-flow review"
+```
+
+The text is the whole tab title, exactly as given, with no repository or file name added. The header beside the logo shows the same text, and its tooltip still names the file or folder. It stays put whichever file you open in a folder, and when you follow a link to another document. A blank title is ignored. `plannotator annotate-last` and `plannotator review` take it too.
 
 ## Flags
 

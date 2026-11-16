@@ -23,6 +23,7 @@
 
 import { saveToHistory, getPlanVersion, getVersionCount, saveAnnotateSubmission } from "./storage";
 import { contentHash } from "./draft";
+import { isSecretEnvPath } from "./annotatable";
 
 export interface AnnotateVersionInfo {
   version: number;
@@ -35,6 +36,8 @@ export interface AnnotateHistoryResult {
   diffCurrent: string;
   previousPlan: string | null;
   versionInfo: AnnotateVersionInfo;
+  /** False when `content` equalled the latest version and nothing was written. */
+  isNew: boolean;
 }
 
 /**
@@ -72,6 +75,8 @@ export function computeAnnotateHistory(
   resolvedFilePath: string,
   content: string,
 ): AnnotateHistoryResult | null {
+  // A `.env` file is never copied into the data dir (core annotatable).
+  if (isSecretEnvPath(resolvedFilePath)) return null;
   const slug = deriveAnnotateHistorySlug(resolvedFilePath);
   try {
     const saved = saveToHistory(project, slug, content);
@@ -86,6 +91,7 @@ export function computeAnnotateHistory(
         totalVersions: getVersionCount(project, slug),
         project,
       },
+      isNew: saved.isNew,
     };
   } catch (error) {
     console.error(

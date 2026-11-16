@@ -16,6 +16,7 @@
  * record go.
  */
 
+import { childPath } from "@plannotator/shared/child-env";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, X509Certificate } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
@@ -63,7 +64,7 @@ export function ensureInboxCertificate(dataDir: string): { cert: string; key: st
   if (!existsSync(certPath) || !existsSync(keyPath)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     chmodSync(dir, 0o700);
-    const run = (args: string[]) => spawnSync("openssl", args, { encoding: "utf8", timeout: 15_000, env: process.env });
+    const run = (args: string[]) => spawnSync("openssl", args, { encoding: "utf8", timeout: 15_000, env: process.env, windowsHide: true });
     const made =
       [
         ["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", keyPath],
@@ -107,14 +108,15 @@ export function lanAddress(): string | null {
  */
 function publishBonjour(name: string, port: number, fingerprint: string): ChildProcess | null {
   const txt = ["v=1", `fp=${fingerprint}`];
-  const dnsSd = process.platform === "darwin" ? Bun.which("dns-sd") : null;
-  const avahi = dnsSd ? null : Bun.which("avahi-publish");
+  const dnsSd = process.platform === "darwin" ? Bun.which("dns-sd", { PATH: childPath() }) : null;
+  const avahi = dnsSd ? null : Bun.which("avahi-publish", { PATH: childPath() });
   const command = dnsSd
     ? [dnsSd, "-R", name, INBOX_BONJOUR_TYPE, "local", String(port), ...txt]
     : avahi
       ? [avahi, "-s", name, INBOX_BONJOUR_TYPE, String(port), ...txt]
       : null;
   if (!command) return null;
+  // windows-hide-guard: dns-sd (macOS) or avahi-publish (Linux) through /bin/sh; never on Windows.
   const child = spawn("/bin/sh", ["-c", '"$@" >/dev/null 2>&1 & child=$!; read _; kill "$child"', "sh", ...command], {
     stdio: ["pipe", "ignore", "ignore"],
   });

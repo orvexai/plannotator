@@ -13,9 +13,11 @@
  * node:http APIs.
  */
 
-import { isLoopbackHostname } from "./live-proxy-core";
+import { isLoopbackHostname, isPlannotatorLiveTarget, isPlannotatorUpstreamResponse } from "./live-proxy-core";
 
 export const LIVE_PROBE_TIMEOUT_MS = 3000;
+/** Redirects the probe follows, each on the target's own loopback origin. */
+export const LIVE_PROBE_MAX_REDIRECTS = 5;
 
 export interface LiveAppCandidate {
   parsed: URL | null;
@@ -40,6 +42,17 @@ export interface LiveAppProbeResult {
   probeError: string | null;
   /** Final URL when the probe redirected off the target's loopback origin. */
   probeRedirectedTo: string | null;
+  /**
+   * The target is a Plannotator server (a port a Plannotator registry names,
+   * or a response carrying the Plannotator server header). Never live: the
+   * proxy would give the proxied page same-origin writes on that server.
+   */
+  plannotator: boolean;
+}
+
+export interface LiveAppProbeOptions {
+  /** Ports Plannotator servers hold (listPlannotatorServerPorts); refused before any request. */
+  plannotatorPorts?: Iterable<number>;
 }
 
 /**
@@ -47,41 +60,65 @@ export interface LiveAppProbeResult {
  * on the FINAL response after redirects: a loopback URL that 302s off its
  * own origin (auth portal, tunnel splash page, another local service) must
  * not open a live session whose iframe immediately navigates off the proxy;
- * same-server redirects (/ to /login) stay live-eligible. Any status < 500
- * with an HTML content type qualifies, so a login page or SPA 404 still
- * opens live.
+ * same-server redirects (/ to /login) stay live-eligible. Each redirect is
+ * judged before it is followed (`redirect: "manual"`, at most
+ * LIVE_PROBE_MAX_REDIRECTS): one off the origin ends the probe without a
+ * request to it. Any status < 500 with an HTML content type qualifies, so a
+ * login page or SPA 404 still opens live.
  */
 export async function probeLiveAppTarget(
   targetUrl: string,
   parsedUrl: URL,
   fetchImpl: typeof fetch = fetch,
+  options: LiveAppProbeOptions = {},
 ): Promise<LiveAppProbeResult> {
+  if (isPlannotatorLiveTarget(parsedUrl, options.plannotatorPorts ?? [])) {
+    return { liveEligible: false, probeError: null, probeRedirectedTo: null, plannotator: true };
+  }
+  let plannotator = false;
   let liveEligible = false;
   let probeError: string | null = null;
   let probeRedirectedTo: string | null = null;
+  const onOrigin = (url: URL) =>
+    url.protocol === "http:" && isLoopbackHostname(url.hostname) && (url.port || "80") === (parsedUrl.port || "80");
   try {
-    const probe = await fetchImpl(targetUrl, {
-      headers: { accept: "text/html" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(LIVE_PROBE_TIMEOUT_MS),
-    });
-    const contentType = probe.headers.get("content-type") ?? "";
-    let finalOnOrigin = false;
-    try {
-      const finalUrl = new URL(probe.url || targetUrl);
-      finalOnOrigin =
-        finalUrl.protocol === "http:"
-        && isLoopbackHostname(finalUrl.hostname)
-        && (finalUrl.port || "80") === (parsedUrl.port || "80");
-      if (!finalOnOrigin) probeRedirectedTo = probe.url;
-    } catch {
-      finalOnOrigin = false;
+    // Redirects are followed by hand, each judged BEFORE it is fetched: only
+    // one that stays on the target's loopback origin is followed, so the probe
+    // never sends a request to another local service (or a Plannotator server).
+    const signal = AbortSignal.timeout(LIVE_PROBE_TIMEOUT_MS);
+    let url = targetUrl;
+    let probe: Response | null = null;
+    for (let hop = 0; hop <= LIVE_PROBE_MAX_REDIRECTS; hop += 1) {
+      const response = await fetchImpl(url, { headers: { accept: "text/html" }, redirect: "manual", signal });
+      const location = response.status >= 300 && response.status < 400 ? response.headers.get("location") : null;
+      if (location === null) {
+        probe = response;
+        break;
+      }
+      await response.body?.cancel().catch(() => {});
+      let next: URL | null = null;
+      try {
+        next = new URL(location, url);
+      } catch {
+        next = null;
+      }
+      if (!next || !onOrigin(next)) {
+        probeRedirectedTo = next ? next.href : location;
+        break;
+      }
+      url = next.href;
     }
-    liveEligible = probe.status < 500 && contentType.includes("text/html") && finalOnOrigin;
+    if (probe) {
+      const contentType = probe.headers.get("content-type") ?? "";
+      plannotator = isPlannotatorUpstreamResponse(probe.headers);
+      liveEligible = !plannotator && probe.status < 500 && contentType.includes("text/html");
+    } else if (probeRedirectedTo === null) {
+      probeError = `more than ${LIVE_PROBE_MAX_REDIRECTS} redirects`;
+    }
   } catch (err) {
     probeError = err instanceof Error ? err.message : String(err);
   }
-  return { liveEligible, probeError, probeRedirectedTo };
+  return { liveEligible, probeError, probeRedirectedTo, plannotator };
 }
 
 // --- Shared user-facing messages ---------------------------------------------
@@ -108,6 +145,9 @@ export function buildForceAppFailureMessage(
   targetUrl: string,
   probe: LiveAppProbeResult,
 ): string {
+  if (probe.plannotator) {
+    return `--app: ${targetUrl} is a Plannotator server; live annotation never proxies a Plannotator server, because the proxied page would get same-origin access to it`;
+  }
   if (probe.probeError !== null) {
     return `--app: could not reach ${targetUrl}: ${probe.probeError}`;
   }
@@ -115,6 +155,14 @@ export function buildForceAppFailureMessage(
     return `--app: ${targetUrl} redirected off its loopback origin (${probe.probeRedirectedTo}); live mode requires the app to serve HTML from the probed origin`;
   }
   return `--app: ${targetUrl} did not return an HTML page`;
+}
+
+/**
+ * Fallback notice when the target is a Plannotator server: live mode never
+ * proxies one, so the session degrades to static conversion and says why.
+ */
+export function buildLivePlannotatorFallbackNotice(targetUrl: string): string {
+  return `${targetUrl} is a Plannotator server, which live annotation never proxies; using static conversion.`;
 }
 
 /**

@@ -15,6 +15,9 @@ import {
   runJjDiff,
   selectDefaultJjCompareTarget,
 } from "./jj-core";
+import { useScratchJjConfig } from "../../tests/helpers/jj-scratch-config";
+
+const jjConfig = useScratchJjConfig();
 
 describe("jj diff args", () => {
   test("maps Call flow modes to the revsets used by each visible Jujutsu diff", () => {
@@ -101,7 +104,7 @@ describe("jj diff args", () => {
 
     expect(getJjDiffArgs("jj-all", "trunk()")).toEqual({
       args: ["diff", "--git", "--from", "root()", "--to", "@"],
-      label: "All files",
+      label: "Every file",
     });
   });
 
@@ -168,7 +171,8 @@ describe("jj compare targets", () => {
     : test.skip;
 
   // Every `jj` process below runs against a throwaway JJ_CONFIG. Reading the
-  // developer's real config is banned outright by CLAUDE.md, and it is also
+  // developer's real config is banned outright by the Testing Rules
+  // (docs/agent-guides/project-and-development.md), and it is also
   // what makes these fixtures reproducible: commit signing, a custom
   // `immutable_heads()` alias or a non-default `git.push-bookmark-prefix` in a
   // real config would otherwise fail or silently reshape them.
@@ -179,7 +183,7 @@ describe("jj compare targets", () => {
       configPath,
       '[user]\nname = "Plannotator Test"\nemail = "test@plannotator.invalid"\n',
     );
-    const env = { ...process.env, JJ_CONFIG: configPath };
+    const env = jjConfig.env({ JJ_CONFIG: configPath });
 
     const jj = (args: string[], options?: { cwd?: string; config?: string[] }) => {
       const result = Bun.spawnSync(["jj", ...(options?.config ?? []), ...args], {

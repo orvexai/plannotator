@@ -19,9 +19,12 @@
  * their viewers by extension (markdown, text, HTML, Mermaid, Graphviz);
  * everything else is decided from the bytes at send time
  * (packages/shared/inbox/attachments.ts): an image by its magic bytes
- * (`image`), a PDF by `%PDF-` (`pdf`), UTF-8 text with no NUL (`code`, shown
- * with line comments), anything else `file` (offered as a download). A
- * document whose bytes are not text is a `file` too.
+ * (`image`), a PDF by `%PDF-` (`pdf`), a film by its container (`video`:
+ * MP4/MOV `ftyp` with a video brand, WebM by its EBML DocType), a recording
+ * by its container (`audio`: MP3, M4A, WAV, Ogg, FLAC, AAC, WebM audio), UTF-8 text
+ * with no NUL (`code`, shown with line comments), anything else `file`
+ * (offered as a download). A document whose bytes are not text is a `file`
+ * too.
  *
  * The person's annotations on an attachment are stored per attachment and
  * version (`inbox/projects/<key>/annotations.jsonl`): `version` is "current"
@@ -38,15 +41,17 @@ import { ulid } from "./inbox-types";
  * How the window draws a file: Plannotator's viewer for its type. `code` (a
  * source file, a script, or any other UTF-8 text) is drawn as a code view
  * with line comments; `image` inline in the message and in an image viewer;
- * `pdf` and `file` are offered as downloads.
+ * `video` in a player, with comments at moments; `audio` in a player too,
+ * with comments at moments the same way (contract 4: `blockId: "video"`,
+ * `inboxVideo.time`); `pdf` and `file` are offered as downloads.
  *
  * Strictly additive: a reader that meets a kind it does not know (an older
  * window reading a newer store, a newer kind on a phone) treats it as `file`,
  * a download (`readInboxAttachmentKind`).
  */
-export type InboxAttachmentKind = "markdown" | "text" | "html" | "mermaid" | "graphviz" | "code" | "image" | "pdf" | "file";
+export type InboxAttachmentKind = "markdown" | "text" | "html" | "mermaid" | "graphviz" | "code" | "image" | "video" | "audio" | "pdf" | "file";
 
-const KNOWN_KINDS: ReadonlySet<string> = new Set(["markdown", "text", "html", "mermaid", "graphviz", "code", "image", "pdf", "file"]);
+const KNOWN_KINDS: ReadonlySet<string> = new Set(["markdown", "text", "html", "mermaid", "graphviz", "code", "image", "video", "audio", "pdf", "file"]);
 
 /** A kind as a reader should treat it: a value it does not know is `file` (a download). */
 export function readInboxAttachmentKind(kind: unknown): InboxAttachmentKind {
@@ -56,10 +61,16 @@ export function readInboxAttachmentKind(kind: unknown): InboxAttachmentKind {
 /** Kinds whose bytes are text, read through the `view` route. */
 export function isInboxTextKind(kind: unknown): boolean {
   const k = readInboxAttachmentKind(kind);
-  return k !== "image" && k !== "pdf" && k !== "file";
+  return k !== "image" && k !== "video" && k !== "audio" && k !== "pdf" && k !== "file";
 }
 
-/** Kinds the person can comment on (every viewer kind; a PDF and a plain file are downloads). */
+/** Kinds played in a player and commented on at moments (contract 4): a video, and a recording. */
+export function isInboxTimedKind(kind: unknown): boolean {
+  const k = readInboxAttachmentKind(kind);
+  return k === "video" || k === "audio";
+}
+
+/** Kinds the person can comment on (every viewer kind, a video or a recording at moments; a PDF and a plain file are downloads). */
 export function isInboxAnnotatableKind(kind: unknown): boolean {
   const k = readInboxAttachmentKind(kind);
   return k !== "pdf" && k !== "file";
@@ -83,11 +94,39 @@ export interface InboxAttachment {
   sent_at: string;
   /** The file's mtime when it was sent. */
   sent_mtime: string;
-  /** The sniffed content type of the sent bytes (images: `image/png`, ...; PDF: `application/pdf`). Added with the image and pdf kinds. */
+  /** The sniffed content type of the sent bytes (images: `image/png`, ...; PDF: `application/pdf`; video: `video/mp4`, `video/quicktime`, `video/webm`; audio: `audio/mpeg`, `audio/mp4`, `audio/wav`, `audio/ogg`, `audio/flac`, `audio/aac`, `audio/webm`). Added with the image and pdf kinds. */
   media_type?: string;
-  /** An image's size in pixels, from its header, when it parses. */
+  /** An image's size in pixels, from its header, when it parses; a video's first video track (MP4/MOV only). */
   width?: number;
   height?: number;
+  /** A video's length in milliseconds, from `moov/mvhd` (MP4/MOV only, when it parses); a recording's from its header (M4A, WAV, FLAC, MP3, Ogg, when it parses). Additive. */
+  duration_ms?: number;
+}
+
+/**
+ * An image a message's body shows (`![alt](design/b.png)` or `<img src>`),
+ * captured as a file of the thread (approval "inbox-image-viewer", 2026-10-15):
+ * the store reads it under the message-image route's rules (referenced in the
+ * body, an image by extension and by its bytes, inside the message's project
+ * or the linked worktree it was sent from, at most 10 MB and 50 megapixels),
+ * copies its bytes into a blob and keeps this record on the message
+ * (`InboxMessage.inline_images`). It is an attachment record (an `att_` id, the
+ * realpath, the sent blob) plus `ref`, so every attachment route, comment and
+ * export path reaches it by id; the window steps through it with the
+ * attachments. Additive: a reader that does not know the field draws nothing
+ * extra.
+ */
+export interface InboxInlineImage extends InboxAttachment {
+  /** The src exactly as the body wrote it (`design/checkout-b.png`), what the body's image renders from. */
+  ref: string;
+  /**
+   * `"on_open"`: the message was sent before images were captured, and the
+   * store took this copy the first time the thread was read ("Changed since
+   * you first opened it"). Absent: captured when the message was sent.
+   */
+  captured?: "on_open";
+  /** When it was captured on open; absent when captured at send. */
+  captured_at?: string;
 }
 
 /** Why the current file cannot be opened (the sent version always can). */
@@ -98,6 +137,11 @@ export type InboxAttachmentUnavailable =
 /** An attachment as the window reads it: the record plus the file as it is now. */
 export interface InboxAttachmentState extends InboxAttachment {
   message_id: string;
+  /** Set on an image the message's body shows (`InboxInlineImage.ref`): the src as written. Absent on an attached file. */
+  ref?: string;
+  /** `InboxInlineImage.captured`: "on_open" for a copy taken the first time the thread was read. */
+  captured?: "on_open";
+  captured_at?: string;
   /** The file on disk now, or null when it cannot be opened (`unavailable` says why). */
   current: { sha256: string; size: number; mtime: string } | null;
   /** The current bytes differ from the sent ones. */
@@ -112,22 +156,83 @@ export type InboxAnnotationVersion = string;
  * Where a comment on a guided review's diff sits: a file of the guide's
  * patch, one side of it, and a line range in that side's numbering (the
  * review app's line comment). Set on the record instead of an attachment.
+ * A global comment (on the whole review, `scope: "general"`) has no file and
+ * no lines: `file` is "", `side` "new" and both lines 0, the review app's
+ * own sentinels, so an older reader still finds every field.
  */
 export interface InboxGuideCommentTarget {
   /** The guided review's title, as the message carries it. */
   title: string;
-  /** The file, as the guide's patch names it. */
+  /** The file, as the guide's patch names it ("" for a global comment). */
   file: string;
   /** `new`: the changed file's lines; `old`: the original's. */
   side: "old" | "new";
   line_start: number;
   line_end: number;
+  /** "general": a global comment, on the whole review (additive; absent on a line comment). */
+  scope?: "general";
 }
 
 /**
+ * Where a comment on the text of an agent's message sits (approval
+ * "inbox-message-comments", 2026-10-19): the message itself, named by the
+ * record's `message_id`. The annotation is Plannotator's text selection
+ * (`originalText` is the exact words selected). `at` is the message's
+ * `created_at`, kept so a reader (the window, the phone's surface) can name
+ * the message ("your message from 2:58 PM") without looking it up.
+ */
+export interface InboxMessageCommentTarget {
+  /** The message's `created_at`. */
+  at: string;
+}
+
+/**
+ * A running local app a thread shows through the Inbox's loopback live
+ * proxy (`packages/server/inbox-live.ts`): today, a question choice's
+ * prototype (`Prototype: http://localhost:…`). `id` is `liv_` + 16 hex of the
+ * URL's normalized identity, the same in every thread.
+ */
+export interface InboxLiveSiteRef {
+  id: string;
+  /** The URL as checked: http, a loopback host, path and query kept, no fragment. */
+  url: string;
+  /** Who named it: an agent (a choice's `Prototype:` line). "person" is reserved for a site the person opens (#2258). */
+  opened_by: "agent" | "person";
+  opened_at: string;
+  web?: true;
+  framed?: false;
+}
+
+/**
+ * Where a comment on a live site sits: the site and the page it was made on.
+ * Then `attachment_id` is empty, `path` is the site's URL and `version`
+ * "current", so an older reader exports it under the URL.
+ */
+export interface InboxLiveCommentTarget {
+  site_id: string;
+  /** The site's URL as recorded. */
+  url: string;
+  /** The page it was made on (path and query, the bridge's report), or null for a comment on the whole site. */
+  page_url: string | null;
+}
+
+/** At most this many running-app prototypes (distinct addresses) in one message. */
+export const INBOX_LIVE_SITES_MAX = 12;
+
+/** A live site's URL, and a comment's page, are at most this long. */
+export const INBOX_LIVE_URL_MAX = 2048;
+
+/** A live comment's quoted words or element text (`originalText`), in characters: what the page supplies is capped. */
+export const INBOX_LIVE_QUOTE_MAX = 10_000;
+/** A live comment's `elementContext` and `htmlAnchor`, each, as JSON (the bridge's own are a few KB at most). */
+export const INBOX_LIVE_ELEMENT_MAX = 32 * 1024;
+/** A live comment's whole annotation object, as JSON. */
+export const INBOX_LIVE_ANNOTATION_MAX = 128 * 1024;
+
+/**
  * One annotation of the person's, stored until it rides a Send: on an
- * attachment, or (with `guide`) on the diff of the guided review a message
- * carries.
+ * attachment, (with `guide`) on the diff of the guided review a message
+ * carries, or (with `message`) on the text of an agent's message.
  */
 export interface InboxAnnotationRecord {
   /** The annotation's own id (Plannotator's `Annotation.id`). */
@@ -135,7 +240,7 @@ export interface InboxAnnotationRecord {
   project_id: string;
   thread_id: string;
   message_id: string;
-  /** The attachment it is on; empty for a guided-review comment (`guide` set). */
+  /** The attachment it is on; empty for a guided-review comment (`guide` set) and a message comment (`message` set). */
   attachment_id: string;
   /** The attachment's realpath, or a guided-review comment's file as the patch names it: with `version`, the draft's key. */
   path: string;
@@ -143,6 +248,15 @@ export interface InboxAnnotationRecord {
   version: InboxAnnotationVersion;
   /** Set on a comment on a guided review's diff (additive: an older reader sees a record whose attachment it cannot find). */
   guide?: InboxGuideCommentTarget;
+  /**
+   * Set on a comment on the text of an agent's message (additive): then
+   * `attachment_id` is empty, `path` is the message id and `version` is
+   * "current", so an older reader sees a record whose attachment it cannot
+   * find and exports it under the message id.
+   */
+  message?: InboxMessageCommentTarget;
+  /** Set on a comment on a running local site the thread shows (additive; see `InboxLiveCommentTarget`). */
+  live?: InboxLiveCommentTarget;
   /** Plannotator's `Annotation` (attachments) or the review app's `CodeAnnotation` (guided reviews), as the viewer made it (opaque to the store beyond the checks). */
   annotation: Record<string, unknown>;
   created_at: string;
@@ -153,6 +267,30 @@ export interface InboxAnnotationRecord {
 }
 
 export const INBOX_ANNOTATION_CURRENT = "current";
+
+/** The most of an agent's message one comment can quote (the words selected), in characters. */
+export const INBOX_MESSAGE_COMMENT_QUOTE_MAX = 20_000;
+
+/** The longest comment on a message's text, in characters. */
+export const INBOX_MESSAGE_COMMENT_TEXT_MAX = 10_000;
+
+const COMMENT_PICTURE_PATH_RE = /^(upl_[0-9A-HJKMNP-TV-Z]{26})\/([^/\\]{1,255})$/;
+
+export const INBOX_COMMENT_PICTURES_MAX = 10;
+
+export function inboxCommentPicture(path: unknown): { upload_id: string; file: string } | null {
+  const match = typeof path === "string" ? COMMENT_PICTURE_PATH_RE.exec(path) : null;
+  return match ? { upload_id: match[1]!, file: match[2]! } : null;
+}
+
+export function inboxCommentPictureUploads(annotation: { images?: unknown } | null | undefined): string[] {
+  const images = annotation?.images;
+  if (!Array.isArray(images)) return [];
+  return images.flatMap((image) => {
+    const picture = inboxCommentPicture(image && typeof image === "object" ? (image as { path?: unknown }).path : undefined);
+    return picture ? [picture.upload_id] : [];
+  });
+}
 
 /**
  * The largest text the window reads whole (the `view` and raw routes). A
@@ -201,7 +339,8 @@ function isCodeName(name: string): boolean {
  * window's routes and the phone's door alike. Null when the name passes.
  */
 export function inboxAttachmentNameRefusal(path: string): string | null {
-  const name = baseName(path);
+  // On NTFS `.env::$DATA`, `.env:x` and `.env .` all name the real `.env`.
+  const name = baseName(path).replace(/:.*$/s, "").replace(/[. ]+$/, "");
   if (isDotenvFileName(name)) return ".env files are never attached (they hold secrets).";
   return null;
 }
@@ -247,6 +386,16 @@ const MEDIA_LABELS: Record<string, string> = {
   "image/bmp": "BMP",
   "image/x-icon": "ICO",
   "image/svg+xml": "SVG",
+  "video/mp4": "MP4",
+  "video/quicktime": "MOV",
+  "video/webm": "WebM",
+  "audio/mpeg": "MP3",
+  "audio/mp4": "M4A",
+  "audio/wav": "WAV",
+  "audio/ogg": "Ogg",
+  "audio/flac": "FLAC",
+  "audio/aac": "AAC",
+  "audio/webm": "WebM",
 };
 
 /** The kind as a tile names it: "Markdown", "HTML", "PNG image", "PDF", "ZIP file". An unknown kind reads as a file. */
@@ -269,9 +418,58 @@ export function inboxAttachmentKindLabel(kind: InboxAttachmentKind | string, nam
       const label = (mediaType && MEDIA_LABELS[mediaType]) ?? ext?.toUpperCase();
       return label ? `${label} image` : "Image";
     }
+    case "video": {
+      const label = (mediaType && MEDIA_LABELS[mediaType]) ?? ext?.toUpperCase();
+      return label ? `${label} video` : "Video";
+    }
+    case "audio": {
+      // An Ogg holding Opus is named by its own extension when it says so ("OPUS audio").
+      const label = ext?.toLowerCase() === "opus" ? "Opus" : ((mediaType && MEDIA_LABELS[mediaType]) ?? ext?.toUpperCase());
+      return label ? `${label} audio` : "Audio";
+    }
     case "pdf":
       return "PDF";
     default:
       return ext ? `${ext.toUpperCase()} file` : "File";
   }
+}
+
+/**
+ * A moment in a video as people read it: `m:ss`, and `h:mm:ss` from one
+ * hour (the window, the phone and the feedback text alike). Seconds are
+ * floored, so a label never names a moment after the frame.
+ */
+export function formatInboxVideoTime(seconds: number): string {
+  const total = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const ss = String(total % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
+
+/**
+ * A comment on a video (contract: `adr/implementation/inbox-mobile.md`):
+ * Plannotator's `Annotation` with this `blockId` and `inboxVideo: { time }`,
+ * the moment in seconds from the start (millisecond precision). The frame the
+ * window grabbed, when there is one, rides `images[0]`. A comment on a
+ * recording (`audio`) is the same shape, with no frame: one contract for every
+ * comment at a moment, so a reader that knows videos reads recordings too.
+ */
+export const INBOX_VIDEO_BLOCK_ID = "video";
+
+/** The moment a stored annotation is on, in seconds, or null when it is not a comment at a moment (a video's or a recording's). */
+export function readInboxVideoTime(annotation: unknown): number | null {
+  if (!annotation || typeof annotation !== "object") return null;
+  const video = (annotation as { inboxVideo?: unknown }).inboxVideo;
+  if (!video || typeof video !== "object") return null;
+  const time = (video as { time?: unknown }).time;
+  return typeof time === "number" && Number.isFinite(time) && time >= 0 ? time : null;
+}
+
+/** A video's length and frame size as its header gave them: "7:41 · 1920 × 1080"; a recording's length, "1:23" (empty when nothing parsed). */
+export function inboxVideoMeta(attachment: Pick<InboxAttachment, "duration_ms" | "width" | "height">): string {
+  const parts: string[] = [];
+  if (typeof attachment.duration_ms === "number" && attachment.duration_ms > 0) parts.push(formatInboxVideoTime(attachment.duration_ms / 1000));
+  if (attachment.width && attachment.height) parts.push(`${attachment.width} × ${attachment.height}`);
+  return parts.join(" · ");
 }

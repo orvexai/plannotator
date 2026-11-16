@@ -12,7 +12,7 @@
  *    the state where the old header offered a data-destroying Approve.
  *  - `Request changes…` must deliver the note as a `scope:'general'`
  *    CodeAnnotation with the ''/0/0 sentinels riding the annotations array
- *    AND inside the exported `## General` section, one render after the
+ *    AND inside the exported `## Global comments` section, one render after the
  *    commit — a same-tick submit posts the pre-note payload and silently
  *    drops it (#1449 transport).
  *  - The discard confirm must post the bare approval (empty annotations), and
@@ -64,6 +64,7 @@ const memoryBackend: StorageBackend = {
 function seedFirstRunSeen(): void {
   memory.set("plannotator-plan-look-choice-resolved", "true");
   memory.set("plannotator-announce-tui-herdr-seen", "1");
+  memory.set("plannotator-announce-inbox-seen", "1");
   memory.set("plannotator-guide-intro-seen", "2");
   memory.set("plannotator-guide-hint-acked", "true");
   memory.set("plannotator-edit-mode-announcement-seen", "3");
@@ -134,6 +135,9 @@ let submissions: SubmittedBody[] = [];
 /** How many upcoming /api/feedback POSTs answer 500. Each failed attempt is
  *  still recorded in `submissions` so its captured body can be asserted. */
 let failFeedbackPosts = 0;
+/** Upcoming /api/feedback POSTs that reject as a network error (a stopped
+ *  server), recorded first. */
+let feedbackNetworkFailures = 0;
 /** When true, /api/diff carries `approvalNotesSupported: true` — the capable
  *  server. Default false mimics an OLD server whose payload has no such
  *  field at all, pinning that absent reads as not-capable. */
@@ -141,6 +145,8 @@ let advertiseApprovalNotes = false;
 /** Extra fields merged into the /api/diff payload — a PR session is entered by
  *  shipping `prMetadata` (+ `platformUser`) exactly the way the server does. */
 let prDiffExtras: Record<string, unknown> | null = null;
+/** Set: /api/pr-action answers with this error, as the server does when the forge refuses. */
+let prActionRefusal: string | null = null;
 /** What /api/ai/capabilities answers; Ask AI is off unless a test says so. */
 let aiCapabilities: Record<string, unknown> = { available: false, providers: [] };
 
@@ -160,10 +166,25 @@ const PR_METADATA = {
   url: "https://github.com/acme/widgets/pull/7",
 };
 
-function seedPlatformSession(options?: { selfAuthored?: boolean }): void {
+const MR_METADATA = {
+  platform: "gitlab",
+  host: "gitlab.com",
+  projectPath: "acme/widgets",
+  iid: 7,
+  title: "Add widget parser",
+  author: "leoreisdias",
+  baseBranch: "main",
+  headBranch: "feature/parser",
+  baseSha: "aaa1111",
+  headSha: "bbb2222",
+  url: "https://gitlab.com/acme/widgets/-/merge_requests/7",
+};
+
+function seedPlatformSession(options?: { selfAuthored?: boolean; gitlab?: boolean }): void {
+  const metadata = options?.gitlab ? MR_METADATA : PR_METADATA;
   prDiffExtras = {
-    prMetadata: PR_METADATA,
-    platformUser: options?.selfAuthored ? PR_METADATA.author : "reviewer",
+    prMetadata: metadata,
+    platformUser: options?.selfAuthored ? metadata.author : "reviewer",
   };
   // The submission's success path opens the PR in a new tab by default;
   // window.open is not a browser here, so keep the toggle off.
@@ -219,6 +240,7 @@ function makeFetch(): typeof fetch {
     if (url.pathname === "/api/pr-action") {
       const posted = JSON.parse(String(init?.body ?? "{}")) as { action?: string; body?: string };
       submissions.push({ endpoint: "pr-action", action: posted.action, body: posted.body });
+      if (prActionRefusal) return Response.json({ error: prActionRefusal }, { status: 500 });
       return Response.json({ ok: true, submission: { status: "complete" } });
     }
     if (url.pathname === "/api/diff/fresh") return Response.json({ fresh: true });
@@ -232,6 +254,10 @@ function makeFetch(): typeof fetch {
       if (failFeedbackPosts > 0) {
         failFeedbackPosts -= 1;
         return Response.json({ error: "boom" }, { status: 500 });
+      }
+      if (feedbackNetworkFailures > 0) {
+        feedbackNetworkFailures -= 1;
+        throw new TypeError("Failed to fetch");
       }
       return Response.json({ ok: true });
     }
@@ -345,8 +371,10 @@ afterEach(async () => {
   if (hasDom && originalMatchMedia) window.matchMedia = originalMatchMedia;
   submissions = [];
   failFeedbackPosts = 0;
+  feedbackNetworkFailures = 0;
   advertiseApprovalNotes = false;
   prDiffExtras = null;
+  prActionRefusal = null;
   aiCapabilities = { available: false, providers: [] };
   seededExternalAnnotations = [];
   memory.clear();
@@ -416,8 +444,8 @@ describe.if(hasDom)("review decision control (agent mode)", () => {
       lineEnd: 0,
       text: "rebase on main before merging",
     });
-    // The export the agent reads carries the note under ## General.
-    expect(body.feedback).toContain("## General");
+    // The export the agent reads carries the note under ## Global comments.
+    expect(body.feedback).toContain("## Global comments");
     expect(body.feedback).toContain("rebase on main before merging");
   });
 
@@ -520,6 +548,88 @@ describe.if(hasDom)("review decision control (agent mode)", () => {
     });
     await settle();
     expect(submissions).toHaveLength(2);
+  });
+
+  // #2913 gave plan review and annotate Mod+Shift+Enter for the note
+  // composer; code review answered the chord by POSTING the review instead,
+  // so a reviewer reaching for a note sent the decision with no note and no
+  // way back. Guards the open (nothing posted) and the send through it.
+  test("Mod+Shift+Enter opens the note composer instead of posting", async () => {
+    seededExternalAnnotations = [EXTERNAL_FINDING];
+    await mountReview();
+    await settle();
+    await settle();
+
+    expect(primaryButton()!.title).toContain("Send");
+    expect(noteInput()).toBeNull();
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    });
+    await settle();
+
+    expect(noteInput()).not.toBeNull();
+    expect(submissions).toHaveLength(0);
+
+    await typeNote("one more pass on the retry path");
+    await pressNoteKey("Enter", { metaKey: true });
+
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]!.approved).toBe(false);
+    expect(submissions[0]!.feedback).toContain("one more pass on the retry path");
+  });
+
+  // The chord's request is a counter the header control reads. A control
+  // mounted after one press (the compact layout toggled away and back) must
+  // not take that old press as a new one and open the composer by itself.
+  test("a remounted header control does not reopen the composer for an old Mod+Shift+Enter", async () => {
+    let coarse = false;
+    const listeners = new Set<(event: MediaQueryListEvent) => void>();
+    // SAFETY: implements the MediaQueryList surface the shell hooks consume;
+    // `coarse` flips the compact touch layout, which drops the header control.
+    window.matchMedia = ((query: string) => ({
+      get matches() { return coarse && query.includes("pointer: coarse"); },
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+      removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+      dispatchEvent: () => true,
+    })) as unknown as typeof window.matchMedia;
+    const setCoarse = async (value: boolean) => {
+      coarse = value;
+      await act(async () => {
+        for (const listener of [...listeners]) listener({ matches: value } as MediaQueryListEvent);
+      });
+      await settle();
+    };
+
+    seededExternalAnnotations = [EXTERNAL_FINDING];
+    await mountReview();
+    await settle();
+    await settle();
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    });
+    await settle();
+    expect(noteInput() !== null).toBe(true);
+    await pressNoteKey("Escape");
+    expect(noteInput() === null).toBe(true);
+
+    await setCoarse(true);
+    expect(caretButton() === null).toBe(true);
+    await setCoarse(false);
+    expect(caretButton() !== null).toBe(true);
+    expect(noteInput() === null).toBe(true);
+
+    // A new press still opens it.
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    });
+    await settle();
+    expect(noteInput() !== null).toBe(true);
+    expect(submissions).toHaveLength(0);
   });
 
   test("Mod+Enter fires the visible primary", async () => {
@@ -663,6 +773,61 @@ describe.if(hasDom)("review decision control (agent mode)", () => {
     expect(document.querySelector(DIALOG)).toBeNull();
     expect(memory.get("plannotator-announce-tui-herdr-seen")).toBe("1");
     expect(submissions).toHaveLength(0);
+  });
+
+  test("the Inbox announcement shows once, links to the Inbox page, and Mod+Enter cannot post behind it", async () => {
+    const DIALOG = "[data-inbox-announcement-dialog]";
+    const isOpen = () => document.querySelector(DIALOG) !== null;
+    const seed = () => {
+      seedFirstRunSeen();
+      memory.set("plannotator-token-hover-announcement-seen", "1");
+      memory.delete("plannotator-announce-inbox-seen");
+    };
+    await mount(isOpen, seed);
+    expect(isOpen()).toBe(true);
+
+    const link = document.querySelector<HTMLAnchorElement>(`${DIALOG} a[data-inbox-announcement-learn-more]`);
+    expect(link?.getAttribute("href")).toBe("https://plannotator.ai/inbox");
+    expect(link?.getAttribute("target")).toBe("_blank");
+
+    const close = document.querySelector<HTMLButtonElement>(`${DIALOG} [data-inbox-announcement-close]`);
+    if (!close) throw new Error("Close action did not render");
+    await act(async () => {
+      close.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }));
+    });
+    await settle();
+    expect(submissions).toHaveLength(0);
+
+    await act(async () => close.click());
+    await settle();
+    expect(isOpen()).toBe(false);
+    expect(memory.get("plannotator-announce-inbox-seen")).toBe("1");
+    expect(submissions).toHaveLength(0);
+
+    // Seen: the next load does not show it again.
+    await act(async () => root?.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    await mount(() => document.body.textContent?.includes("Approve"), () => {});
+    expect(isOpen()).toBe(false);
+  });
+
+  test("the Inbox announcement never shows in the VS Code webview", async () => {
+    const target = window as { __PLANNOTATOR_VSCODE?: unknown };
+    target.__PLANNOTATOR_VSCODE = true;
+    try {
+      await mount(() => document.body.textContent?.includes("Approve"), () => {
+        seedFirstRunSeen();
+        memory.set("plannotator-token-hover-announcement-seen", "1");
+        memory.delete("plannotator-announce-inbox-seen");
+      });
+      for (let attempt = 0; attempt < 5; attempt += 1) await settle();
+      expect(document.querySelector("[data-inbox-announcement-dialog]") !== null).toBe(false);
+      expect(memory.has("plannotator-announce-inbox-seen")).toBe(false);
+    } finally {
+      delete target.__PLANNOTATOR_VSCODE;
+    }
   });
 
   test("the Ask this session announcement takes the last turn, and Mod+Enter cannot post behind it", async () => {
@@ -948,6 +1113,36 @@ describe.if(hasDom)("review decision control (platform mode)", () => {
     expect(statuses[0]!.feedback).toContain("approved on GitHub");
   });
 
+  // GitLab lets an author approve their own MR unless the project forbids it:
+  // Approve stays live, and a refusal shows GitLab's answer in the open
+  // dialog, with nothing sent to the agent, so the review goes on.
+  test("own GitLab MR: Approve is live; GitLab's refusal shows in the dialog and the review stays open", async () => {
+    seedPlatformSession({ selfAuthored: true, gitlab: true });
+    const refusal = "GitLab refused the approval (401 Unauthorized). The project may not let you approve this merge request.";
+    prActionRefusal = refusal;
+    await mountReview();
+
+    const primary = primaryButton()!;
+    expect(primary.textContent).toContain("Approve");
+    expect(primary.getAttribute("aria-disabled")).toBeNull();
+    await act(async () => primary.click());
+    await settle();
+    expect(submissionDialogOpen("Approve MR")).toBe(true);
+
+    await pressModEnter();
+
+    expect(submissions.filter((s) => s.endpoint === "pr-action").map((s) => s.action)).toEqual(["approve"]);
+    expect(submissionDialogOpen("Approve MR")).toBe(true);
+    expect(document.body.textContent).toContain(refusal);
+    expect(submissions.filter((s) => s.endpoint === "feedback")).toHaveLength(0);
+
+    // Request changes is still there to choose.
+    await act(async () => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Cancel")?.click());
+    await settle();
+    await openMenu();
+    expect(menuItem("Request changes")?.disabled).toBe(false);
+  });
+
   test("self-authored empty state: muted primary is a no-op (click and Mod+Enter); Request changes… mutes, Comment… stays live", async () => {
     seedPlatformSession({ selfAuthored: true });
     await mountReview();
@@ -1008,10 +1203,15 @@ describe.if(hasDom)("review decision control (platform mode)", () => {
 
     expect(primaryButton()!.textContent).toContain("Post Comments");
 
+    // A tap is Alt going down and coming up alone (the registry's double-tap).
+    const tapAlt = () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Alt", altKey: true, bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { key: "Alt", bubbles: true }));
+    };
     const doubleTapAlt = async () => {
       await act(async () => {
-        window.dispatchEvent(new KeyboardEvent("keyup", { key: "Alt", bubbles: true }));
-        window.dispatchEvent(new KeyboardEvent("keyup", { key: "Alt", bubbles: true }));
+        tapAlt();
+        tapAlt();
       });
       await settle();
     };
@@ -1023,5 +1223,93 @@ describe.if(hasDom)("review decision control (platform mode)", () => {
     await doubleTapAlt();
     expect(primaryButton()!.textContent).toContain("Post Comments");
     expect(submissions).toHaveLength(0);
+
+    // ⌥F5 twice (Next change) and Alt+← twice (Back on Windows) hold Alt
+    // around another key: never a destination switch.
+    for (const key of ["F5", "ArrowLeft"]) {
+      await act(async () => {
+        for (let i = 0; i < 2; i += 1) {
+          window.dispatchEvent(new KeyboardEvent("keydown", { key: "Alt", altKey: true, bubbles: true }));
+          window.dispatchEvent(new KeyboardEvent("keydown", { key, code: key, altKey: true, bubbles: true }));
+          window.dispatchEvent(new KeyboardEvent("keyup", { key, code: key, altKey: true, bubbles: true }));
+          window.dispatchEvent(new KeyboardEvent("keyup", { key: "Alt", bubbles: true }));
+        }
+      });
+      await settle();
+      expect(primaryButton()!.textContent).toContain("Post Comments");
+    }
+  });
+});
+
+/**
+ * #1392 in code review: a send to a stopped server (or one that answered
+ * 500) used to set a "Failed to send" string nothing displayed, so the page
+ * looked the same as before the click. It must say the feedback was not sent
+ * and offer Retry and Copy feedback, with the review left as it was.
+ */
+describe.if(hasDom)("review: a send that does not reach Plannotator", () => {
+  // Sonner keeps earlier tests' toasts in its module store, so find this one
+  // by its title rather than taking the first toast on the page.
+  const failureToast = () =>
+    Array.from(document.querySelectorAll<HTMLElement>("[data-sonner-toast]"))
+      // A dismissed toast stays in the DOM while it animates out.
+      .filter((el) => el.getAttribute("data-removed") !== "true")
+      .find((el) => el.querySelector("[data-title]")?.textContent?.endsWith(" not sent"));
+  const toastButton = (label: string) =>
+    Array.from(failureToast()?.querySelectorAll<HTMLButtonElement>("button") ?? []).find((b) => b.textContent === label);
+  const completionState = () => document.querySelector("[data-completion-state]")?.getAttribute("data-completion-state") ?? null;
+
+  async function waitFor(check: () => unknown, what: string): Promise<void> {
+    for (let attempt = 0; attempt < 40 && !check(); attempt += 1) await settle();
+    if (!check()) throw new Error(`timed out waiting for ${what}`);
+  }
+
+  test("Send Feedback with the server gone: the message, Copy feedback, then Retry sends it", async () => {
+    feedbackNetworkFailures = 1;
+    const clipboard = navigator.clipboard;
+    const copied: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => void copied.push(text) },
+    });
+    try {
+      seededExternalAnnotations = [EXTERNAL_FINDING];
+      await mountReview();
+      await settle();
+      await settle();
+      expect(primaryButton()!.title).toContain("Send");
+      await act(async () => primaryButton()!.click());
+      await waitFor(failureToast, "the failure message");
+
+      expect(completionState()).toBeNull();
+      // Deliberate copy: the title says the feedback did not go out, and why.
+      expect(failureToast()!.textContent).toContain("Feedback not sent");
+      expect(failureToast()!.textContent).toContain("isn't running");
+
+      await act(async () => toastButton("Copy feedback")!.click());
+      await waitFor(() => copied.length > 0, "the copy");
+      // The same markdown the review's Copy feedback copies and the send carried.
+      expect(copied[0]).toBe(submissions[0]!.feedback!);
+
+      await act(async () => toastButton("Retry")!.click());
+      await waitFor(() => completionState(), "the completion screen");
+      expect(submissions).toHaveLength(2);
+      expect(submissions[1]!.feedback).toContain("still drops null");
+    } finally {
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: clipboard });
+    }
+  });
+
+  test("a bare Approve answered 500: Approval not sent, nothing to copy, no Approved screen", async () => {
+    failFeedbackPosts = 1;
+    await mountReview();
+    await act(async () => primaryButton()!.click());
+    await waitFor(failureToast, "the failure message");
+
+    expect(completionState()).toBeNull();
+    expect(failureToast()!.textContent).toContain("Approval not sent");
+    expect(failureToast()!.textContent).toContain("500");
+    expect(Boolean(toastButton("Copy feedback"))).toBe(false);
+    expect(primaryButton()!.title).toContain("Approve");
   });
 });
