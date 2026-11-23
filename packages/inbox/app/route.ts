@@ -2,6 +2,7 @@
 
 import { tourStepOf } from '../tour/model';
 import { systemRouteOf } from '../system/route';
+import { localRouteOf, type LocalOpen } from '../pulls/localRoute';
 import { withoutClickSignal } from '../history';
 import { parseFileView } from '../fileView';
 import { parseSettingsHash, type SettingsSection } from '../settingsRoute';
@@ -13,9 +14,25 @@ import { shapeReviewAtOf, type ReviewAt } from '../shape/review';
 import { viewScopeOf, type PullViewScope } from '../pulls/viewScope';
 
 export interface Route {
-  page: 'inbox' | 'settings' | 'whats-new' | 'drafts' | 'tour' | 'board' | 'reviews' | 'shapes' | 'prs' | 'artifacts' | 'scheduled';
+  page: 'inbox' | 'settings' | 'whats-new' | 'drafts' | 'tour' | 'board' | 'reviews' | 'shapes' | 'prs' | 'artifacts' | 'scheduled' | 'plans';
+  /**
+   * Plans (`#plans`, only while config.json `inboxPlans` is on; approval "inbox-plans"): the plan open (`#plans=pln_…`),
+   * the version read (`&v=3`; absent: the newest), the two versions compared (`&from=3&to=5`), and `#plans&new` for
+   * the get-started screen once there are plans. The file on screen: another of its documents (`&doc=doc_…`) or an
+   * artifact (`&file=<path>`); absent: the plan's main page. The Spaces home's scope: every plan by project
+   * (`#plans&all`), or one of the sidebar's projects (`#plans&project=<id>`, in `project`); absent: the home.
+   */
+  plan?: string | null;
+  planDoc?: string | null;
+  planFile?: string | null;
+  planVersion?: number | null;
+  planDiff?: { from: number; to: number } | null;
+  planNew?: boolean;
+  planAll?: boolean;
   /** Routines (`#routines`): the one open beside the list (`#routine=sch_…`, `#routine=new` for a new one). */
   scheduled?: string | null;
+  /** The open routine's Runs tab (`#routine=sch_…&runs`); absent: its Edit tab. */
+  routineRuns?: boolean;
   /**
    * Pull requests (`#prs`, Code review on; approval "inbox-pr-dashboard"): Open or Merged (`&state=merged`), a stack's
    * page (`&stack=`, a layer's key), a PR opened from it (`&layer=`; `&scope=stack`, `&range=` or `&since=`, `PullViewScope`), and `&from=sheet` when the PR was
@@ -36,6 +53,12 @@ export interface Route {
   layer?: string | null;
   scope?: PullViewScope;
   /**
+   * The layer whose diff closed back to this stack's page (`&back=`, `layerClosed`), or to the list it was opened from
+   * (a layer's row, focus.ts `listUnder`): the list shows that layer's row selected, its stack unfolded. Only a diff's
+   * Back writes it, so any other way to the stack (a row, a thread, a tile) shows the stack's.
+   */
+  backLayer?: string | null;
+  /**
    * A thread opened from Reviews (`#reviews&thread=…`): the same thread and pane as the Inbox's (`page: 'inbox'`), with
    * Reviews' list beside it and its filter kept. It doesn't move threads: a different list on the same thread.
    */
@@ -52,9 +75,11 @@ export interface Route {
   system?: string | null;
   sheet?: string | null;
   full?: boolean;
+  /** Reviews' "On this computer" (pulls/localRoute.ts): the row whose diff is open beside the list (`&local=prj_…&branch=…`). */
+  local?: LocalOpen | null;
   /**
-   * Shape (approval "shape-inbox-placement"): the board open over its thread (`#thread=…&shape=shp_…`), or over
-   * the grid for a board with no thread (`#shapes&shape=shp_…`). The grid alone is `#shapes`.
+   * Shape (approval "shape-inbox-placement"): the board open in its thread's pane (`#thread=…&shape=shp_…`), or
+   * over the grid for a board with no thread (`#shapes&shape=shp_…`). The grid alone is `#shapes`.
    */
   shape?: string | null;
   /** The Board's list (`#board`, `#board=done`, `#board=cancelled`; `#board=shipped` before the rename opens Done, `#board=icebox` from before v2 Cancelled). */
@@ -132,6 +157,16 @@ export interface Route {
   experimental?: boolean;
 }
 
+/** The project the Inbox list is filtered to: Reviews' and the PR board's (`#reviews&project=`, `#prs&project=`) are theirs, never the list's. */
+export function listProjectOf(route: Pick<Route, 'page' | 'project'>): string | null {
+  return route.page === 'reviews' || route.page === 'prs' ? null : (route.project ?? null);
+}
+
+/** A layer's diff in Reviews closed (its Back, a verdict sent): its stack's page, that layer still the list's selection. */
+export function layerClosed(route: Route): Route {
+  return { ...route, layer: null, scope: 'layer', backLayer: route.layer ?? null };
+}
+
 export function readRoute(): Route {
   return routeOf(window.location.hash);
 }
@@ -146,14 +181,19 @@ export function routeOf(fullHash: string): Route {
   if (params.has('drafts')) return { page: 'drafts', project: null, thread: null };
   // The Artifacts wall (the sidebar's Artifacts row). `#thread=…&artifacts` is a thread's own grid, below.
   if (params.has('artifacts') && !params.get('thread')) return { page: 'artifacts', project: null, thread: null, pinned: params.get('artifacts') === 'pinned' };
-  if (params.has('routine') || params.has('routines')) return { page: 'scheduled', project: null, thread: null, scheduled: params.get('routine') || null };
+  if (params.has('routine') || params.has('routines')) {
+    const scheduled = params.get('routine') || null;
+    return { page: 'scheduled', project: null, thread: null, scheduled, ...(scheduled && params.has('runs') ? { routineRuns: true } : {}) };
+  }
+  if (params.has('plans')) return plansRouteOf(params);
   if (params.has('shapes')) return { page: 'shapes', project: null, thread: null, shape: params.get('shape') };
   if (params.has('prs')) {
     const stack = params.get('stack') || null;
     const layer = stack ? params.get('layer') || null : null;
     return {
       page: 'prs',
-      project: null,
+      // Reviews' project filter, which the board follows (`boardInProject`).
+      project: params.get('project') || null,
       thread: null,
       prsView: params.get('state') === 'merged' ? 'merged' : 'open',
       prsLayout: sheetLayoutOf(params.get('layout')),
@@ -177,8 +217,10 @@ export function routeOf(fullHash: string): Route {
       stack,
       layer,
       scope: layer ? viewScopeOf(params) : 'layer',
+      backLayer: !layer ? params.get('back') || null : null,
       new: params.has('new'),
       ...systemRouteOf(params),
+      ...localRouteOf(params),
     };
   }
   if (params.has('board'))
@@ -213,5 +255,25 @@ export function routeOf(fullHash: string): Route {
     board: thread && params.get('card') ? boardViewOf(params.get('from')) : undefined,
     boardProject: thread && params.get('card') ? params.get('board-project') || null : null,
     boardInitiative: thread && params.get('card') ? boardInitiativeOf(params.get('board-initiative'), null) : null,
+  };
+}
+
+const versionOf = (raw: string | null): number | null => (raw && /^[1-9][0-9]{0,8}$/.test(raw) ? Number(raw) : null);
+
+function plansRouteOf(params: URLSearchParams): Route {
+  const plan = params.get('plans') || null;
+  const from = versionOf(params.get('from'));
+  const to = versionOf(params.get('to'));
+  return {
+    page: 'plans',
+    project: plan ? null : params.get('project') || null,
+    thread: null,
+    plan,
+    planVersion: plan ? versionOf(params.get('v')) : null,
+    planDoc: plan && !params.get('file') ? params.get('doc') || null : null,
+    planFile: plan ? params.get('file') || null : null,
+    planDiff: plan && from !== null && to !== null && from !== to ? { from, to } : null,
+    planNew: !plan && params.has('new'),
+    planAll: !plan && !params.get('project') && params.has('all'),
   };
 }
