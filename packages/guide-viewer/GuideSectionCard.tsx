@@ -1,8 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown } from 'lucide-react';
 import type { GuideSection } from '@plannotator/core/guide';
+import { fileKind, groupByFileKind, type FileKind } from '@plannotator/core/file-kind';
 import type { DiffFile } from './types';
+import { FILE_KIND_LABELS, FileKindIcon } from './FileKindIcon';
 import { renderMarkdownProse } from './renderMarkdownProse';
+import type { GuideLinkRenderer } from './renderInlineMarkdown';
 import { useGuideHost } from './host';
 import { GuideFileCard } from './GuideFileCard';
 
@@ -61,11 +64,195 @@ function FileChip({
   );
 }
 
+/** "Tests 2" / "Generated 1" above a kind's chips, shown only when a chapter mixes kinds. */
+function KindSubhead({ kind, count }: { kind: FileKind; count: number }) {
+  return (
+    <div data-guide-kind-subhead={kind} className="flex items-center gap-1.5 px-0.5 pt-1 text-[10.5px] font-medium text-muted-foreground">
+      <FileKindIcon kind={kind} />
+      <span>{FILE_KIND_LABELS[kind]}</span>
+      <span className="tabular-nums text-muted-foreground/60">{count}</span>
+    </div>
+  );
+}
+
+/** The card's own border colour (`border-border/50`): the tab's outline continues it. */
+const CARD_BORDER = 'color-mix(in oklab, var(--border) 50%, transparent)';
+/** The open card's background (`bg-card`). */
+const CARD_FILL = 'var(--card)';
+/**
+ * The folded card's background (`bg-muted/10`) made opaque over the guide's
+ * ground, so the tab's fill hides the card's top border under it.
+ */
+const FOLDED_CARD_FILL = 'color-mix(in oklab, var(--muted) 10%, var(--background))';
+/** Space around the control inside the tab, and the tab's corner radii (the card's rounded-lg). */
+const TAB_PAD_X = 6;
+const TAB_PAD_Y = 4;
+const TAB_RADIUS = 8;
+/** The inverse radius where the tab's left side meets the card's top edge. */
+const TAB_SHOULDER = 10;
+
+/**
+ * A host's control in a small tab rising out of the card's top edge at its
+ * top right (GuideHostValue.renderSectionTab): the card's own background and
+ * border, only as wide as the control, rounded top corners, and a curved
+ * shoulder into the card's top edge. One SVG path draws it: the fill covers
+ * the card's top border under the tab, a 1px stroke on half-pixel coordinates
+ * continues the card's border, so the outline is one line with no seam. It is
+ * part of the card: it scrolls with it.
+ */
+function SectionTab({ fill, lead, children }: { fill: string; lead?: React.ReactNode; children: React.ReactNode }) {
+  const controlRef = useRef<HTMLDivElement>(null);
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
+  useLayoutEffect(() => {
+    const el = controlRef.current;
+    if (!el) return;
+    const measure = () => {
+      const w = Math.ceil(el.offsetWidth);
+      const h = Math.ceil(el.offsetHeight);
+      setSize((prev) => (prev && prev.w === w && prev.h === h ? prev : { w, h }));
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const h = size?.h ?? 0;
+  const w = size?.w ?? 0;
+  const T = h + TAB_PAD_Y * 2; // the tab's height above the card's top edge
+  const s = TAB_SHOULDER;
+  const W = s + w + TAB_PAD_X * 2;
+  const r = TAB_RADIUS;
+  // The card starts right under the row: its top border is the pixel row [T, T+1].
+  const xl = s - 0.5;
+  const xr = W - 0.5;
+  const y0 = 0.5;
+  const yb = T + 0.5;
+  const outline = `M 0 ${yb} A ${s - 0.5} ${s - 0.5} 0 0 0 ${xl} ${yb - (s - 0.5)} L ${xl} ${y0 + r} A ${r} ${r} 0 0 1 ${xl + r} ${y0} L ${xr - r} ${y0} A ${r} ${r} 0 0 1 ${xr} ${y0 + r} L ${xr} ${T + 1}`;
+  return (
+    <div data-guide-section-tab="" style={{ position: 'relative', zIndex: 1, height: T, pointerEvents: 'none' }}>
+      {size && (
+        <svg
+          aria-hidden="true"
+          width={W}
+          height={T + 1}
+          viewBox={`0 0 ${W} ${T + 1}`}
+          style={{ position: 'absolute', right: 0, top: 0, overflow: 'visible' }}
+        >
+          <path d={`${outline} L ${W} ${T + 1} L 0 ${T + 1} Z`} style={{ fill }} />
+          <path d={outline} style={{ fill: 'none', stroke: CARD_BORDER, strokeWidth: 1 }} />
+        </svg>
+      )}
+      {/* The host's lead (GuideView bare: the header's actions) on the same row, left of the tab, centred on it. It
+          ends 8px short of the tab and may only take the room left of it, so the two never meet. */}
+      {lead && (
+        <div
+          data-guide-section-tab-lead=""
+          style={{ position: 'absolute', left: 0, right: W + 8, top: 0, height: T, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, minWidth: 0, pointerEvents: 'auto', visibility: size ? undefined : 'hidden' }}
+        >
+          {lead}
+        </div>
+      )}
+      <div
+        ref={controlRef}
+        style={{ position: 'absolute', right: TAB_PAD_X, top: TAB_PAD_Y, pointerEvents: 'auto', visibility: size ? undefined : 'hidden' }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** Where folded chapter diagrams are listed (one key, newest last), and how many it keeps. */
+const DIAGRAM_FOLDS_KEY = 'plannotator-guide-diagram-folds';
+const DIAGRAM_FOLDS_KEPT = 60;
+
+type FoldStore = { getItem: (key: string) => string | null; setItem: (key: string, value: string) => void };
+
+/** The browser's localStorage, when the page has one it may use. */
+function localFoldStore(): FoldStore | null {
+  try {
+    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A short name for one chapter's diagram: its chapter's title and its source, so a redrawn diagram opens again. */
+export function chapterDiagramFoldId(title: string, source: string): string {
+  let hash = 5381;
+  const text = `${title}\n${source}`;
+  for (let i = 0; i < text.length; i++) hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0;
+  return hash.toString(36);
+}
+
+function readFolds(store: FoldStore | null): string[] {
+  try {
+    return (store?.getItem(DIAGRAM_FOLDS_KEY) ?? '').split(' ').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function writeFold(store: FoldStore | null, id: string, folded: boolean): void {
+  const rest = readFolds(store).filter((kept) => kept !== id);
+  const next = folded ? [...rest, id].slice(-DIAGRAM_FOLDS_KEPT) : rest;
+  try {
+    store?.setItem(DIAGRAM_FOLDS_KEY, next.join(' '));
+  } catch {
+    // Storage refused (private mode, quota): the fold lasts while the page is open.
+  }
+}
+
+/**
+ * A chapter's diagram at the top of its code pane: a "Diagram" header whose caret folds it, as a file's does, and
+ * the host's drawing under it, its box capped at 320px (the canvas fits the drawing inside it; Expand opens it full
+ * size) so a tall diagram does not push the chapter's code away. The fold is
+ * kept (the host's store, else localStorage), so the diagram stays folded when the guide opens again. A host with
+ * `chapterDiagramsFolded` draws it folded at first and keeps nothing.
+ */
+function ChapterDiagram({ kind, foldId, children }: { kind: string; foldId: string; children: React.ReactNode }) {
+  const { diagramFoldStore, chapterDiagramsFolded } = useGuideHost();
+  const store = diagramFoldStore ?? localFoldStore();
+  // The host's `chapterDiagramsFolded`: folded at first, and the person's clicks last only while the page is open.
+  const [folded, setFolded] = useState(() => chapterDiagramsFolded === true || readFolds(store).includes(foldId));
+  const toggle = () => {
+    const next = !folded;
+    setFolded(next);
+    if (chapterDiagramsFolded !== true) writeFold(store, foldId, next);
+  };
+  return (
+    <div data-guide-chapter-diagram={kind} data-folded={folded ? '' : undefined} className="min-w-0">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={!folded}
+        className="group flex items-center gap-1.5 rounded px-1 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+        title={folded ? 'Show diagram' : 'Hide diagram'}
+      >
+        <ChevronDown className={`flex-shrink-0 transition-transform ${folded ? '-rotate-90' : ''}`} size={13} />
+        Diagram
+      </button>
+      {!folded && (
+        <div
+          data-guide-chapter-diagram-body=""
+          className="mt-1.5 min-w-0 [&_[data-diagram-block]]:!my-0 [&_[data-diagram-inline]]:max-h-[320px]"
+        >
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface GuideSectionCardProps {
   section: GuideSection;
   files: DiffFile[];
   index: number;
   total: number;
+  /** False for the "Everything else" card: it is not one of the guide's sections, so it carries no "NN / NN". */
+  numbered?: boolean;
   reviewed?: boolean;
   showReviewed?: boolean;
   onToggleReviewed?: () => void;
@@ -73,6 +260,12 @@ interface GuideSectionCardProps {
   revealTarget: { filePath: string; token: number } | null;
   onActivate: (filePath: string) => void;
   onRequestReveal: (filePath: string) => void;
+  /** Renders guide links (`chapter:`, `code:`) in the chapter overview. */
+  renderLink?: GuideLinkRenderer;
+  /** Each file's box as tall as its diff (GuideView `fitFileHeights`); see GuideFileCard `fitContent`. */
+  fitFileHeights?: boolean;
+  /** Drawn on the tab's row, left of the tab, when this card has one (GuideView `bare`: the header's actions). */
+  tabLead?: React.ReactNode;
 }
 
 /**
@@ -87,17 +280,24 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
   total,
   reviewed = false,
   showReviewed = true,
+  numbered = true,
   onToggleReviewed,
   focusedFile,
   revealTarget,
   onActivate,
   onRequestReveal,
+  renderLink,
+  fitFileHeights = false,
+  tabLead,
 }) => {
   const [collapsedOverride, setCollapsedOverride] = useState<boolean | null>(null);
   const host = useGuideHost();
   const cardRef = useRef<HTMLDivElement>(null);
-  const position = `${String(index + 1).padStart(2, '0')} / ${String(total).padStart(2, '0')}`;
+  const position = numbered ? `${String(index + 1).padStart(2, '0')} / ${String(total).padStart(2, '0')}` : null;
   const isCollapsed = showReviewed ? collapsedOverride ?? reviewed : collapsedOverride === true;
+  // A chapter's diagram (format version 5), drawn by the host at the top of the chapter's code pane; a host that
+  // cannot draw it leaves the chapter exactly as it is without one.
+  const chapterDiagram = section.diagram && !isCollapsed ? (host.renderChapterDiagram?.(section.diagram, index) ?? null) : null;
 
   const filesByPath = useMemo(() => new Map(host.files.map((file) => [file.path, file])), [host.files]);
   const summaryByPath = useMemo(() => {
@@ -107,6 +307,18 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
     }
     return summaries;
   }, [section.diffs]);
+
+  // Within the chapter, files come together by kind (code, tests, generated),
+  // keeping the author's order inside each kind. Chips and diff cards share it.
+  const chipGroups = useMemo(
+    () => groupByFileKind(section.diffs, (ref) => ref.file, host.generatedFiles),
+    [section.diffs, host.generatedFiles],
+  );
+  const orderedFiles = useMemo(
+    () => (host.keepsFileOrder ? files : groupByFileKind(files, (file) => file.path, host.generatedFiles).flatMap((group) => group.items)),
+    [files, host.generatedFiles, host.keepsFileOrder],
+  );
+  const showKinds = chipGroups.length > 1;
 
   const targetBelongsHere = revealTarget && section.diffs.some((ref) => ref.file === revealTarget.filePath)
     ? revealTarget
@@ -128,9 +340,26 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
     onToggleReviewed?.();
   };
 
+  // A host's control in a tab on this card (the Inbox's diff layout); nothing otherwise.
+  const tab = host.renderSectionTab?.(index, { folded: isCollapsed, diffs: section.diffs.length, title: section.title }) ?? null;
+  // A host's content at the foot of the prose column (VS Code: ask about this chapter); nothing otherwise.
+  const footer = host.renderSectionFooter?.(index) ?? null;
+  const tabbed = tab !== null && tab !== undefined && tab !== false;
+  const withTab = (card: React.ReactNode, fill: string) =>
+    tabbed ? (
+      <div data-guide-section-tabbed="">
+        <SectionTab fill={fill} lead={tabLead}>{tab}</SectionTab>
+        {card}
+      </div>
+    ) : (
+      card
+    );
+  // Squared under the tab, which carries the corner; a jump to the card keeps the tab in view.
+  const tabbedCardStyle: React.CSSProperties | undefined = tabbed ? { borderTopRightRadius: 0, scrollMarginTop: 56 } : undefined;
+
   if (isCollapsed) {
-    return (
-      <div ref={cardRef} className="flex w-full items-center gap-3 rounded-lg border border-border/50 bg-muted/10 px-4 py-3">
+    return withTab(
+      <div ref={cardRef} data-guide-section={index} style={tabbedCardStyle} className="flex w-full items-center gap-3 rounded-lg border border-border/50 bg-muted/10 px-4 py-3">
         {showReviewed && (
           <button
             type="button"
@@ -152,18 +381,19 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
             {section.diffs.length} diff{section.diffs.length !== 1 ? 's' : ''}
             {reviewed ? ' · reviewed' : ''}
           </span>
-          <span className="flex-shrink-0 font-mono text-[10px] text-muted-foreground/40">{position}</span>
+          {position && <span className="flex-shrink-0 font-mono text-[10px] text-muted-foreground/40">{position}</span>}
           <ChevronDown className="flex-shrink-0 -rotate-90 text-muted-foreground/40 transition-transform group-hover:text-muted-foreground" size={13} />
         </button>
-      </div>
+      </div>,
+      FOLDED_CARD_FILL,
     );
   }
 
-  return (
-    <div ref={cardRef} className="scroll-mt-4 overflow-clip rounded-lg border border-border/50 bg-card">
+  return withTab(
+    <div ref={cardRef} data-guide-section={index} style={tabbedCardStyle} className="scroll-mt-4 overflow-clip rounded-lg border border-border/50 bg-card">
       {/* Stacked below md; a proportional chapter column on tablets; the fixed 440px column from lg up (desktop unchanged). */}
-      <div className="md:grid md:grid-cols-[minmax(260px,36%)_minmax(0,1fr)] lg:grid-cols-[440px_minmax(0,1fr)]">
-        <div className="border-b border-border/40 md:border-b-0 md:border-r">
+      <div data-guide-section-grid="" className="md:grid md:grid-cols-[minmax(260px,36%)_minmax(0,1fr)] lg:grid-cols-[440px_minmax(0,1fr)]">
+        <div data-guide-section-narrative="" className="border-b border-border/40 md:border-b-0 md:border-r">
           <div className="px-4 py-4 md:sticky md:top-0 md:flex md:max-h-[calc(100dvh-48px)] md:flex-col md:overflow-y-auto md:overflow-x-hidden md:px-6 md:py-5">
             <div className="flex items-start gap-2 md:flex-none">
               <h3 className="flex-1 text-[15px] font-semibold leading-snug text-foreground [text-wrap:balance]">
@@ -179,8 +409,9 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
                 <ChevronDown className="rotate-180" size={13} />
               </button>
             </div>
+            {(position || showReviewed) && (
             <div className="mt-2 flex items-center gap-3 md:flex-none">
-              <span className="font-mono text-[11px] text-muted-foreground/60">{position}</span>
+              {position && <span className="font-mono text-[11px] text-muted-foreground/60">{position}</span>}
               {showReviewed && (
                 <button
                   type="button"
@@ -193,41 +424,55 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
                 </button>
               )}
             </div>
+            )}
 
             {section.overview && (
-              <div className="mt-3.5 space-y-2.5 md:flex-none">{renderMarkdownProse(section.overview, { tone: 'muted' })}</div>
+              <div className="mt-3.5 space-y-2.5 md:flex-none">{renderMarkdownProse(section.overview, { tone: 'muted', renderLink })}</div>
             )}
 
             {section.diffs.length > 0 && (
               <div className="mt-5 space-y-1.5 md:min-h-[84px] md:overflow-y-auto md:overflow-x-hidden">
-                {section.diffs.map((ref) => (
-                  <FileChip
-                    key={ref.file}
-                    filePath={ref.file}
-                    summary={ref.summary}
-                    file={filesByPath.get(ref.file)}
-                    active={focusedFile === ref.file}
-                    onClick={() => onRequestReveal(ref.file)}
-                  />
+                {chipGroups.map((group) => (
+                  <React.Fragment key={group.kind}>
+                    {showKinds && group.kind !== 'code' && <KindSubhead kind={group.kind} count={group.items.length} />}
+                    {group.items.map((ref) => (
+                      <FileChip
+                        key={ref.file}
+                        filePath={ref.file}
+                        summary={ref.summary}
+                        file={filesByPath.get(ref.file)}
+                        active={focusedFile === ref.file}
+                        onClick={() => onRequestReveal(ref.file)}
+                      />
+                    ))}
+                  </React.Fragment>
                 ))}
               </div>
             )}
+            {footer && <div className="mt-4 md:flex-none">{footer}</div>}
           </div>
         </div>
 
         <div className="min-w-0 space-y-4 bg-muted/[0.07] px-1.5 py-3 md:px-4 md:py-4">
-          {files.length > 0 ? (
-            files.map((file) => (
+          {chapterDiagram && section.diagram && (
+            <ChapterDiagram kind={section.diagram.kind} foldId={chapterDiagramFoldId(section.title, section.diagram.source)}>
+              {chapterDiagram}
+            </ChapterDiagram>
+          )}
+          {orderedFiles.length > 0 ? (
+            orderedFiles.map((file) => (
               <GuideFileCard
                 key={file.path}
                 file={file}
                 summary={summaryByPath.get(file.path)}
+                kind={fileKind(file.path, host.generatedFiles)}
                 focused={focusedFile === file.path}
                 revealTarget={targetBelongsHere}
                 onActivate={onActivate}
+                fitContent={fitFileHeights}
               />
             ))
-          ) : (
+          ) : host.renderSectionEmpty?.(index) ?? (
             <div className="flex min-h-[150px] items-center justify-center px-6 text-center">
               <div>
                 <p className="text-xs font-medium text-foreground">No chapter files in the current diff</p>
@@ -237,6 +482,7 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    CARD_FILL,
   );
 };

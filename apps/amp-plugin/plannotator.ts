@@ -171,6 +171,35 @@ export default function plannotatorAmpPlugin(amp: PluginAPI) {
       await handleAnnotateResult(ctx, result, { kind: "message" });
     },
   );
+
+  amp.registerCommand(
+    "plannotator-inbox",
+    {
+      title: "Open Inbox",
+      category: CATEGORY,
+      description: "Open the Plannotator Inbox in the browser and show its address.",
+    },
+    async (ctx) => {
+      // Starts a stopped Inbox in the background, opens it and prints its URL; returns at once.
+      const result = await runPlannotator(amp, ctx, ["inbox", "--open"]);
+      await ctx.ui.notify(inboxOpenedMessage(result));
+    },
+  );
+}
+
+/** What /plannotator-inbox shows for the CLI's answer. */
+export function inboxOpenedMessage(result: RunResult): string {
+  const url = /https?:\/\/\S+/.exec(result.stdout)?.[0];
+  if (!result.error && result.status === 0 && url) {
+    // The CLI's stderr says why no browser opened (a remote session, a "none" browser).
+    return `Plannotator Inbox: ${url}${result.stderr.trim() ? `\n${result.stderr.trim()}` : ""}`;
+  }
+  const details = [result.error, result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n").trim();
+  if (/unknown inbox option: --open|unknown command/i.test(details)) {
+    return "The plannotator CLI is older than /plannotator-inbox. Update it with `plannotator update`, or run `plannotator inbox` in a terminal.";
+  }
+  const missing = /\bENOENT\b|executable not found|command not found/i.test(details);
+  return `Could not open the Plannotator Inbox.${details ? `\n\n${details}` : ""}${missing ? `\n\nInstall the CLI first: ${INSTALL_URL}` : ""}`;
 }
 
 export function extractTextFromThreadMessage(message: ThreadMessage): string {
@@ -479,6 +508,7 @@ async function runPlannotator(
       stdin: options.stdin ? "pipe" : "ignore",
       stdout: "pipe",
       stderr: "pipe",
+      windowsHide: true,
     });
   } catch (error) {
     return {
@@ -922,6 +952,8 @@ function sleep(ms: number): Promise<void> {
 function detectPlannotatorVersion(command: string[]): string | null {
   try {
     const result = Bun.spawnSync([...command, "--version"], {
+      env: { ...process.env },
+      windowsHide: true,
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -977,6 +1009,9 @@ function loadPlannotatorConfig(): PromptConfig {
   }
 }
 
+/** What only Plannotator writes into its data directory (DATA_DIR_MARKERS in packages/shared/data-dir.ts). */
+export const DATA_DIR_MARKERS = ["history", "sessions", "drafts", "inbox", "claude-code-mod", "install-flags.json"] as const;
+
 export function getPlannotatorDataDir(): string {
   const home = homedir();
 
@@ -989,18 +1024,26 @@ export function getPlannotatorDataDir(): string {
     return resolve(value);
   }
 
-  // Legacy-first: an existing ~/.plannotator always wins so current
-  // installs never move. Only when it is absent AND XDG_DATA_HOME is
-  // explicitly set to an absolute path does the XDG location apply.
+  // Legacy-first: an existing ~/.plannotator wins so current installs never
+  // move, unless it is a stray folder (none of Plannotator's data) while the
+  // XDG folder holds the data (#2305). Only when it is absent AND
+  // XDG_DATA_HOME is explicitly set to an absolute path does the XDG
+  // location apply otherwise. A copy of packages/shared/data-dir.ts (this
+  // plugin is one file); tests/data-dir-mirrors.test.ts keeps them equal.
   const legacyDir = join(home, ".plannotator");
-  if (existsSync(legacyDir)) return legacyDir;
-
   const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
-  if (xdgDataHome && isAbsolute(xdgDataHome)) {
-    return join(xdgDataHome, "plannotator");
+  const xdgDir = xdgDataHome && isAbsolute(xdgDataHome) ? join(xdgDataHome, "plannotator") : null;
+
+  if (existsSync(legacyDir)) {
+    if (xdgDir && existsSync(xdgDir) && holdsPlannotatorData(xdgDir) && !holdsPlannotatorData(legacyDir)) return xdgDir;
+    return legacyDir;
   }
 
-  return legacyDir;
+  return xdgDir ?? legacyDir;
+}
+
+function holdsPlannotatorData(dir: string): boolean {
+  return DATA_DIR_MARKERS.some((entry) => existsSync(join(dir, entry)));
 }
 
 function getConfiguredPrompt(

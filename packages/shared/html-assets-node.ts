@@ -1,13 +1,126 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve as resolvePath, posix as pathPosix, sep } from "node:path";
 import {
+  HTML_ASSET_DOCUMENT_CSP,
   htmlAssetContentType,
+  htmlAssetHeaders,
   refusesHiddenHtmlAssetPath,
   rewriteCssAssetReferences,
   rewriteHtmlAssetReferences,
 } from "./html-assets";
+import { decideByteRange } from "./byte-range";
 
 export const MAX_HTML_ASSET_BYTES = 50 * 1024 * 1024;
+
+/** Resolve a local Markdown video's URL without granting access outside its document folder. */
+export function annotateMediaFile(
+  path: string | null,
+  base: string | null,
+  servedDocuments: ReadonlySet<string>,
+): { path: string; contentType: string; size: number; status: 200 } | { status: 403 | 404 | 413 } {
+  if (!path || !base || !isAbsolute(base) || isAbsolute(path) || /^[a-z][a-z\d+.-]*:/i.test(path) || path.includes('\\')) {
+    return { status: 403 };
+  }
+  if (!annotateMediaContentType(path)) return { status: 403 };
+  const directory = resolvePath(base);
+  // The caller's base is untrusted. It must be the folder of a document this
+  // session opened, including a linked document outside the original roots.
+  if (![...servedDocuments].some((document) => {
+    const docDir = dirname(resolvePath(document));
+    return isWithinDirectory(directory, docDir) && isWithinDirectory(docDir, directory);
+  })) return { status: 403 };
+  // Resolve once; every check below is on the file that is then served.
+  let root: string;
+  let target: string;
+  try {
+    root = realpathSync(directory);
+    target = realpathSync(resolvePath(directory, path));
+  } catch {
+    return { status: 404 };
+  }
+  const inside = relative(root, target);
+  if (!inside || inside.startsWith("..") || isAbsolute(inside)) return { status: 403 };
+  // Hidden files and folders (`.git/`, `.cache/`), as the HTML assets refuse them.
+  if (refusesHiddenHtmlAssetPath(inside)) return { status: 403 };
+  // A `clip.mp4` link to `notes.txt` is not a video.
+  const contentType = annotateMediaContentType(target);
+  if (!contentType) return { status: 403 };
+  let stat;
+  try {
+    stat = statSync(target);
+  } catch {
+    return { status: 404 };
+  }
+  if (!stat.isFile()) return { status: 404 };
+  if (stat.size > MAX_HTML_ASSET_BYTES) return { status: 413 };
+  return { status: 200, path: target, contentType, size: stat.size };
+}
+
+function annotateMediaContentType(path: string): string | null {
+  const extension = pathPosix.extname(path.replace(/\\/g, "/")).toLowerCase();
+  return extension === ".mp4" ? "video/mp4"
+    : extension === ".webm" ? "video/webm"
+      : extension === ".ogg" ? "video/ogg" : null;
+}
+
+/**
+ * The `/api/annotate-media` answer, the same in every server (annotate and
+ * plan, Bun and Pi): an error status, or the headers and the byte span of the
+ * file to send. One `Range` (`bytes=a-b`, `bytes=a-`, `bytes=-n`) is a `206`
+ * with `Content-Range`; a range past the end is a `416`; none, several or an
+ * unreadable one is the whole file. A player needs the `206` to seek, and
+ * Safari plays nothing without it. The adapter streams the span from `path`.
+ */
+export function annotateMediaAnswer(
+  path: string | null,
+  base: string | null,
+  servedDocuments: ReadonlySet<string>,
+  range: string | null,
+):
+  | { status: 403 | 404 | 413 }
+  | { status: 416; headers: Record<string, string> }
+  | { status: 200 | 206; headers: Record<string, string>; path: string; start: number; end: number } {
+  const media = annotateMediaFile(path, base, servedDocuments);
+  if (media.status !== 200) return media;
+  const headers: Record<string, string> = {
+    ...htmlAssetHeaders(media.contentType),
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Accept-Ranges": "bytes",
+  };
+  // No validator is sent, so `If-Range` is not judged; a 206 is never capped.
+  const decision = decideByteRange(range, media.size, { maxLength: Number.POSITIVE_INFINITY });
+  if (decision.kind === "unsatisfiable") {
+    return { status: 416, headers: { ...headers, "Content-Range": `bytes */${media.size}`, "Content-Length": "0" } };
+  }
+  const start = decision.kind === "partial" ? decision.start : 0;
+  const end = decision.kind === "partial" ? decision.end : media.size - 1;
+  headers["Content-Length"] = String(Math.max(0, end - start + 1));
+  if (decision.kind === "partial") headers["Content-Range"] = `bytes ${start}-${end}/${media.size}`;
+  return { status: decision.kind === "partial" ? 206 : 200, headers, path: media.path, start, end };
+}
+
+/**
+ * The CSP of an HTML document served from an asset root outside the session's
+ * roots (#2291): no network, so a page opened from anywhere cannot send what
+ * its scripts load (the Inbox's INBOX_HTML_DOCUMENT_CSP is the same rule).
+ */
+export const OUTSIDE_ROOT_HTML_DOCUMENT_CSP = `${HTML_ASSET_DOCUMENT_CSP}; connect-src 'none'`;
+
+/**
+ * Whether an asset file may be read: a regular file by its real path (a FIFO
+ * or device would block the read) within `maxBytes`. "missing", "not-file" or
+ * "too-large" otherwise.
+ */
+export function htmlAssetFileState(path: string, maxBytes: number): "ok" | "missing" | "not-file" | "too-large" {
+  let stat;
+  try {
+    stat = statSync(path);
+  } catch {
+    return "missing";
+  }
+  if (!stat.isFile()) return "not-file";
+  return stat.size > maxBytes ? "too-large" : "ok";
+}
 
 /**
  * Where an HTML document's relative assets are served from. Normally the
@@ -31,6 +144,29 @@ export function htmlAssetContext(
   const basePath = relative(root, documentDirectory).split(sep).join("/");
   if (basePath.split("/").some((segment) => segment.startsWith("."))) return ownFolder;
   return { root, basePath, docDir: documentDirectory };
+}
+
+/** What an HTML page needs to render: images, media, styles, fonts, scripts and nested pages. */
+const RENDER_ASSET_RE = /\.(?:apng|avif|bmp|css|gif|ico|jpe?g|js|mjs|mp3|mp4|ogg|otf|png|svg|ttf|wav|webm|webp|woff2?|html?)$/i;
+
+/**
+ * The rule for an asset root outside the session's roots: an HTML document a
+ * tab on this machine opened from anywhere (#2291). Its folder may be a home
+ * folder, so it serves only render types, never a hidden path, the dotenv
+ * family or a data/config file (`.json`, `.xml`, `.webmanifest`).
+ */
+export function refusesOutsideRootHtmlAsset(relativePath: string): boolean {
+  return refusesHiddenHtmlAssetPath(relativePath) || !RENDER_ASSET_RE.test(relativePath);
+}
+
+/**
+ * Whether an asset response from a root outside the session's roots carries
+ * `Access-Control-Allow-Origin: *`: fonts only, which the browser loads in CORS
+ * mode. Everything else stays readable by the page (`<img>`, `<link>`,
+ * `<script>`) but not by its scripts (`fetch`).
+ */
+export function outsideRootAssetAllowsCors(relativePath: string): boolean {
+  return /\.(?:otf|ttf|woff2?)$/i.test(relativePath);
 }
 
 /**
@@ -70,7 +206,12 @@ export function htmlAssetPathRefused(
   return refuse(relative(realRoot, real).split(sep).join("/"));
 }
 
-export function inlineHtmlLocalAssets(html: string, htmlFilePath: string, folderPath?: string): string {
+export function inlineHtmlLocalAssets(
+  html: string,
+  htmlFilePath: string,
+  folderPath?: string,
+  refuseAssetPath?: (relativePath: string) => boolean,
+): string {
   if (/^https?:\/\//i.test(htmlFilePath)) return html;
 
   try {
@@ -85,6 +226,7 @@ export function inlineHtmlLocalAssets(html: string, htmlFilePath: string, folder
         const resolved = resolvePath(root, assetPath);
         if (!isWithinDirectory(resolved, root)) return null;
         if (docDir && !folderSessionAssetAllowed(root, docDir, assetPath)) return null;
+        if (refuseAssetPath && htmlAssetPathRefused(root, assetPath, refuseAssetPath)) return null;
         if (!existsSync(resolved)) return null;
 
         const stat = statSync(resolved);

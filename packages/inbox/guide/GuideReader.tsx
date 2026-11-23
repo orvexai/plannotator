@@ -8,18 +8,22 @@
  * comments (`commentOnly`: nothing else of the review app, which needs its
  * server); without, they are read-only, as on guides.show and the phone.
  *
- * Mounted only through GuidePane's dynamic import (`#guide-reader`,
- * tests/entry-assets.test.ts). The single-file build inlines it: its bytes
- * ship in inbox.html and its modules (the guide chain, the diff renderer) run
- * at page load; what waits for Open is the mount, the diff render and the
- * highlighter, as with every lazy runtime in Plannotator's single-file apps.
- * No new Tailwind classes here or in the chain. The comment cards, toolbar
+ * Mounted only through lazyParts.tsx's dynamic import (`#guide-reader`,
+ * tests/entry-assets.test.ts). It is its own chunk, packed in inbox.html and
+ * served by the Inbox (build/pack-inbox.ts, #2593): its modules (the guide
+ * chain, the diff renderer) load and run on the first Open, never at page load.
+ * The first section card carries the Split | Unified tab (DiffStyleSwitch,
+ * through the chain's `renderSectionTab`) unless the host draws the diff
+ * controls in its own bar (`hostDiffControls`: the guided review and the
+ * full-window review, approval "diff-controls-headers"); a phone draws every
+ * diff Unified and has no tab. The diffs follow every display setting the
+ * "Diff display" popover writes, the tab size included. No new Tailwind classes here or in the chain. The comment cards, toolbar
  * and suggestion blocks are styled by packages/review-editor/comments.css,
  * which apps/inbox/index.css imports (guides.show gets it through
  * review-editor's index.css; its pinned manifest follows the viewer build).
  */
 
-import { useCallback, useMemo, useRef, useState, type FC } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState, type FC, type ReactNode } from 'react';
 import type { CodeGuideData } from '@plannotator/core/guide';
 import type { GuideSnapshot } from '@plannotator/core/guide-format';
 import type {
@@ -29,19 +33,43 @@ import type {
   ConventionalLabel,
   TokenAnnotationMeta,
 } from '@plannotator/ui/types';
-import type { GuideReaderProps } from './types';
+import { ReviewWorkerPoolProvider } from '@plannotator/review-editor/worker-pool';
+import { useRefHoverCards } from '@plannotator/ui/components/RefHoverCard';
+import { openedLinesQuote } from '../attachments';
+import { wholeFileReader, type KeptWholeFiles } from './wholeFileReader';
+import { useSemDiffClient } from './useSemDiffClient';
+import type { GuideFileNote, GuideLineMark, GuideLineNote, GuideReaderProps, OnGuideLineMark } from './types';
 import type ReaderShape from './reader-module';
-import { GuideHostProvider, GuideView, type GuideDiffRendererContext, type GuideDiffRendererProps } from '@plannotator/guide-viewer';
+import { GuideHostProvider, GuideView, type GuideDiffRendererContext, type GuideDiffRendererProps, type GuideGlobalComments } from '@plannotator/guide-viewer';
+import { GuideCodeSpanContext } from '@plannotator/guide-viewer/renderInlineMarkdown';
+import { CommentPopover, restoreCommentDraft } from '@plannotator/ui/components/CommentPopover';
+import { CodeSpanContext } from '@plannotator/ui/components/LocalLinkContext';
 import { parseDiffToFiles } from '@plannotator/guide-viewer/diffParser';
 import { engineLabel } from '@plannotator/guide-viewer/GuideViewer';
 import { AllFilesCodeView, type AllFilesCodeViewProps } from '@plannotator/review-editor/components/AllFilesCodeView';
-import { extractLinesFromPatch } from '@plannotator/review-editor/utils/patchParser';
+import type { DiffSelectionActions } from '@plannotator/review-editor/components/SelectionChooser';
+import { extractLinesFromPatch, isLineRangeInPatch } from '@plannotator/review-editor/utils/patchParser';
 import { useConfigValue } from '@plannotator/ui/config';
+import { getIdentity } from '@plannotator/ui/utils/identity';
+import { DiffStyleSwitch } from '../components/DiffStyleSwitch';
+import { reviewSourceLine } from './sourceLine';
+import { withChapterMermaid, withOverviewMermaid } from './overviewMermaid';
+import { usePhone } from '../phone';
+import { useCommentPictures } from '../commentPictures';
+import { ReviewImagesContext } from '../reviewImages';
+import { ImageDiffPreview } from '@plannotator/review-editor/components/ImageDiffPreview';
+import { differencesSupported, ImageViewMenu } from '@plannotator/review-editor/components/image-diff/ImageViewMenu';
+import type { GuideReaderImages } from './types';
+import { RenderedFilesProvider, useRenderedFiles } from './renderedFiles';
+import type { ImageAttachment } from '@plannotator/ui/types';
 
 /** A line range the review app selects on (Pierre's). */
 type SelectedLineRange = NonNullable<AllFilesCodeViewProps['pendingSelection']>;
 
 const NO_ANNOTATIONS: never[] = [];
+const NO_LINE_NOTES: readonly GuideLineNote[] = [];
+const NO_LINE_MARKS: readonly GuideLineMark[] = [];
+const NO_FILE_NOTES: readonly GuideFileNote[] = [];
 const noop = () => {};
 
 /** One card's comment wiring: the review app's annotation props of `AllFilesCodeView`. */
@@ -71,6 +99,8 @@ export interface GuideDiffComments {
   ) => void;
   onSelectAnnotation: (id: string | null) => void;
   onDeleteAnnotation: (id: string) => void;
+  /** Choices before the comment box (Comment · Ask · Show me). Absent: the comment box opens at once. */
+  selectionActions?: DiffSelectionActions;
 }
 
 /**
@@ -78,8 +108,44 @@ export interface GuideDiffComments {
  * `compactTouchLayout` is the review app's own phone header (the surface passes it): the full path, its ellipsis at the leading edge
  * only when it does not fit, and 44 pt targets. `comments` turns on line comments; without it the diff is read-only.
  */
-export const GuideDiff: FC<GuideDiffRendererProps & { compactTouchLayout?: boolean; comments?: GuideDiffComments }> = ({ comments, ...props }) => {
-  const diffStyle = useConfigValue('diffStyle');
+export const GuideDiff: FC<
+  GuideDiffRendererProps & {
+    compactTouchLayout?: boolean;
+    /**
+     * Code review's image preview and its view menu for a changed image (`useImagePreviews`). Forwarded to
+     * AllFilesCodeView with the rest of `props`. Absent: the binary notice.
+     */
+    renderImagePreview?: AllFilesCodeViewProps['renderImagePreview'];
+    renderImageViewControl?: AllFilesCodeViewProps['renderImageViewControl'];
+    /** Code review's rendered Markdown files and SVG Image / Source (`useRenderedFiles`), forwarded likewise. Absent: the source diff. */
+    markdownPreview?: AllFilesCodeViewProps['markdownPreview'];
+    comments?: GuideDiffComments;
+    /** Draw this layout whatever the setting says, leaving the setting as it is (a phone: always Unified). */
+    diffStyleOverride?: 'split' | 'unified';
+    /** A walkthrough's code isn't a change: no "N unmodified lines" between its ranges. */
+    plainSeparators?: boolean;
+    /** The review's Viewed ticks (the header's Viewed control). Absent: none, as before. */
+    viewedFiles?: Set<string>;
+    onToggleViewed?: (filePath: string) => void;
+    /** Reads a file's whole text for the expand arrows. Absent: the diff shows as it came. */
+    fetchFileContent?: AllFilesCodeViewProps['fetchFileContent'];
+    semDiffClient?: AllFilesCodeViewProps['semDiffClient'];
+    fileOpenIn?: (filePath: string) => ReactNode;
+    /** What the host draws under this file's lines (the PR page's threads). Absent: none. */
+    lineNotes?: readonly GuideLineNote[];
+    /** This file's marks at the right edge of lines (the PR page's risk bars). Absent: none. */
+    lineMarks?: readonly GuideLineMark[];
+    /** Hears this file's marks. */
+    onLineMark?: OnGuideLineMark;
+    /** What the host draws about this whole file, under its header (the PR page's threads on the file). Absent: none. */
+    wholeFileNotes?: readonly GuideFileNote[];
+    /** Context notes on this file's lines (review-editor's seam). Absent: none, as before. */
+    contextNotes?: AllFilesCodeViewProps['contextNotes'];
+    renderContextNote?: AllFilesCodeViewProps['renderContextNote'];
+  }
+> = ({ comments, diffStyleOverride, plainSeparators, viewedFiles, onToggleViewed, fileOpenIn, lineNotes, lineMarks, onLineMark, wholeFileNotes, contextNotes, renderContextNote, ...props }) => {
+  const savedDiffStyle = useConfigValue('diffStyle');
+  const diffStyle = diffStyleOverride ?? savedDiffStyle;
   const diffOverflow = useConfigValue('diffOverflow');
   const diffIndicators = useConfigValue('diffIndicators');
   const lineDiffType = useConfigValue('diffLineDiffType');
@@ -93,6 +159,7 @@ export const GuideDiff: FC<GuideDiffRendererProps & { compactTouchLayout?: boole
       {...props}
       readOnly={!comments}
       commentOnly={!!comments}
+      fileOpenIn={fileOpenIn}
       contextExpansionAvailable={false}
       diffStyle={diffStyle}
       diffOverflow={diffOverflow}
@@ -101,9 +168,14 @@ export const GuideDiff: FC<GuideDiffRendererProps & { compactTouchLayout?: boole
       disableLineNumbers={!showLineNumbers}
       disableBackground={!showBackground}
       expandUnchanged={expandUnchanged}
+      hunkSeparators={plainSeparators ? 'simple' : 'line-info'}
       fontFamily={fontFamily || undefined}
       fontSize={fontSize || undefined}
       annotations={comments?.annotations ?? NO_ANNOTATIONS}
+      {...(lineNotes ? { hostLineNotes: lineNotes } : {})}
+      {...(lineMarks ? { hostLineMarks: lineMarks } : {})}
+      {...(onLineMark ? { onHostLineMark: onLineMark } : {})}
+      {...(wholeFileNotes ? { hostFileNotes: wholeFileNotes } : {})}
       selectedAnnotationId={comments?.selectedAnnotationId ?? null}
       scrollTargetAnnotation={comments?.scrollTargetAnnotation ?? null}
       pendingSelection={comments?.pendingSelection ?? null}
@@ -112,42 +184,217 @@ export const GuideDiff: FC<GuideDiffRendererProps & { compactTouchLayout?: boole
       onEditAnnotation={comments?.onEditAnnotation ?? noop}
       onSelectAnnotation={comments?.onSelectAnnotation ?? noop}
       onDeleteAnnotation={comments?.onDeleteAnnotation ?? noop}
+      {...(comments?.selectionActions ? { selectionActions: comments.selectionActions } : {})}
+      {...(onToggleViewed ? { viewedFiles, onToggleViewed } : {})}
+      {...(contextNotes && renderContextNote ? { contextNotes, renderContextNote } : {})}
     />
   );
 };
-
-/** The provenance line guides.show draws under the counts: repository, branch, the reviewed range. */
-function sourceLine(snapshot: GuideSnapshot): string {
-  return [snapshot.source.repo, snapshot.source.branch, snapshot.review.gitRef].filter(Boolean).join(' · ');
-}
 
 function newCommentId(): string {
   return `ann-guide-${typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`;
 }
 
-export default function GuideReader({ snapshot, reviewed, onReviewedChange, comments }: GuideReaderProps) {
+/**
+ * A review's "All files" (code review in the Inbox): every changed file in the patch's order, under one heading, so
+ * the same chain draws the same diffs and comments without the agent's chapters.
+ */
+function allFilesGuide(snapshot: GuideSnapshot, files: readonly { path: string; additions: number; deletions: number }[], threadHeading: boolean): CodeGuideData {
+  // A walkthrough's files are code as it is, not changes.
+  const asItIs = files.length > 0 && files.every((file) => file.additions === 0 && file.deletions === 0);
+  return {
+    title: snapshot.guide.title,
+    intent: '',
+    // Under a top bar whose switch says All files: no heading of its own (the pane's CSS draws one column, no card).
+    sections: [{ title: threadHeading ? '' : asItIs ? 'Every file' : 'Every changed file', overview: threadHeading ? '' : asItIs ? 'In the order they were sent.' : 'In the order of the diff.', diffs: files.map((file) => ({ file: file.path })) }],
+    unplacedFiles: [],
+    reviewed: [false],
+  };
+}
+
+interface ImagePreviewProps {
+  renderImagePreview?: AllFilesCodeViewProps['renderImagePreview'];
+  renderImageViewControl?: AllFilesCodeViewProps['renderImageViewControl'];
+}
+const NO_IMAGE_PREVIEWS: ImagePreviewProps = {};
+
+/**
+ * Code review's image preview on a changed image (review parity B2): the review app's own `ImageDiffPreview` in place
+ * of the binary notice and its `ImageViewMenu` (Side by side, Swipe, Onion skin, Differences) on the file's header,
+ * wired as its All files wires them (review-editor ReviewAllFilesDiffPanel.tsx). Only the reads differ: they go to the
+ * host's route (`images.fetchImpl`, packages/inbox/reviewImages.ts), under the host's snapshot id. Stable while
+ * `images` and the layout are, so the headers do not churn.
+ */
+function useImagePreviews(images: GuideReaderImages | undefined): ImagePreviewProps {
+  const compact = usePhone();
+  const snapshotId = images?.snapshotId;
+  const fetchImpl = images?.fetchImpl;
+  return useMemo<ImagePreviewProps>(() => {
+    if (!snapshotId || !fetchImpl) return NO_IMAGE_PREVIEWS;
+    return {
+      renderImagePreview: ({ file, fallback, tooLargeFallback, onHeightChange }) => (
+        <ImageDiffPreview
+          key={`${snapshotId}:${file.path}`}
+          filePath={file.path}
+          status={file.status}
+          patch={file.patch}
+          snapshotId={snapshotId}
+          variant="all-files"
+          compact={compact}
+          fallback={fallback}
+          tooLargeFallback={tooLargeFallback}
+          onHeightChange={onHeightChange}
+          fetchImpl={fetchImpl}
+        />
+      ),
+      renderImageViewControl: ({ file, iconOnly, touch }) => (
+        <ImageViewMenu
+          filePath={file.path}
+          comparable={file.status !== 'added' && file.status !== 'deleted'}
+          differencesAvailable={differencesSupported()}
+          iconOnly={iconOnly}
+          touch={touch}
+        />
+      ),
+    };
+  }, [snapshotId, fetchImpl, compact]);
+}
+
+/**
+ * Highlighting runs off the page's thread, or a long file freezes it. The pool's three workers start with the first
+ * reader on screen and end with the last, so a page with no diff does not hold them.
+ */
+export default function GuideReader(props: GuideReaderProps) {
+  return (
+    <ReviewWorkerPoolProvider>
+      <Reader {...props} />
+    </ReviewWorkerPoolProvider>
+  );
+}
+
+function Reader({
+  snapshot,
+  reviewed,
+  onReviewedChange,
+  chapterTicks = true,
+  comments,
+  mode = 'walkthrough',
+  reveal = null,
+  viewed,
+  fileOpenIn,
+  selectionActions,
+  renderOverviewDiagram,
+  renderChapterDiagram,
+  chapterDiagramsFolded = false,
+  renderOverviewFigure,
+  renderHeadActions,
+  highlight = null,
+  bare = false,
+  controlsHost = null,
+  fileContents,
+  threadHeading = false,
+  signComments = false,
+  hostDiffControls = false,
+  collapseAll,
+  lineNotes,
+  lineMarks,
+  onLineMark,
+  wholeFileNotes,
+  contextNotes,
+  renderContextNote,
+}: GuideReaderProps) {
+  const savedDiffStyle = useConfigValue('diffStyle');
   const files = useMemo(() => parseDiffToFiles(snapshot.review.rawPatch), [snapshot.review.rawPatch]);
-  const guide = useMemo<CodeGuideData>(
+  const wholeFiles = useRef<KeptWholeFiles>(new Map());
+  const fetchFileContent = useMemo<AllFilesCodeViewProps['fetchFileContent']>(() => (fileContents ? wholeFileReader(fileContents, wholeFiles.current) : undefined), [fileContents]);
+  const semDiffClient = useSemDiffClient();
+  // Code review's image previews, where the host's reader part names where its images are read (ReaderPart `images`).
+  const readerImages = useContext(ReviewImagesContext);
+  const imagePreviews = useImagePreviews(readerImages);
+  const walkthrough = useMemo<CodeGuideData>(
     () => ({
       title: snapshot.guide.title,
-      intent: snapshot.guide.intent,
+      // The thread's heading has one title: a guide with no intent keeps its name there (a narrow bar has no title).
+      intent: threadHeading ? snapshot.guide.intent || snapshot.guide.title : snapshot.guide.intent,
+      ...(snapshot.guide.overview && { overview: snapshot.guide.overview }),
       sections: snapshot.guide.sections,
       unplacedFiles: snapshot.guide.unplacedFiles,
       reviewed: [...snapshot.guide.reviewed],
     }),
-    [snapshot.guide],
+    [snapshot.guide, threadHeading],
   );
-  const ticks = useMemo(() => guide.sections.map((_, i) => reviewed[i] ?? snapshot.guide.reviewed[i] ?? false), [guide.sections, reviewed, snapshot.guide.reviewed]);
+  const everyFile = useMemo(() => allFilesGuide(snapshot, files, threadHeading), [snapshot, files, threadHeading]);
+  const guide = mode === 'files' ? everyFile : walkthrough;
+  const ticks = useMemo(
+    () => (mode === 'files' ? [false] : guide.sections.map((_, i) => reviewed[i] ?? snapshot.guide.reviewed[i] ?? false)),
+    [mode, guide.sections, reviewed, snapshot.guide.reviewed],
+  );
   const [focusedFile, setFocusedFile] = useState<string | null>(null);
-  const toggle = useCallback((index: number) => onReviewedChange(ticks.map((value, i) => (i === index ? !value : value))), [ticks, onReviewedChange]);
+  const toggle = useCallback(
+    (index: number) => {
+      // "All files" has one heading of its own, not a chapter: nothing to tick.
+      if (mode === 'files') return;
+      onReviewedChange(ticks.map((value, i) => (i === index ? !value : value)));
+    },
+    [mode, ticks, onReviewedChange],
+  );
 
-  // Line comments: the selection the toolbar opens on, as the review app keeps it (one, on the focused card).
+  // Line comments: the selection the toolbar opens on, as the review app keeps it (one), on the file it was made in:
+  // the next file taking focus has the same line numbers, but not these lines.
   const [pendingSelection, setPendingSelection] = useState<SelectedLineRange | null>(null);
+  const [selectionFile, setSelectionFile] = useState<string | null>(null);
+  const selectionSetters = useRef(new Map<string, (range: SelectedLineRange | null) => void>());
+  const selectionSetter = useCallback((path: string) => {
+    let set = selectionSetters.current.get(path);
+    if (!set) {
+      set = (range) => {
+        setSelectionFile(path);
+        setPendingSelection(range);
+      };
+      selectionSetters.current.set(path, set);
+    }
+    return set;
+  }, []);
+  // A host's highlight (a picture's part opened its code): those lines are painted on that file's card, which takes focus.
+  useEffect(() => {
+    if (!highlight) {
+      // The host took it back (a part landed where nothing may be painted).
+      setPendingSelection(null);
+      return;
+    }
+    setFocusedFile(highlight.path);
+    setSelectionFile(highlight.path);
+    setPendingSelection({ start: highlight.start, end: highlight.end, side: highlight.side === 'old' ? 'deletions' : 'additions' });
+  }, [highlight?.token]); // eslint-disable-line react-hooks/exhaustive-deps
   const commentsRef = useRef(comments);
   commentsRef.current = comments;
   const pendingRef = useRef(pendingSelection);
   pendingRef.current = pendingSelection;
-  const annotations = useMemo(() => (comments ? [...comments.annotations] : NO_ANNOTATIONS), [comments?.annotations]);
+  // The PR page and a review with Code review on sign a new comment with the person's name, as the review app does; a
+  // guide, or any review with Code review off, leaves it unsigned as on main.
+  const signs = bare || signComments;
+  const signed = useCallback((): { author?: string } => (signs ? { author: getIdentity() } : {}), [signs]);
+  const pictures = useCommentPictures();
+  // Line comments go to the diffs; global comments (on the whole review) to the guide's header.
+  const annotations = useMemo(() => (comments ? comments.annotations.filter((a) => a.scope !== 'general') : NO_ANNOTATIONS), [comments?.annotations]);
+  const globalAnnotations = useMemo(() => (comments ? comments.annotations.filter((a) => a.scope === 'general') : NO_ANNOTATIONS), [comments?.annotations]);
+  /** The global comment composer, open on the header's "Global comment" button. */
+  const [globalAnchor, setGlobalAnchor] = useState<HTMLElement | null>(null);
+  const globalDraftKey = comments ? `guide-global:${comments.draftScope}` : null;
+  const addGlobalComment = useCallback((text: string, images?: ImageAttachment[]) => {
+    const wiring = commentsRef.current;
+    const trimmed = text.trim();
+    setGlobalAnchor(null);
+    if (!wiring || (!trimmed && !images?.length)) return;
+    const draftKey = `guide-global:${wiring.draftScope}`;
+    // The review app's general comment: no file and no lines (its '' / 0 / 0 sentinels).
+    void wiring
+      .onSave({ id: newCommentId(), type: 'comment', scope: 'general', filePath: '', lineStart: 0, lineEnd: 0, side: 'new', text: trimmed, ...(images?.length ? { images } : {}), ...signed(), createdAt: Date.now() })
+      // Refused (too long, the thread resolved elsewhere, offline): the words wait in the composer for the next open.
+      .then((saved) => {
+        if (!saved) restoreCommentDraft(draftKey, text, images);
+      });
+  }, [signed]);
   const addComment = useCallback<GuideDiffComments['onAddAnnotationForFile']>(
     (filePath, type, text, suggestedCode, originalCode, conventionalLabel, decorations, tokenMeta) => {
       const range = pendingRef.current;
@@ -158,7 +405,11 @@ export default function GuideReader({ snapshot, reviewed, onReviewedChange, comm
       const side = range.side === 'additions' ? 'new' : 'old';
       const file = files.find((f) => f.path === filePath);
       // The lines as the person read them, quoted in the reply.
-      const selectedText = file ? extractLinesFromPatch(file.patch, lineStart, lineEnd, side) : '';
+      // On a line an expand arrow opened: no forge takes it inline, so a PR's review posts it in its main comment, the code quoted.
+      const outsideDiff = !!file && !isLineRangeInPatch(file.patch, lineStart, lineEnd, side);
+      const whole = wholeFiles.current.get(filePath);
+      const openedCode = outsideDiff && whole ? openedLinesQuote(whole.contents, side, lineStart, lineEnd) : '';
+      const selectedText = !outsideDiff && file ? extractLinesFromPatch(file.patch, lineStart, lineEnd, side) : '';
       wiring.onSave({
         id: newCommentId(),
         type,
@@ -172,13 +423,15 @@ export default function GuideReader({ snapshot, reviewed, onReviewedChange, comm
         originalCode,
         ...(tokenMeta && { charStart: tokenMeta.charStart, charEnd: tokenMeta.charEnd, tokenText: tokenMeta.tokenText }),
         ...(selectedText && { selectedText }),
+        ...(outsideDiff && { outsideDiff: true, ...(openedCode && { anchorText: openedCode }) }),
         createdAt: Date.now(),
+        ...signed(),
         conventionalLabel,
         decorations,
       });
       setPendingSelection(null);
     },
-    [files],
+    [files, signed],
   );
   const editComment = useCallback<GuideDiffComments['onEditAnnotation']>((id, text, suggestedCode, originalCode, conventionalLabel, decorations) => {
     const wiring = commentsRef.current;
@@ -199,53 +452,289 @@ export default function GuideReader({ snapshot, reviewed, onReviewedChange, comm
 
   // A comment chosen in the panel: its file's card comes into view first.
   const scrollTarget = comments?.scrollTarget ?? null;
-  const revealFile = useMemo(() => {
+  const commentFile = useMemo(() => {
     if (!scrollTarget) return null;
     const target = annotations.find((a) => a.id === scrollTarget.id);
     return target ? { path: target.filePath, token: scrollTarget.token } : null;
     // Only a new target moves the view, not an edit of the comments.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollTarget]);
+  // The review's rail moves the view too (`reveal`): whichever moved last wins, under one token count of its own.
+  // And a link in a rendered Markdown file to another file of the review (renderedFiles.tsx), as code review opens it.
+  const [linked, setLinked] = useState<{ path: string; token: number } | null>(null);
+  const openLinkedFile = useCallback((path: string) => setLinked((was) => ({ path, token: (was?.token ?? 0) + 1 })), []);
+  const moves = useRef({ count: 0, comment: commentFile, rail: reveal, link: linked, target: null as { path: string; token: number } | null });
+  const revealFile = useMemo(() => {
+    const seen = moves.current;
+    const railMoved = reveal !== seen.rail && reveal !== null;
+    const commentMoved = commentFile !== seen.comment && commentFile !== null;
+    const linkMoved = linked !== seen.link && linked !== null;
+    seen.rail = reveal;
+    seen.comment = commentFile;
+    seen.link = linked;
+    const next = railMoved ? reveal : commentMoved ? commentFile : linkMoved ? linked : null;
+    if (next) {
+      seen.count += 1;
+      seen.target = { path: next.path, token: seen.count };
+    }
+    return seen.target;
+  }, [commentFile, reveal, linked]);
+
+  // A phone draws one column, always, and offers no switch (two ~130 px columns read as nothing);
+  // the saved layout is left as it is. Elsewhere the first card carries the Split | Unified tab, unless the host's bar has it.
+  const phone = usePhone();
+  // The tab size the popover sets, as code review applies it (Pierre reads it off the page).
+  const tabSize = useConfigValue('diffTabSize');
+  useEffect(() => {
+    document.documentElement.style.setProperty('--diffs-tab-size', String(tabSize));
+  }, [tabSize]);
+  // AllFilesCodeView compares Viewed sets by identity: a new Set only when the ticks change.
+  const viewedFilesKey = viewed ? [...viewed.files].sort().join('\n') : null;
+  const viewedSet = useMemo(() => (viewed ? new Set(viewed.files) : undefined), [viewedFilesKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Nothing marked as changed (a walkthrough): Split would draw the same code twice.
+  const asItIs = files.length > 0 && files.every((file) => file.additions === 0 && file.deletions === 0);
+  // The pull request page's flat review, whose bar holds its actions, draws the tab as two marks.
+  const renderSectionTab = useCallback((index: number) => (index === 0 ? <DiffStyleSwitch icons={!!controlsHost} /> : null), [controlsHost]);
+
+  // Each file's card gets its own notes, the same array while they stay the same, so one thread read again draws one
+  // file again and no other.
+  const notesByFile = useMemo(() => {
+    const map = new Map<string, GuideLineNote[]>();
+    for (const note of lineNotes ?? []) {
+      const list = map.get(note.filePath);
+      if (list) list.push(note);
+      else map.set(note.filePath, [note]);
+    }
+    return map;
+  }, [lineNotes]);
+  const keptNotes = useRef(new Map<string, readonly GuideLineNote[]>());
+  const fileNotes = useCallback((path: string): readonly GuideLineNote[] => {
+    const next = notesByFile.get(path) ?? NO_LINE_NOTES;
+    const kept = keptNotes.current.get(path);
+    const same = kept && kept.length === next.length && kept.every((note, i) => note.id === next[i]!.id && note.key === next[i]!.key && note.line === next[i]!.line && note.side === next[i]!.side);
+    if (same) return kept;
+    keptNotes.current.set(path, next);
+    return next;
+  }, [notesByFile]);
+
+  // The same for marks at lines' right edges: each file's own, the same array while they stay the same (a new array
+  // is new CSS for the file's diff, drawn again).
+  const marksByFile = useMemo(() => {
+    const map = new Map<string, GuideLineMark[]>();
+    for (const mark of lineMarks ?? []) {
+      const list = map.get(mark.filePath);
+      if (list) list.push(mark);
+      else map.set(mark.filePath, [mark]);
+    }
+    return map;
+  }, [lineMarks]);
+  const keptMarks = useRef(new Map<string, readonly GuideLineMark[]>());
+  const fileMarks = useCallback((path: string): readonly GuideLineMark[] => {
+    const next = marksByFile.get(path) ?? NO_LINE_MARKS;
+    const kept = keptMarks.current.get(path);
+    const same = kept && kept.length === next.length && kept.every((mark, i) => mark.id === next[i]!.id && mark.side === next[i]!.side && mark.line === next[i]!.line && mark.label === next[i]!.label && mark.paint === next[i]!.paint && mark.popup === next[i]!.popup);
+    if (same) return kept;
+    keptMarks.current.set(path, next);
+    return next;
+  }, [marksByFile]);
+
+  // The same for notes on whole files: each file's own, the same array while they stay the same.
+  const wholeByFile = useMemo(() => {
+    const map = new Map<string, GuideFileNote[]>();
+    for (const note of wholeFileNotes ?? []) {
+      const list = map.get(note.filePath);
+      if (list) list.push(note);
+      else map.set(note.filePath, [note]);
+    }
+    return map;
+  }, [wholeFileNotes]);
+  const keptWhole = useRef(new Map<string, readonly GuideFileNote[]>());
+  const wholeNotesFor = useCallback((path: string): readonly GuideFileNote[] => {
+    const next = wholeByFile.get(path) ?? NO_FILE_NOTES;
+    const kept = keptWhole.current.get(path);
+    const same = kept && kept.length === next.length && kept.every((note, i) => note.id === next[i]!.id && note.key === next[i]!.key);
+    if (same) return kept;
+    keptWhole.current.set(path, next);
+    return next;
+  }, [wholeByFile]);
 
   const getDiffRendererProps = useCallback(
-    ({ file, focused }: GuideDiffRendererContext): { comments?: GuideDiffComments } =>
-      comments
+    ({ file }: GuideDiffRendererContext): {
+      comments?: GuideDiffComments;
+      diffStyleOverride?: 'unified';
+      plainSeparators?: boolean;
+      viewedFiles?: Set<string>;
+      onToggleViewed?: (filePath: string) => void;
+      fetchFileContent?: AllFilesCodeViewProps['fetchFileContent'];
+      semDiffClient?: AllFilesCodeViewProps['semDiffClient'];
+      fileOpenIn?: (filePath: string) => ReactNode;
+      flushFiles?: boolean;
+      headerKeepsFolder?: boolean;
+      lineNotes?: readonly GuideLineNote[];
+      lineMarks?: readonly GuideLineMark[];
+      onLineMark?: OnGuideLineMark;
+      wholeFileNotes?: readonly GuideFileNote[];
+      contextNotes?: AllFilesCodeViewProps['contextNotes'];
+      renderContextNote?: AllFilesCodeViewProps['renderContextNote'];
+    } => ({
+      ...(lineNotes ? { lineNotes: fileNotes(file.path) } : {}),
+      ...(lineMarks ? { lineMarks: fileMarks(file.path) } : {}),
+      ...(onLineMark ? { onLineMark } : {}),
+      ...(wholeFileNotes ? { wholeFileNotes: wholeNotesFor(file.path) } : {}),
+      // The PR page: files flush, and a narrow header (a phone's) keeps the folder, so two files of one name read apart.
+      ...(bare && { flushFiles: true, headerKeepsFolder: true }),
+      // A host's context notes: only a file that has one gets the seam (the others draw exactly as before).
+      ...(contextNotes && renderContextNote && contextNotes.some((note) => note.filePath === file.path) ? { contextNotes, renderContextNote } : {}),
+      ...((phone || asItIs) && { diffStyleOverride: 'unified' as const }),
+      ...(asItIs && { plainSeparators: true }),
+      ...(fetchFileContent && { fetchFileContent }),
+      ...(fetchFileContent && semDiffClient && !asItIs && { semDiffClient }),
+      ...(fileOpenIn ? { fileOpenIn } : {}),
+      ...(viewedSet && viewed ? { viewedFiles: viewedSet, onToggleViewed: viewed.onToggle } : {}),
+      ...(comments
         ? {
             comments: {
               annotations,
               selectedAnnotationId: comments.selectedId,
               scrollTargetAnnotation: scrollTarget && annotations.some((a) => a.id === scrollTarget.id && a.filePath === file.path) ? scrollTarget : null,
-              // Only the focused card is the selection target, as in the review app.
-              pendingSelection: focused ? pendingSelection : null,
-              onLineSelection: setPendingSelection,
+              pendingSelection: selectionFile === file.path ? pendingSelection : null,
+              onLineSelection: selectionSetter(file.path),
               onAddAnnotationForFile: addComment,
               onEditAnnotation: editComment,
               onSelectAnnotation: selectComment,
               onDeleteAnnotation: deleteComment,
+              ...(selectionActions ? { selectionActions: selectionActions as DiffSelectionActions } : {}),
             },
           }
-        : {},
-    [comments, annotations, scrollTarget, pendingSelection, addComment, editComment, selectComment, deleteComment],
+        : {}),
+    }),
+    [bare, contextNotes, renderContextNote, phone, asItIs, comments, annotations, scrollTarget, pendingSelection, selectionFile, selectionSetter, addComment, editComment, selectComment, deleteComment, viewedSet, viewed, selectionActions, fetchFileContent, semDiffClient, fileOpenIn, lineNotes, fileNotes, lineMarks, fileMarks, onLineMark, wholeFileNotes, wholeNotesFor],
+  );
+  // Global comments: the list under the header and its button, while the review takes comments (as line comments).
+  // One chosen in the list is shown where the pane lists comments (its folded sheet opens on it).
+  const showGlobalComment = useCallback((id: string) => {
+    const wiring = commentsRef.current;
+    if (wiring?.onShowGlobalComment) wiring.onShowGlobalComment(id);
+    else wiring?.onSelect(id);
+  }, []);
+  const globalComments = useMemo<GuideGlobalComments | undefined>(
+    () =>
+      comments
+        ? {
+            comments: globalAnnotations.map((a) => ({ id: a.id, text: a.text ?? '' })),
+            onAdd: setGlobalAnchor,
+            onSelect: showGlobalComment,
+            selectedId: comments.selectedId,
+          }
+        : undefined,
+    [comments, globalAnnotations, showGlobalComment],
+  );
+  // A global comment chosen in the panel: its place in the guide's list comes into view.
+  useEffect(() => {
+    if (!scrollTarget || !globalAnnotations.some((a) => a.id === scrollTarget.id)) return;
+    const item = Array.from(document.querySelectorAll<HTMLElement>('[data-guide-global-comment]')).find((el) => el.dataset.guideGlobalComment === scrollTarget.id);
+    item?.scrollIntoView?.({ block: 'nearest' });
+    // Only a new target moves the view.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollTarget]);
+  // Every guide the Inbox opens draws its Mermaid overview diagram, whatever the host draws itself.
+  const drawOverviewDiagram = useMemo(() => withOverviewMermaid(renderOverviewDiagram), [renderOverviewDiagram]);
+  // And each chapter's diagram (format version 5), at the top of the chapter's code pane.
+  const drawChapterDiagram = useMemo(() => withChapterMermaid(renderChapterDiagram), [renderChapterDiagram]);
+  // Code review's rendered files (renderedFiles.tsx): a changed Markdown file's Source / Changes / Read, read through the
+  // host's whole-file reader, and a changed SVG's Image / Source where the host names its images. Never on a walkthrough
+  // of code as it is.
+  const { markdownPreview, rendered } = useRenderedFiles({
+    files,
+    read: fetchFileContent,
+    images: readerImages,
+    enabled: !asItIs,
+    compact: phone,
+    openFile: openLinkedFile,
+  });
+  // Each file's renderer props, with the image previews and rendered files where the host has them.
+  const rendererProps = useCallback(
+    (context: GuideDiffRendererContext) => ({ ...getDiffRendererProps(context), ...imagePreviews, ...(markdownPreview ? { markdownPreview } : {}) }),
+    [getDiffRendererProps, imagePreviews, markdownPreview],
   );
   const host = useMemo(
-    () => ({ files, DiffRenderer: GuideDiff, getDiffRendererProps, ...(revealFile ? { revealFile } : {}) }),
-    [files, getDiffRendererProps, revealFile],
+    () => ({
+      files,
+      DiffRenderer: GuideDiff,
+      getDiffRendererProps: rendererProps,
+      ...(revealFile ? { revealFile } : {}),
+      ...(phone || asItIs || hostDiffControls ? {} : { renderSectionTab }),
+      // A walkthrough's chapter can be words alone: nothing is missing, so it says that and not "out of date".
+      ...(asItIs && { renderSectionEmpty: () => <p className="ib-rv-nocode" data-section-no-code="">No code in this chapter.</p> }),
+      renderOverviewDiagram: drawOverviewDiagram,
+      renderChapterDiagram: drawChapterDiagram,
+      ...(chapterDiagramsFolded ? { chapterDiagramsFolded: true } : {}),
+      ...(renderOverviewFigure ? { renderOverviewFigure } : {}),
+      ...(renderHeadActions ? { renderHeadActions } : {}),
+      ...(globalComments ? { globalComments } : {}),
+      // What GuideDiff draws (a phone: always Unified), for a file box's first estimate.
+      diffStyle: phone || asItIs ? ('unified' as const) : savedDiffStyle,
+      // The PR page's flush files draw no row after the last hunk until a file's text is read (flushFiles).
+      opensWholeFiles: !!fetchFileContent && !bare,
+      // The PR page: files edge to edge, each box exactly its header and code.
+      ...(bare ? { flushFiles: true, keepsFileOrder: true } : {}),
+      ...(collapseAll ? { collapseAll } : {}),
+    }),
+    [files, asItIs, rendererProps, revealFile, phone, hostDiffControls, renderSectionTab, drawOverviewDiagram, drawChapterDiagram, chapterDiagramsFolded, renderOverviewFigure, renderHeadActions, globalComments, savedDiffStyle, fetchFileContent, collapseAll, bare],
   );
+
+  // The window's wrap for a code span, for the viewer's own inline parser.
+  const codeSpan = useContext(CodeSpanContext);
+  // Hover cards for the links in the guide's prose (issue, PR, MR and Linear issue links), as a message body has
+  // them, over the window's own transport. The region is the guide's own root: a wrapper element would come between
+  // `.ib-gbody` and that root, and the PR page's `.ib-gbody > .w-full` rules would stop matching.
+  const proseRef = useRef<HTMLDivElement>(null);
+  const refCard = useRefHoverCards(proseRef);
 
   return (
     <GuideHostProvider value={host}>
+      <RenderedFilesProvider value={rendered}>
+      <GuideCodeSpanContext.Provider value={codeSpan}>
       <GuideView
         guide={guide}
         reviewed={ticks}
         onToggleReviewed={toggle}
-        engineLabel={engineLabel(snapshot.generator?.engine, snapshot.generator?.model)}
+        showReviewed={chapterTicks}
+        // All files under the thread's heading: the repository, branch and range alone (no agent's chapters to credit).
+        engineLabel={threadHeading && mode === 'files' ? undefined : engineLabel(snapshot.generator?.engine, snapshot.generator?.model)}
         focusedFile={focusedFile}
         onFocusFile={setFocusedFile}
-        sourceLine={sourceLine(snapshot)}
+        sourceLine={reviewSourceLine(snapshot)}
+        bare={bare}
+        actionsHost={controlsHost}
+        threadHeading={threadHeading}
+        // Every file's box as tall as its diff, in the readers built on this one (a thread's guided review, the review, the PR page).
+        fitFileHeights
+        rootRef={proseRef}
       />
+      {refCard}
+      </GuideCodeSpanContext.Provider>
+      </RenderedFilesProvider>
+      {globalAnchor && globalDraftKey && (
+        <CommentPopover
+          anchorEl={globalAnchor}
+          contextText=""
+          isGlobal
+          allowImages={pictures}
+          // The words typed survive a close (Escape, a click outside) and a refused save, one draft per message.
+          draftKey={globalDraftKey}
+          onSubmit={addGlobalComment}
+          onClose={() => setGlobalAnchor(null)}
+        />
+      )}
     </GuideHostProvider>
   );
 }
 
 // Held to the shape the window's strict typecheck reads (reader-module.d.ts).
 GuideReader satisfies typeof ReaderShape;
+
+// The PR page's rail rides this chunk: the review app's trees and file view (PullRepoParts.tsx, PullChangesTree.tsx).
+export { PullAllFiles, PullRepoFile } from './PullRepoParts';
+export { PullChangesTree } from './PullChangesTree';
+export { ReviewKeys } from './ReviewKeys';

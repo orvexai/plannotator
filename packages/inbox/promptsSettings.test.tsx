@@ -1,0 +1,428 @@
+/**
+ * Settings → Prompts (components/PromptsSettings.tsx; design of record
+ * `.product/approved/inbox-prompts-page/`, #2194): the reminder in effect
+ * shown in full and marked Default, Edit and Save writing
+ * `prompts.inbox.reminder`, Reset to default and Use shared deleting their
+ * key (null), an agent's own text, the "Reminder off in Agents" note, the
+ * cap (the count from 8,000, Save refused past 9,000), and the twelve
+ * read-only prompts folded into one row. Requests go to a recording fetch
+ * that answers like the server.
+ *
+ * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from tests/dom-test-list.txt.
+ */
+import { afterEach, expect, test } from 'bun:test';
+import { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import type { InboxPromptHost, InboxPromptsSettings } from '@plannotator/core/inbox-types';
+import { tooltipOf } from './testing/tooltip';
+
+const hasDom = typeof document !== 'undefined';
+const { PromptsSection, promptsSummary } = (hasDom ? await import('./components/PromptsSettings') : {}) as typeof import('./components/PromptsSettings');
+
+/** The built-in line as the Inbox serves it (a fixture: the settings page shows whatever it is given). */
+const WAKE = 'Plannotator Inbox is on: … Their reply comes back here.';
+
+let root: Root | null = null;
+let host: HTMLElement | null = null;
+const realFetch = globalThis.fetch;
+afterEach(() => {
+  act(() => root?.unmount());
+  host?.remove();
+  root = null;
+  host = null;
+  globalThis.fetch = realFetch;
+});
+
+function model(over: Partial<InboxPromptsSettings['reminder']> = {}): InboxPromptsSettings {
+  return {
+    reminder: {
+      shared: null,
+      runtimes: { 'claude-code': null, pi: null, opencode: null },
+      defaults: { wake: WAKE, no_wake: 'no wake' },
+      max: 9000,
+      on: { 'claude-code': true, pi: true, opencode: false },
+      ...over,
+    },
+    others: [
+      { key: 'prompts.plan.approved', group: 'plan', group_label: 'Plan', label: 'Approved', default: 'Plan approved.', text: 'Plan approved.', custom: false, runtimes: [], note: 'OpenCode has a shorter default.' },
+      { key: 'prompts.review.denied', group: 'review', group_label: 'Code review', label: 'Changes requested', default: 'Verify.', text: 'Check each finding.', custom: true, runtimes: [], note: 'Added after your feedback.' },
+    ],
+  };
+}
+
+/** A fetch that applies `{ prompts: { inbox } }` to the model like the server, and records what was sent. */
+function server(start: InboxPromptsSettings) {
+  const state = structuredClone(start);
+  const sent: unknown[] = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    sent.push(body.prompts);
+    const inbox = body.prompts.inbox ?? {};
+    const clean = (value: string | null) => (value === null || value.trim() === '' ? null : value);
+    if ('guide' in body.prompts) state.guide = { text: clean(body.prompts.guide), max: 12000 };
+    if ('reminder' in inbox) state.reminder.shared = clean(inbox.reminder);
+    if ('rules' in inbox && state.rules) state.rules.shared = clean(inbox.rules);
+    for (const [agent, entry] of Object.entries(inbox.runtimes ?? {}) as [InboxPromptHost, { reminder?: string | null; rules?: string | null }][]) {
+      if ('reminder' in entry) state.reminder.runtimes[agent] = clean(entry.reminder ?? null);
+      if ('rules' in entry && state.rules) state.rules.runtimes[agent] = clean(entry.rules ?? null);
+    }
+    return new Response(JSON.stringify({ prompts: structuredClone(state) }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+  return sent;
+}
+
+function mount(start: InboxPromptsSettings, open = true) {
+  host = document.createElement('div');
+  host.className = 'pn-inbox';
+  document.body.appendChild(host);
+  let current = start;
+  const render = () =>
+    root!.render(
+      <PromptsSection
+        prompts={current}
+        configFile="/Users/ann/.plannotator/config.json"
+        home="/Users/ann"
+        onPrompts={(next) => {
+          current = next;
+          render();
+        }}
+      />,
+    );
+  act(() => {
+    root = createRoot(host!);
+    render();
+  });
+  const fold = q<HTMLButtonElement>(host!, '[data-prompts-reminder-fold]');
+  if (open && fold?.getAttribute('aria-expanded') === 'false') act(() => fold.click());
+  return host;
+}
+
+const q = <T extends Element = HTMLElement>(el: Element, selector: string) => el.querySelector<T & Element>(selector) as T | null;
+const type = (box: HTMLTextAreaElement, words: string) =>
+  act(() => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(box, words);
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+const click = async (button: Element | null) => {
+  await act(async () => {
+    (button as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+};
+
+test.skipIf(!hasDom)('by default: the text in effect in full, marked Default; every agent uses it; one note where the reminder is off', () => {
+  const el = mount(model());
+  expect(q(el, '[data-prompt-slot="shared"] .ib-chip')?.textContent).toBe('Default');
+  expect(q(el, '[data-prompt-text="shared"]')?.textContent).toBe(WAKE);
+  expect(q(el, '[data-prompt-reset]')).toBeNull();
+  expect(q(el, '[data-prompt-show-default]')).toBeNull();
+  expect([...el.querySelectorAll('[data-prompt-status]')].map((s) => s.textContent)).toEqual([
+    'Uses the shared text',
+    'Uses the shared text',
+    'Uses the shared text · Reminder off in Agents',
+  ]);
+  expect(q<HTMLAnchorElement>(el, '[data-prompt-agents-link]')?.getAttribute('href')).toBe('#settings/agents');
+  // No native titles: tooltips are components.
+  expect(el.querySelectorAll('[title]')).toHaveLength(0);
+  expect(promptsSummary(model())).toBe('Default');
+});
+
+test.skipIf(!hasDom)('Edit, Save: the shared text becomes Custom; Show default opens the default; Reset to default deletes the key', async () => {
+  const sent = server(model());
+  const el = mount(model());
+  await click(q(el, '[data-prompt-edit="shared"]'));
+  const box = q<HTMLTextAreaElement>(el, '[data-prompt-field="shared"]')!;
+  expect(box.value).toBe(WAKE);
+  expect(document.activeElement).toBe(box);
+  // Unchanged: nothing to save.
+  expect(q<HTMLButtonElement>(el, '[data-prompt-save="shared"]')!.disabled).toBe(true);
+  type(box, 'Send only when no upstream session can decide.');
+  await click(q(el, '[data-prompt-save="shared"]'));
+  expect(sent).toEqual([{ inbox: { reminder: 'Send only when no upstream session can decide.' } }]);
+  expect(q(el, '[data-prompt-field="shared"]')).toBeNull();
+  expect(q(el, '[data-prompt-slot="shared"] .ib-chip')?.textContent).toBe('Custom');
+  expect(q(el, '[data-prompt-text="shared"]')?.textContent).toBe('Send only when no upstream session can decide.');
+  expect(document.activeElement).toBe(q(el, '[data-prompt-edit="shared"]'));
+
+  const disclosure = q<HTMLButtonElement>(el, '[data-prompt-show-default]')!;
+  expect(disclosure.getAttribute('aria-expanded')).toBe('false');
+  await click(disclosure);
+  expect(q(el, '[data-prompt-default]')?.textContent).toBe(WAKE);
+  expect(disclosure.getAttribute('aria-expanded')).toBe('true');
+
+  await click(q(el, '[data-prompt-reset]'));
+  expect(sent.at(-1)).toEqual({ inbox: { reminder: null } });
+  expect(q(el, '[data-prompt-slot="shared"] .ib-chip')?.textContent).toBe('Default');
+  expect(q(el, '[data-prompt-default]')).toBeNull();
+});
+
+test.skipIf(!hasDom)('Cancel keeps what was saved; saving the default text back deletes the key', async () => {
+  const sent = server(model({ shared: 'Mine.' }));
+  const el = mount(model({ shared: 'Mine.' }));
+  await click(q(el, '[data-prompt-edit="shared"]'));
+  type(q<HTMLTextAreaElement>(el, '[data-prompt-field="shared"]')!, 'Something else');
+  await click(q(el, '[data-prompt-cancel="shared"]'));
+  expect(sent).toEqual([]);
+  expect(q(el, '[data-prompt-text="shared"]')?.textContent).toBe('Mine.');
+  await click(q(el, '[data-prompt-edit="shared"]'));
+  type(q<HTMLTextAreaElement>(el, '[data-prompt-field="shared"]')!, WAKE);
+  await click(q(el, '[data-prompt-save="shared"]'));
+  expect(sent).toEqual([{ inbox: { reminder: null } }]);
+});
+
+test.skipIf(!hasDom)("an agent's own text: Edit starts from the shared text, Save writes the agent's key; Use shared deletes it", async () => {
+  const start = model({ shared: 'Shared.' });
+  const sent = server(start);
+  const el = mount(start);
+  const pi = q(el, '[data-agent="pi"]')!;
+  await click(q(pi, '[data-prompt-edit="pi"]'));
+  const box = q<HTMLTextAreaElement>(el, '[data-prompt-field="pi"]')!;
+  expect(box.value).toBe('Shared.');
+  expect(box.getAttribute('aria-label')).toBe('Inbox reminder for Pi');
+  // The shared text as Pi's own is still a change: Save is offered.
+  expect(q<HTMLButtonElement>(el, '[data-prompt-save="pi"]')!.disabled).toBe(false);
+  type(box, 'Pi: report upstream first.');
+  await click(q(el, '[data-prompt-save="pi"]'));
+  expect(sent).toEqual([{ inbox: { runtimes: { pi: { reminder: 'Pi: report upstream first.' } } } }]);
+  expect(q(pi, '[data-prompt-status="pi"]')?.textContent).toBe('Own text');
+  expect(q(pi, '[data-prompt-text="pi"]')?.textContent).toBe('Pi: report upstream first.');
+  expect(promptsSummary(model({ runtimes: { 'claude-code': null, pi: 'x', opencode: null } }))).toBe('Custom');
+
+  await click(q(pi, '[data-prompt-use-shared="pi"]'));
+  expect(sent.at(-1)).toEqual({ inbox: { runtimes: { pi: { reminder: null } } } });
+  expect(q(pi, '[data-prompt-status="pi"]')?.textContent).toBe('Uses the shared text');
+  expect(q(pi, '[data-prompt-text="pi"]')).toBeNull();
+});
+
+test.skipIf(!hasDom)('the cap: no count under 8,000; the count from there; past 9,000 Save is refused and the count says so', async () => {
+  server(model());
+  const el = mount(model());
+  await click(q(el, '[data-prompt-edit="shared"]'));
+  const box = q<HTMLTextAreaElement>(el, '[data-prompt-field="shared"]')!;
+  type(box, 'a'.repeat(7999));
+  expect(q(el, '[data-prompt-count]')).toBeNull();
+  type(box, 'a'.repeat(8000));
+  expect(q(el, '[data-prompt-count]')?.textContent).toBe('8,000 / 9,000');
+  expect(box.getAttribute('aria-describedby')).toBe(q(el, '[data-prompt-count]')!.id);
+  type(box, 'a'.repeat(9000));
+  expect(q<HTMLButtonElement>(el, '[data-prompt-save="shared"]')!.disabled).toBe(false);
+  type(box, 'a'.repeat(9001));
+  expect(q(el, '[data-prompt-count]')?.hasAttribute('data-over')).toBe(true);
+  expect(q<HTMLButtonElement>(el, '[data-prompt-save="shared"]')!.disabled).toBe(true);
+  expect(box.getAttribute('aria-invalid')).toBe('true');
+  // Blank is not text: nothing to save.
+  type(box, '   ');
+  expect(q<HTMLButtonElement>(el, '[data-prompt-save="shared"]')!.disabled).toBe(true);
+});
+
+test.skipIf(!hasDom)('a refused save keeps the field and says why', async () => {
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: 'prompts.inbox.reminder: at most 9,000 characters.', code: 'validation_error' }), {
+      status: 422,
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch;
+  const el = mount(model());
+  await click(q(el, '[data-prompt-edit="shared"]'));
+  type(q<HTMLTextAreaElement>(el, '[data-prompt-field="shared"]')!, 'Mine.');
+  await click(q(el, '[data-prompt-save="shared"]'));
+  expect(q(el, '[data-prompt-field="shared"]')).not.toBeNull();
+  expect(q(el, '[data-prompt-error="shared"]')?.textContent).toContain('at most 9,000 characters');
+});
+
+test.skipIf(!hasDom)('the plan, review and annotate prompts: one folded row, opened read-only with key, mark and note', async () => {
+  const el = mount(model());
+  const fold = q<HTMLButtonElement>(el, '[data-prompts-fold]')!;
+  expect(fold.textContent).toBe('2 prompts· 1 custom');
+  expect(fold.getAttribute('aria-expanded')).toBe('false');
+  expect(q(el, '[data-prompts-list]')).toBeNull();
+  await click(fold);
+  const approved = q(el, '[data-prompt-key="prompts.plan.approved"]')!;
+  expect([approved.querySelector('b')?.textContent, approved.querySelector('.ib-chip')?.textContent, approved.querySelector('code')?.textContent]).toEqual(['Approved', 'Default', 'prompts.plan.approved']);
+  expect(approved.querySelector('.pm-onote')?.textContent).toBe('OpenCode has a shorter default.');
+  const denied = q(el, '[data-prompt-key="prompts.review.denied"]')!;
+  expect([denied.querySelector('.ib-chip')?.textContent, denied.querySelector('pre')?.textContent, denied.querySelector('.pm-onote')]).toEqual(['Custom', 'Check each finding.', null]);
+  expect(el.querySelectorAll('[data-prompts-list] textarea, [data-prompts-list] button')).toHaveLength(0);
+});
+
+test.skipIf(!hasDom)('text over the limit in config.json: the default stays marked, a calm line says it is ignored, and Reset to default / Use shared delete it', async () => {
+  const start = model({
+    over: { shared: 9200, runtimes: { 'claude-code': null, pi: 10000, opencode: null } },
+  });
+  const sent = server(start);
+  const el = mount(start);
+  expect(q(el, '[data-prompt-slot="shared"] .ib-chip')?.textContent).toBe('Default');
+  expect(q(el, '[data-prompt-text="shared"]')?.textContent).toBe(WAKE);
+  expect(q(el, '[data-prompt-over="shared"]')?.textContent).toBe('The text in config.json is 9,200 characters, over the 9,000 limit, so it is ignored.');
+  expect(q(el, '[data-prompt-over="pi"]')?.textContent).toBe('The text in config.json is 10,000 characters, over the 9,000 limit, so it is ignored.');
+  expect(q(el, '[data-prompt-status="pi"]')?.textContent).toBe('Uses the shared text');
+  // Calm: not an alert, not the error line.
+  expect(el.querySelectorAll('[role="alert"]')).toHaveLength(0);
+  await click(q(el, '[data-prompt-reset]'));
+  expect(sent.at(-1)).toEqual({ inbox: { reminder: null } });
+  await click(q(el, '[data-prompt-use-shared="pi"]'));
+  expect(sent.at(-1)).toEqual({ inbox: { runtimes: { pi: { reminder: null } } } });
+});
+
+test.skipIf(!hasDom)("OpenCode 1: its row shows the default it really gets (the no-wake line), and Edit starts from it; a shared text replaces it", async () => {
+  const NO_WAKE = 'Plannotator Inbox is on: … Read the thread later with read_thread.';
+  const start: InboxPromptsSettings = {
+    ...model({ wakes: { 'claude-code': true, pi: true, opencode: false } }),
+  };
+  start.reminder.defaults.no_wake = NO_WAKE;
+  server(start);
+  const el = mount(start);
+  const opencode = q(el, '[data-agent="opencode"]')!;
+  expect(q(opencode, '[data-prompt-status="opencode"]')?.textContent).toBe('Uses the default for OpenCode 1 · Reminder off in Agents');
+  expect(q(opencode, '[data-prompt-text="opencode"]')?.textContent).toBe(NO_WAKE);
+  expect(q(el, '[data-prompt-text="pi"]')).toBeNull();
+  await click(q(opencode, '[data-prompt-edit="opencode"]'));
+  expect(q<HTMLTextAreaElement>(el, '[data-prompt-field="opencode"]')!.value).toBe(NO_WAKE);
+  await click(q(el, '[data-prompt-cancel="opencode"]'));
+  act(() => root!.unmount());
+  const shared = model({ shared: 'Shared.', wakes: { 'claude-code': true, pi: true, opencode: false } });
+  act(() => {
+    root = createRoot(host!);
+    root.render(<PromptsSection prompts={shared} />);
+  });
+  act(() => q<HTMLButtonElement>(host!, '[data-prompts-reminder-fold]')!.click());
+  expect(q(host!, '[data-prompt-status="opencode"]')?.textContent).toBe('Uses the shared text · Reminder off in Agents');
+  expect(q(host!, '[data-prompt-text="opencode"]')).toBeNull();
+});
+
+test.skipIf(!hasDom)('config.json is named with the home folder as ~, the full path in the component tooltip; outside home, in full with none', async () => {
+  const el = mount(model());
+  const path = q(el, '[data-prompts-config-path]')!;
+  expect(path.textContent).toBe('~/.plannotator/config.json');
+  expect(path.hasAttribute('title')).toBe(false);
+  expect(await tooltipOf(path)).toBe('/Users/ann/.plannotator/config.json');
+  act(() => root!.unmount());
+  act(() => {
+    root = createRoot(host!);
+    root.render(<PromptsSection prompts={model()} configFile="/srv/plannotator/config.json" home="/Users/ann" />);
+  });
+  const outside = q(host!, '[data-prompts-config-path]')!;
+  expect(outside.textContent).toBe('/srv/plannotator/config.json');
+  expect(await tooltipOf(outside)).toBeNull();
+});
+
+test.skipIf(!hasDom)('Guided reviews: Default with only Edit; Save writes `guide` and shows it as Custom; Reset to default deletes it', async () => {
+  const start: InboxPromptsSettings = { ...model(), guide: { text: null, max: 12000 } };
+  const sent = server(start);
+  const el = mount(start);
+  const row = q(el, '[data-prompt-slot="guide"]')!;
+  expect(q(row, '.ib-chip')?.textContent).toBe('Default');
+  expect(q(row, '[data-prompt-text="guide"], [data-prompt-reset]')).toBeNull();
+  await click(q(row, '[data-prompt-edit="guide"]'));
+  const box = q<HTMLTextAreaElement>(el, '[data-prompt-field="guide"]')!;
+  expect(box.value).toBe('');
+  expect(document.activeElement).toBe(box);
+  type(box, 'Start with the riskiest change.');
+  await click(q(el, '[data-prompt-save="guide"]'));
+  expect(sent).toEqual([{ guide: 'Start with the riskiest change.' }]);
+  expect(q(row, '.ib-chip')?.textContent).toBe('Custom');
+  expect(q(row, '[data-prompt-text="guide"]')?.textContent).toBe('Start with the riskiest change.');
+  // The reminder is untouched: the phone's list still reads Custom for the page.
+  expect(q(el, '[data-prompt-slot="shared"] .ib-chip')?.textContent).toBe('Default');
+  expect(promptsSummary({ ...model(), guide: { text: 'x', max: 12000 } })).toBe('Custom');
+  // Past the cap Save is refused.
+  await click(q(row, '[data-prompt-edit="guide"]'));
+  type(q<HTMLTextAreaElement>(el, '[data-prompt-field="guide"]')!, 'a'.repeat(12001));
+  expect(q<HTMLButtonElement>(el, '[data-prompt-save="guide"]')!.disabled).toBe(true);
+  expect(q(el, '[data-prompt-count]')?.textContent).toBe('12,001 / 12,000');
+  await click(q(el, '[data-prompt-cancel="guide"]'));
+  await click(q(row, '[data-prompt-reset="guide"]'));
+  expect(sent.at(-1)).toEqual({ guide: null });
+  expect(q(row, '.ib-chip')?.textContent).toBe('Default');
+});
+
+function withRules(rules: Partial<NonNullable<InboxPromptsSettings['rules']>> = {}): InboxPromptsSettings {
+  return {
+    ...model(),
+    rules: {
+      shared: null,
+      runtimes: { 'claude-code': null, pi: null, opencode: null },
+      room: { shared: 8000, runtimes: { 'claude-code': 8000, pi: 8000, opencode: 8000 } },
+      dropped: [],
+      ...rules,
+    },
+  };
+}
+
+test.skipIf(!hasDom)('Rules for your agents: on top, the reminder folded under it; the box starts empty, Save writes the rules for all agents, Back to default deletes them', async () => {
+  const sent = server(withRules());
+  const el = mount(withRules(), false);
+  expect(q(el, '[data-rules-section] + section [data-prompts-reminder-fold]')).not.toBeNull();
+  expect(q(el, '[data-prompts-reminder]')).toBeNull();
+  await click(q(el, '[data-rules-add]'));
+  expect(q<HTMLTextAreaElement>(document.body, '[data-rules-field]')!.value).toBe('');
+  type(q<HTMLTextAreaElement>(document.body, '[data-rules-field]')!, 'Only message me when you are blocked or done.');
+  await click(q(document.body, '[data-rules-save]'));
+  expect(sent.at(-1)).toEqual({ inbox: { rules: 'Only message me when you are blocked or done.' } });
+  expect(q(el, '[data-rules-text="shared"]')?.textContent).toBe('Only message me when you are blocked or done.');
+  await click(q(el, '[data-rules-edit="shared"]'));
+  await click(q(document.body, '[data-rules-reset]'));
+  expect(sent.at(-1)).toEqual({ inbox: { rules: null } });
+  expect(q(el, '[data-rules-add]')).not.toBeNull();
+});
+
+test.skipIf(!hasDom)("Rules for one agent: For picks the agent's own box; Save writes only its key", async () => {
+  const sent = server(withRules({ shared: 'Keep messages short.' }));
+  const el = mount(withRules({ shared: 'Keep messages short.' }), false);
+  await click(q(el, '[data-rules-edit="shared"]'));
+  await click(q(document.body, '[data-rules-for="pi"]'));
+  expect(q<HTMLTextAreaElement>(document.body, '[data-rules-field]')!.value).toBe('');
+  type(q<HTMLTextAreaElement>(document.body, '[data-rules-field]')!, 'Never send from reviewer sessions.');
+  await click(q(document.body, '[data-rules-save]'));
+  expect(sent.at(-1)).toEqual({ inbox: { runtimes: { pi: { rules: 'Never send from reviewer sessions.' } } } });
+  expect(q(el, '[data-rules-text="pi"]')?.textContent).toBe('Never send from reviewer sessions.');
+  expect(q(el, '[data-rules-text="shared"]')?.textContent).toBe('Keep messages short.');
+});
+
+/** The rooms as the server computes them (packages/server/inbox-mcp-instructions.ts): a fixture, the page shows whatever it is given. */
+const ROOMS = { claude_code_old: 397, claude_code: 1913, other: 8827 };
+const mcp = (over: Partial<NonNullable<NonNullable<InboxPromptsSettings['rules']>['mcp']>> = {}) => ({ room: ROOMS.claude_code, rooms: ROOMS, dropped: [], reminder_dropped: [], ...over });
+
+test.skipIf(!hasDom)("agents connected through MCP: the rules for all agents show current Claude Code's room near it, and Save is never refused for it", async () => {
+  const start = withRules({ mcp: mcp() });
+  server(start);
+  const el = mount(start, false);
+  await click(q(el, '[data-rules-add]'));
+  const field = q<HTMLTextAreaElement>(document.body, '[data-rules-field]')!;
+  type(field, 'a'.repeat(1000));
+  expect(q(document.body, '[data-rules-count="mcp"]')).toBeNull();
+  type(field, 'a'.repeat(1600));
+  expect(q(document.body, '[data-rules-count="mcp"]')?.textContent?.trim()).toBe('1,600 / 1,913 for Claude Code through MCP');
+  expect(q(document.body, '[data-rules-count="mcp"]')?.hasAttribute('data-over')).toBe(false);
+  type(field, 'a'.repeat(2000));
+  expect(q(document.body, '[data-rules-count="mcp"]')?.hasAttribute('data-over')).toBe(true);
+  expect(q<HTMLButtonElement>(document.body, '[data-rules-save]')!.disabled).toBe(false);
+  // One agent's own rules never reach an MCP session: no MCP count there.
+  await click(q(document.body, '[data-rules-for="pi"]'));
+  type(q<HTMLTextAreaElement>(document.body, '[data-rules-field]')!, 'a'.repeat(2000));
+  expect(q(document.body, '[data-rules-count="mcp"]')).toBeNull();
+});
+
+test.skipIf(!hasDom)('agents connected through MCP: the note names who misses the rules, widest first, with the room', () => {
+  const note = (dropped: ('claude_code_old' | 'claude_code' | 'other')[]) => {
+    act(() => root?.unmount());
+    host?.remove();
+    const el = mount(withRules({ shared: 'r'.repeat(500), mcp: mcp({ dropped }) }), false);
+    return q(el, '[data-rules-dropped="mcp"]')?.textContent ?? null;
+  };
+  expect(note([])).toBeNull();
+  expect(note(['claude_code_old'])).toBe(
+    'Not sent to older Claude Code (before 2.1.296), other Claude apps, or clients that do not name themselves, when they connect through MCP: they take rules up to 397 characters there.',
+  );
+  expect(note(['claude_code_old', 'claude_code'])).toBe(
+    "Not sent to Claude Code or other Claude apps when they connect through MCP (T3 Code's Claude threads too): Claude Code 2.1.296 and later takes rules up to 1,913 characters there, the others 397. Codex and other agents get them.",
+  );
+  expect(note(['claude_code_old', 'claude_code', 'other'])).toBe('Not sent to agents connected through MCP (T3 Code, Codex and others): they take rules up to 8,827 characters.');
+});
+
+test.skipIf(!hasDom)('agents connected through MCP: a reminder left out names the clients it misses', () => {
+  const withReminder = withRules({ shared: 'Ask first.', mcp: mcp({ reminder_dropped: ['claude_code_old'] }) });
+  withReminder.reminder = { ...withReminder.reminder, shared: 'Ping me when you are done.' };
+  const el = mount(withReminder);
+  expect(q(el, '[data-rules-dropped="mcp"]')).toBeNull();
+  expect(q(el, '[data-prompt-over="mcp"]')?.textContent).toBe('Not sent to older Claude Code (before 2.1.296) and other Claude apps through MCP: it does not fit in the room there.');
+});

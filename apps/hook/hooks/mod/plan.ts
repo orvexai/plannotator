@@ -3,6 +3,8 @@
  * ExitPlanMode and the `classic.PermissionRequest` answer. Pure.
  */
 
+import { isAbsolutePath } from './paths'
+
 /** Claude Code's plan-mode tool. */
 export const PLAN_TOOL = 'ExitPlanMode'
 
@@ -16,7 +18,7 @@ export const MAX_PLAN_FILE_BYTES = 2 * 1024 * 1024
  * The caller also requires a regular file within MAX_PLAN_FILE_BYTES.
  */
 export function isTrustablePlanPath(path: unknown): path is string {
-  return typeof path === 'string' && path.startsWith('/') && /\.md$/i.test(path)
+  return typeof path === 'string' && isAbsolutePath(path) && /\.md$/i.test(path)
 }
 
 /** Hash input: trailing whitespace is not a different plan. */
@@ -54,6 +56,40 @@ export function planCallAction(
   if (state.approval && state.approval.hash === planHash) return { kind: 'pass-approved', approval: state.approval }
   if (state.open) return { kind: 'revise', review: state.open }
   return { kind: 'start' }
+}
+
+/**
+ * The approved call's record for the plugin's own PermissionRequest command
+ * hook (#2007). On Team/Enterprise accounts Claude Code seats its built-in
+ * guard (`cc-plugin-sec-default`) above the person's plugins, and it sends
+ * `classic.PermissionRequest` past this mod. The event then reaches the
+ * command hook (`plannotator`), which reads this record and allows the call
+ * instead of opening a second review. Written while the approved call is in
+ * flight, removed when it settles.
+ *
+ * A copy of the CLI's contract (`apps/hook/server/mod-plan-approval.ts`; a
+ * hooks module imports only its own files); `mod-plan-approval.test.ts` keeps
+ * them equal.
+ */
+export const PLAN_APPROVALS_DIR = 'plan-approvals'
+export const PLAN_APPROVAL_RECORD_VERSION = 1
+
+export interface PlanApprovalRecord {
+  v: typeof PLAN_APPROVAL_RECORD_VERSION
+  hash: string
+  plan: string
+  permissionMode?: string
+  at: number
+}
+
+export function planApprovalRecord(approval: PendingApproval, at: number): PlanApprovalRecord {
+  return {
+    v: PLAN_APPROVAL_RECORD_VERSION,
+    hash: approval.hash,
+    plan: approval.plan,
+    ...(approval.permissionMode ? { permissionMode: approval.permissionMode } : {}),
+    at,
+  }
 }
 
 /** The `classic.PermissionRequest` decision that lets the approved plan through. */
@@ -105,7 +141,7 @@ export function cliLacksModPlan(stderr: string): boolean {
 
 /** Logged once per session when the CLI has no non-blocking plan review. */
 export const CLASSIC_PLAN_REVIEW_TEXT =
-  'Your plannotator CLI is older than the Plannotator plugin and has no non-blocking plan review, so plans open in the classic review, which holds this session until you decide. Update the CLI (curl -fsSL https://plannotator.ai/install.sh | bash) and start or resume a session to get non-blocking plan review.'
+  'Your plannotator CLI is older than the Plannotator plugin and has no non-blocking plan review, so plans open in the classic review, which holds this session until you decide. Update the CLI (curl -fsSL https://plannotator.ai/install.sh | bash, or on Windows irm https://plannotator.ai/install.ps1 | iex) and start or resume a session to get non-blocking plan review.'
 
 /**
  * Sent to Claude when the old CLI refused only after the ExitPlanMode call had

@@ -1,0 +1,614 @@
+/**
+ * The thread header's order (owner, 2026-10-16: "the archive button needs to
+ * move next to the close button. Mark read should be the furthest."; the
+ * amendment in the "inbox-mark-read" approval; approval "inbox-thread-header",
+ * 2026-11-02: the read button and a Snooze clock, as icons, before the
+ * subject). Proved in a real browser against the compiled binary, in every
+ * layout the header has:
+ *
+ *  - desktop beside the list: the read button (Mark read) and the Snooze
+ *    clock lead (no full-screen button: the list column's edge hides the
+ *    list), then the subject; at the right, icons only (approval
+ *    "inbox-thread-artifacts"): Artifacts, Expand all (chevrons), ⋯ More
+ *    (Archive is in its menu), a hairline, the ×;
+ *  - the thread in full screen (approval "inbox-files-tabs", amendment
+ *    2026-10-30, B; a click on the list's edge, or Enter on it, since the
+ *    owner's 2026-11-09 call): the sidebar and the list hide, the thread keeps
+ *    a centred 760 px measure, ‹ Inbox leads and there is no ×;
+ *    ‹ Inbox, Escape or ⌘B brings them back (Escape leaves full screen before
+ *    it closes the thread); a file opened there opens beside the thread and
+ *    closing it returns to full screen (⌘B there leaves it alone); another
+ *    thread keeps it, J and K included (the list stays drawn, hidden); G I
+ *    brings the list back; a stacked window never counts as full screen; a
+ *    window narrowed in full screen keeps the list beside the thread on the
+ *    way out (the sidebar held closed);
+ *  - a stacked window (1000 px): ‹ Inbox leads, then Mark read and Snooze;
+ *    ⋯ More (the copy menu, design record "inbox-copy-message") ends it;
+ *  - a file beside the thread: the same, with ‹ Inbox closing the file;
+ *  - full screen: the file covers the thread;
+ *  - a phone: ‹ Inbox, the subject, Artifacts, Expand, ⋯ More at the right edge, 44 px targets;
+ *    Mark read and Snooze lead the ⋯ sheet;
+ *  - a thread that came back from the archive, and an archived thread
+ *    (Unarchive in its foot, the header's Archive button reading Unarchive).
+ *
+ * The keyboard's tab order follows the visual order. Build the binary first
+ * (see inbox.spec.ts), then `bun run test:e2e:inbox`. PNGs land in
+ * .local/proof/thread-header/.
+ */
+
+import { devices, expect, test, type Browser, type BrowserContext, type Locator, type Page } from './inbox-test';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { SimAgent, scratchProject } from '../../scripts/inbox-sim';
+import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { forgetFileViewChoice } from './file-view';
+import { NO_BROWSER } from '../helpers/no-browser';
+
+const repo = resolve(__dirname, '../..');
+const binary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
+const proofDir = join(resolve(process.env.PLANNOTATOR_E2E_PROOF_DIR ?? join(repo, '.local/proof')), 'thread-header');
+
+const ASK = ['The invoice list needs a call before I build it.', '', ':::question', 'Which layout should the invoice list use?', '', '- [ ] Cards', '- [ ] A dense table', ':::'].join('\n');
+
+interface World {
+  url: string;
+  context: BrowserContext;
+  page: Page;
+  claude: SimAgent;
+  threads: { invoices: string; archived: string; back: string };
+  attachment: string;
+}
+
+let world: World;
+
+async function shot(page: Page, name: string, schemes: readonly ('light' | 'dark')[] = ['light']): Promise<void> {
+  for (const scheme of schemes) {
+    await page.emulateMedia({ colorScheme: scheme, reducedMotion: 'reduce' });
+    await page.waitForTimeout(250);
+    await page.screenshot({ path: join(proofDir, `${name}-${scheme}.png`) });
+  }
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
+}
+
+/** The header's visible controls, left to right, by a short name. The title is left out: cut, it is a button too (a tap opens it whole). */
+async function headerOrder(pane: Locator): Promise<string[]> {
+  return pane.locator('.ib-phead').evaluate((head) =>
+    [...head.querySelectorAll('button')]
+      .filter((b) => {
+        if (b.hasAttribute('data-header-title')) return false;
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && getComputedStyle(b).visibility !== 'hidden';
+      })
+      .sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x)
+      .map((b) =>
+        b.hasAttribute('data-artifacts-button')
+            ? 'artifacts'
+          : b.hasAttribute('data-archive')
+            ? 'archive'
+          : b.hasAttribute('data-thread-more')
+            ? 'more'
+            : b.hasAttribute('data-expand-all')
+              ? 'expand'
+              : b.classList.contains('ib-pback')
+                ? 'back'
+                : b.getAttribute('aria-label') === 'Close the thread'
+                  ? 'close'
+                  : (b.getAttribute('aria-label') ?? '?'),
+      ),
+  );
+}
+
+async function post(url: string, path: string, body: unknown): Promise<void> {
+  const res = await fetch(new URL(path, url), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  expect(res.status, await res.clone().text()).toBe(200);
+}
+
+test.describe.configure({ mode: 'serial' });
+
+test.beforeAll(async ({ browser }: { browser: Browser }) => {
+  expect(existsSync(binary), `build the binary first: ${binary}`).toBe(true);
+  rmSync(proofDir, { recursive: true, force: true });
+  mkdirSync(proofDir, { recursive: true });
+  const root = inboxScratch('plannotator-inbox-header-e2e-');
+  const dataDir = join(root, 'data');
+  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: NO_BROWSER, PLANNOTATOR_INBOX_CONNECT: '0' };
+  const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
+  expect(started.status, started.stderr).toBe(0);
+  const url = started.stdout.trim();
+  const project = scratchProject(join(root, 'src'), 'billing');
+  mkdirSync(join(project, 'docs'), { recursive: true });
+  writeFileSync(join(project, 'docs', 'invoice-plan.md'), '# Invoice list\n\nA dense table, overdue first, with an empty state that says what to do next.\n');
+  const claude = await SimAgent.connect({ binary, env, name: 'Claude Code', host: 'claude-code' });
+
+  // A thread of two messages (so Expand all shows), with a question and a file.
+  const first = await claude.send({ project_path: project, subject: 'Invoice list: cards or a table?', thread: 'invoices', body: 'Starting on the invoice list.' });
+  await new Promise((r) => setTimeout(r, 20));
+  const second = await claude.send({ project_path: project, thread: 'invoices', body: ASK, attachments: ['docs/invoice-plan.md'] });
+  // A thread the person archived.
+  const archived = await claude.send({ project_path: project, subject: 'Nightly build is green', body: 'The nightly build is green again.' });
+  await post(url, `/api/inbox/messages/${archived.message_id}/resolve`, { resolved: true });
+  // A thread that came back: archived, then the agent wrote into it with a question.
+  const back = await claude.send({ project_path: project, subject: 'Search for the docs site', body: 'Search is wired up.' });
+  await post(url, `/api/inbox/messages/${back.message_id}/resolve`, { resolved: true });
+  await claude.send({ project_path: project, reply_to: back.message_id as string, body: ['One more thing.', '', ':::question', 'Which search index should the docs use?', '', '- [ ] Pagefind', '- [ ] Orama', ':::'].join('\n') });
+
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'light' });
+  const page = await context.newPage();
+  world = {
+    url,
+    context,
+    page,
+    claude,
+    threads: { invoices: first.thread_id as string, archived: archived.thread_id as string, back: back.thread_id as string },
+    attachment: (second.attachments as { id: string }[])[0].id,
+  };
+});
+
+/** A view pressed in a test is remembered: forgotten after each, so the next opens by today's rule (file-view.ts). */
+test.afterEach(async () => forgetFileViewChoice(world?.page));
+
+test.afterAll(async () => {
+  try {
+    if (!world) return;
+    await world.claude.close().catch(() => {});
+    await world.context.close();
+  } finally {
+    await removeInboxScratch();
+  }
+});
+
+test('desktop beside the list: the subject leads, ⋯ More (Mark read and Snooze lead its menu) sits beside the close; Tab follows that order', async () => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.invoices}`);
+  const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+  await expect(pane.locator('[data-thread-more]')).toBeVisible();
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await shot(page, '1-desktop', ['light', 'dark']);
+  expect(await headerOrder(pane)).toEqual(['artifacts', 'expand', 'more', 'close']);
+  // The title leads the bar, up to Artifacts. A named thread shows its name (the list's rule, the owner's 2026-11-02
+  // call) with its subject after it, the thread's only heading (2026-11-15: none in the body); the meta line has no
+  // pill repeating the name.
+  const subject = pane.locator('.ib-phead [data-header-subject]');
+  await expect(subject.locator('[data-header-name-words]')).toHaveText('invoices');
+  await expect(subject.locator('[data-header-after]')).toHaveText('Invoice list: cards or a table?');
+  await expect(subject.locator('[data-header-after]')).toBeVisible();
+  await expect(subject).toHaveAttribute('aria-label', 'invoices: Invoice list: cards or a table?');
+  await expect(pane.locator('.ib-pbody h2')).toHaveCount(0);
+  await expect(pane.locator('[data-thread-meta] .ib-key')).toHaveCount(0);
+  // Whole on the line, the title is no button and has no tooltip repeating it.
+  const words = subject.locator('[data-header-title]');
+  await expect(words).not.toHaveAttribute('aria-expanded');
+  await words.hover();
+  const subjectTip = page.locator('[data-side].bg-popover');
+  await page.waitForTimeout(800);
+  await expect(subjectTip).toHaveCount(0);
+  await page.mouse.move(0, 0);
+  // Cut (the title's room narrowed here), its tooltip shows the subject, and hangs on the words, not on the title's box
+  // (which takes the bar's free room): it opens over the words, not far to the right over the empty room (the owner,
+  // 2026-11-08).
+  await subject.evaluate((el) => (el.style.maxWidth = '120px'));
+  await expect(words).toHaveAttribute('aria-expanded', 'false');
+  await words.hover();
+  await expect(subjectTip).toHaveText('Invoice list: cards or a table?');
+  const [wordsBox, tipBox] = await Promise.all([words.boundingBox(), subjectTip.boundingBox()]);
+  expect(Math.abs(tipBox!.x + tipBox!.width / 2 - (wordsBox!.x + wordsBox!.width / 2))).toBeLessThan(2);
+  await page.mouse.move(0, 0);
+  await subject.evaluate((el) => (el.style.maxWidth = ''));
+  await expect(words).not.toHaveAttribute('aria-expanded');
+  const [headBox, subjectBox, artifactsBox] = await Promise.all([pane.locator('.ib-phead').boundingBox(), subject.boundingBox(), pane.locator('[data-artifacts-button]').boundingBox()]);
+  expect(subjectBox!.x - headBox!.x).toBeLessThan(24);
+  expect(subjectBox!.x + subjectBox!.width).toBeLessThanOrEqual(artifactsBox!.x + 0.5);
+  // No full-screen button: the list column's edge hides the list (click it, drag to resize).
+  await expect(pane.locator('[data-full-in]')).toHaveCount(0);
+  // ⋯ More (design record "inbox-copy-message", option B) holds Archive (the owner, 2026-11-01), then only the hairline
+  // before the close (approval "inbox-thread-artifacts"). The header has no Archive button of its own.
+  await expect(pane.locator('.ib-phead [data-archive]')).toHaveCount(0);
+  expect(await pane.locator('[data-thread-more]').evaluate((b) => b.nextElementSibling?.className)).toBe('ib-vsep');
+  expect(await pane.locator('[data-thread-more]').evaluate((b) => b.nextElementSibling?.nextElementSibling?.getAttribute('aria-label'))).toBe('Close the thread');
+  // The read action and Snooze lead the ⋯ menu, with their icons.
+  await pane.locator('[data-thread-more]').click();
+  const menu = page.locator('[data-thread-menu]');
+  await expect(menu.locator('[data-thread-read-item]')).toHaveAccessibleName('Mark read');
+  await expect(menu.locator('[data-thread-read-item]')).toHaveAttribute('aria-keyshortcuts', 'E');
+  await expect(menu.locator('[data-thread-snooze-item]')).toHaveAttribute('aria-keyshortcuts', 'H');
+  await expect(menu.locator('[data-thread-read-item] svg, [data-thread-snooze-item] svg').first()).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0);
+  // The keyboard walks the header left to right.
+  await pane.locator('[data-artifacts-button]').focus();
+  await page.keyboard.press('Tab');
+  await expect(pane.locator('[data-expand-all]')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(pane.locator('[data-thread-more]')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(pane.getByRole('button', { name: 'Close the thread' })).toBeFocused();
+});
+
+test('Archive is in the ⋯ menu, not the header: it archives with Undo, and a phone sheet has it too', async ({ browser }) => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.invoices}`);
+  const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+  await expect(pane.locator('[data-thread-more]')).toBeVisible();
+  await expect(pane.locator('.ib-phead [data-archive]')).toHaveCount(0);
+  await expect(pane.locator('.ib-phead').getByRole('button', { name: 'Archive the thread' })).toHaveCount(0);
+  await pane.locator('[data-thread-more]').click();
+  const item = page.getByRole('menuitem', { name: 'Archive thread' });
+  await expect(item).toBeVisible();
+  await shot(page, '8-menu-open');
+  await item.click();
+  await expect(page.locator('.ib-pfoot')).toContainText('Archived. The next message from');
+  await page.locator('[data-toast-undo]').click();
+  await expect(page.locator('.ib-pfoot')).not.toContainText('Archived. The next message from');
+  expect(await headerOrder(pane)).toEqual(['artifacts', 'expand', 'more', 'close']);
+
+  const { defaultBrowserType: _ignored, ...options } = devices['Pixel 7'] as (typeof devices)['Pixel 7'] & { defaultBrowserType?: string };
+  const context = await browser.newContext({ ...options, colorScheme: 'light' });
+  try {
+    const phone = await context.newPage();
+    await phone.goto(`${world.url}#thread=${threads.invoices}`);
+    const phonePane = phone.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+    await expect(phonePane.locator('[data-phone-back]')).toBeVisible();
+    await shot(phone, '9-phone-header');
+    await phonePane.locator('[data-thread-more]').click();
+    await expect(phone.getByRole('menuitem', { name: 'Archive thread' })).toBeVisible();
+    await shot(phone, '9-phone-menu-open');
+  } finally {
+    await context.close();
+  }
+});
+
+/** The thread's left edge: past the sidebar and the list beside them, at the window's edge in full screen. */
+const leftOf = (pane: Locator) => async () => (await pane.boundingBox())?.x ?? -1;
+const sidebarCookie = async (page: Page) => (await page.context().cookies()).find((c) => c.name === 'plannotator-inbox-sidebar-open')?.value ?? null;
+
+test('the thread in full screen: the sidebar and the list hide; ‹ Inbox, Escape and ⌘B bring them back', async () => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.invoices}`);
+  const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+  const enter = page.locator('.ib-listcol .ib-handle-hit');
+  const leave = pane.locator('[data-full-back]');
+  const sidebar = page.getByRole('complementary', { name: 'Inbox navigation' });
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await expect(sidebar).toBeVisible();
+  expect(await leftOf(pane)()).toBeGreaterThan(400);
+  const cookieBefore = await sidebarCookie(page);
+
+  // In (a click on the list's edge): the list and the sidebar hide, the thread spans the window at a reading measure, ‹ Inbox leads.
+  await enter.click();
+  await expect(pane).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await expect.poll(leftOf(pane)).toBeLessThan(20);
+  await expect(sidebar).toBeHidden();
+  await expect(leave).toBeFocused();
+  await expect(leave).toHaveAccessibleName('Back to Inbox');
+  expect(await headerOrder(pane)).toEqual(['back', 'artifacts', 'expand', 'more']);
+  await expect(pane.getByRole('button', { name: 'Close the thread' })).toHaveCount(0);
+  const measure = await pane.locator('.ib-pbody').evaluate((b) => {
+    const s = getComputedStyle(b);
+    return { text: b.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight), left: parseFloat(s.paddingLeft), right: parseFloat(s.paddingRight) };
+  });
+  expect(measure.text).toBeGreaterThan(740);
+  expect(measure.text).toBeLessThanOrEqual(761);
+  expect(Math.abs(measure.left - measure.right)).toBeLessThan(1);
+  // The person's sidebar choice is not written.
+  expect(await sidebarCookie(page)).toBe(cookieBefore);
+  await shot(page, '1b-thread-full-screen', ['light', 'dark']);
+
+  // ‹ Inbox: the list and the sidebar come back, the thread stays open, focus on its subject.
+  await leave.click();
+  await expect(pane).not.toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await expect(sidebar).toBeVisible();
+  await expect.poll(leftOf(pane)).toBeGreaterThan(400);
+  await expect(pane.locator('h2.ib-subject')).toBeFocused();
+  await expect(pane.getByRole('button', { name: 'Close the thread' })).toBeVisible();
+
+  // ⌘B leaves full screen too, and still writes no sidebar choice.
+  await enter.click();
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await page.keyboard.press('ControlOrMeta+b');
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await expect(sidebar).toBeVisible();
+  await expect(pane).not.toHaveAttribute('data-full', '');
+  expect(await sidebarCookie(page)).toBe(cookieBefore);
+
+  // The sidebar closed by the person: the edge hides only the list, and leaving full screen leaves the sidebar closed.
+  await page.keyboard.press('ControlOrMeta+b');
+  await expect(sidebar).toBeHidden();
+  await enter.click();
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await leave.click();
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await expect(sidebar).toBeHidden();
+  await page.keyboard.press('ControlOrMeta+b');
+  await expect(sidebar).toBeVisible();
+
+  // Enter on the focused edge hides the list too, and focus leaves the hidden edge for ‹ Inbox.
+  await page.getByRole('separator', { name: 'List width' }).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await expect(leave).toBeFocused();
+  await leave.click();
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+
+  // Escape leaves full screen first (the thread stays), then closes the thread.
+  await enter.click();
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await expect(leave).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await expect(pane).toBeVisible();
+  await expect.poll(() => page.evaluate(() => location.hash)).toContain(`thread=${threads.invoices}`);
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await page.keyboard.press('Escape');
+  await expect.poll(() => page.evaluate(() => location.hash)).not.toContain('thread=');
+});
+
+test('the thread in full screen with a file: the file opens beside it; closing the file returns to full screen', async () => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.invoices}`);
+  const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+  await page.locator('.ib-listcol .ib-handle-hit').click();
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await pane.getByRole('button', { name: 'Open invoice-plan.md' }).first().click();
+  const view = page.locator(`[data-attachment-pane="${world.attachment}"]`);
+  await expect(view).toBeVisible();
+  await expect(view).not.toHaveClass(/ib-full/);
+  // Beside a file the thread drops its measure (the file has the room); the file's ‹ Inbox leads.
+  await expect(pane).not.toHaveAttribute('data-full', '');
+  await expect(pane.locator('[data-file-back]')).toBeVisible();
+  await expect(pane.locator('[data-full-back]')).toHaveCount(0);
+  expect(await headerOrder(pane)).toEqual(['back', 'artifacts', 'expand', 'more']);
+  await shot(page, '1c-thread-full-screen-with-file', ['light', 'dark']);
+  // The file's ×: back to the thread in full screen, not to the list.
+  await view.getByRole('button', { name: 'Close invoice-plan.md' }).click();
+  await expect(view).toHaveCount(0);
+  await expect(pane).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await expect(pane.locator('[data-full-back]')).toBeVisible();
+  // Escape from the file closes the file first, still in full screen.
+  await pane.getByRole('button', { name: 'Open invoice-plan.md' }).first().click();
+  await expect(view).toBeVisible();
+  await view.focus();
+  await page.keyboard.press('Escape');
+  await expect(view).toHaveCount(0);
+  await expect(pane).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  // The file's own full screen, then back beside the thread, then its ×: still the thread in full screen.
+  await pane.getByRole('button', { name: 'Open invoice-plan.md' }).first().click();
+  await expect(view).toBeVisible();
+  await view.getByRole('button', { name: 'Full screen' }).click();
+  await expect(view).toHaveClass(/ib-full/);
+  await view.locator('[data-full-view-close]').click();
+  await expect(view).not.toHaveClass(/ib-full/);
+  await expect(pane.locator('[data-file-back]')).toBeVisible();
+  await view.getByRole('button', { name: 'Close invoice-plan.md' }).click();
+  await expect(view).toHaveCount(0);
+  await expect(pane).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  // Pressing Full screen was remembered as the person's view (fileView.ts): forgotten, so the next file opens beside.
+  await forgetFileViewChoice(page);
+  // ⌘B with a file open from full screen leaves full screen alone: closing the file still returns to it.
+  await pane.getByRole('button', { name: 'Open invoice-plan.md' }).first().click();
+  await expect(view).toBeVisible();
+  await page.keyboard.press('ControlOrMeta+b');
+  await expect(view).toBeVisible();
+  await view.getByRole('button', { name: 'Close invoice-plan.md' }).click();
+  await expect(view).toHaveCount(0);
+  await expect(pane).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  // ‹ Inbox with a file open closes the file and leaves full screen: the list comes back.
+  await pane.getByRole('button', { name: 'Open invoice-plan.md' }).first().click();
+  await expect(view).toBeVisible();
+  await pane.locator('[data-file-back]').click();
+  await expect(view).toHaveCount(0);
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await expect(page.locator('.ib-listcol .ib-handle-hit')).toBeVisible();
+});
+
+test('the thread in full screen is a reading mode: another thread keeps it; a stacked window never counts as full screen', async () => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.invoices}`);
+  const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+  await page.locator('.ib-listcol .ib-handle-hit').click();
+  await expect(pane).toHaveAttribute('data-full', '');
+  // Another thread (a link, search, a notification): still full screen.
+  await page.evaluate((id) => (location.hash = `#thread=${id}`), threads.back);
+  const other = page.locator(`section.ib-pane[data-thread-id="${threads.back}"]`);
+  await expect(other).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  await expect(other.locator('[data-full-back]')).toBeVisible();
+  // A window too narrow for two panes: the stacked thread leads with its own ‹ Inbox, never full screen's.
+  await page.setViewportSize({ width: 800, height: 800 });
+  try {
+    await expect(other.locator('[data-stack-back]')).toBeVisible();
+    await expect(other).not.toHaveAttribute('data-full', '');
+    await expect(other.locator('[data-full-back]')).toHaveCount(0);
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 900 });
+  }
+  // Wide again: back to full screen, as the person left it.
+  await expect(other).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  // No thread open: it ends.
+  await page.evaluate(() => (location.hash = ''));
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await page.evaluate((id) => (location.hash = `#thread=${id}`), threads.invoices);
+  await expect(pane).toBeVisible();
+  await expect(pane).not.toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol .ib-handle-hit')).toBeVisible();
+});
+
+test('the thread in full screen: J and K step through the hidden list and keep full screen; G I brings the list back', async () => {
+  const { page } = world;
+  await page.goto(world.url);
+  const rows = page.locator('.ib-main .ib-lbody [data-thread-id]');
+  await expect(rows.first()).toBeVisible();
+  const order = [...new Set(await rows.evaluateAll((els) => els.map((e) => e.getAttribute('data-thread-id') ?? '')))].filter(Boolean);
+  expect(order.length).toBeGreaterThan(1);
+  const [first, second] = order as [string, string];
+  const hash = () => page.evaluate(() => location.hash);
+  await page.evaluate((id) => (location.hash = `#thread=${id}`), second);
+  const secondPane = page.locator(`section.ib-pane[data-thread-id="${second}"]`);
+  await page.locator('.ib-listcol .ib-handle-hit').click();
+  await expect(secondPane).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  // K: the thread above it in the list, still in full screen.
+  await page.keyboard.press('k');
+  await expect.poll(hash).toContain(`thread=${first}`);
+  const firstPane = page.locator(`section.ib-pane[data-thread-id="${first}"]`);
+  await expect(firstPane).toHaveAttribute('data-full', '');
+  await expect(page.locator('.ib-listcol')).toBeHidden();
+  // J: back down.
+  await page.keyboard.press('j');
+  await expect.poll(hash).toContain(`thread=${second}`);
+  await expect(secondPane).toHaveAttribute('data-full', '');
+  // G I: full screen ends so the open thread's row can take focus.
+  await page.keyboard.press('g');
+  await page.keyboard.press('i');
+  await expect(page.locator('.ib-listcol')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => document.activeElement?.closest('.ib-lbody [data-thread-id]')?.getAttribute('data-thread-id') ?? null)).toBe(second);
+});
+
+test('the thread in full screen, then a narrower window: leaving keeps the list beside the thread, the sidebar held closed', async () => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.invoices}`);
+  const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+  const sidebar = page.getByRole('complementary', { name: 'Inbox navigation' });
+  await expect(sidebar).toBeVisible();
+  const mainWidth = () => page.locator('.ib-main').evaluate((m) => m.getBoundingClientRect().width);
+  try {
+    // ‹ Inbox, then Escape: each way out does the same room check.
+    for (const way of ['‹ Inbox', 'Escape'] as const) {
+      await page.locator('.ib-listcol .ib-handle-hit').click();
+      await expect(pane).toHaveAttribute('data-full', '');
+      // Room for the thread alone, and for the list beside it, but not for the sidebar too.
+      await page.setViewportSize({ width: 960, height: 800 });
+      await expect(pane).toHaveAttribute('data-full', '');
+      if (way === 'Escape') {
+        await expect(pane.locator('[data-full-back]')).toBeFocused();
+        await page.keyboard.press('Escape');
+      } else await pane.locator('[data-full-back]').click();
+      await expect(pane).not.toHaveAttribute('data-full', '');
+      await expect(page.locator('.ib-listcol')).toBeVisible();
+      await expect(sidebar).toBeHidden();
+      await expect(pane.locator('[data-stack-back]')).toHaveCount(0);
+      expect(await mainWidth()).toBeGreaterThanOrEqual(820);
+      await expect(pane.locator('h2.ib-subject')).toBeFocused();
+      // Wide again: the sidebar comes back on its own.
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await expect(sidebar).toBeVisible();
+    }
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 900 });
+  }
+});
+
+test('a stacked window: ‹ Inbox, then Mark read and Snooze; ⋯ More ends the header', async () => {
+  const { page, threads } = world;
+  await page.setViewportSize({ width: 1000, height: 800 });
+  try {
+    await page.goto(`${world.url}#thread=${threads.invoices}`);
+    const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+    await expect(pane.locator('[data-stack-back]')).toBeVisible();
+    await shot(page, '2-stacked-1000');
+    expect(await headerOrder(pane)).toEqual(['back', 'artifacts', 'expand', 'more']);
+    await expect(pane.getByRole('button', { name: 'Close the thread' })).toHaveCount(0);
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 900 });
+  }
+});
+
+test('a file beside the thread: ‹ Inbox, then Mark read and Snooze; ⋯ More ends the header; full screen covers it', async () => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.invoices}&file=${world.attachment}`);
+  const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+  const view = page.locator(`[data-attachment-pane="${world.attachment}"]`);
+  await expect(view).toBeVisible();
+  await expect(pane.locator('[data-file-back]')).toBeVisible();
+  await shot(page, '3-file-beside', ['light', 'dark']);
+  expect(await headerOrder(pane)).toEqual(['back', 'artifacts', 'expand', 'more']);
+  await view.getByRole('button', { name: 'Full screen' }).click();
+  await expect(view).toHaveClass(/ib-full/);
+  await shot(page, '4-file-full-screen');
+  await view.getByRole('button', { name: 'Side by side' }).click();
+  await expect(view).not.toHaveClass(/ib-full/);
+  expect(await headerOrder(pane)).toEqual(['back', 'artifacts', 'expand', 'more']);
+});
+
+test('a thread that came back from the archive, and an archived one: the same order, Unarchive in the foot', async () => {
+  const { page, threads } = world;
+  await page.goto(`${world.url}#thread=${threads.back}`);
+  const backPane = page.locator(`section.ib-pane[data-thread-id="${threads.back}"]`);
+  await expect(backPane.locator('[data-came-back]')).toBeVisible();
+  await shot(page, '5-came-back');
+  // A thread that came back is not resolved for the window, so Mark read is offered: it leads the ⋯ menu.
+  expect(await headerOrder(backPane)).toEqual(['expand', 'more', 'close']);
+  await backPane.locator('[data-thread-more]').click();
+  await expect(page.locator('[data-thread-menu] [role="menuitem"]').first()).toHaveAttribute('data-thread-read-item', '');
+  await page.keyboard.press('Escape');
+
+  await page.goto(`${world.url}#thread=${threads.archived}`);
+  const archivedPane = page.locator(`section.ib-pane[data-thread-id="${threads.archived}"]`);
+  await expect(archivedPane.getByRole('button', { name: 'Unarchive' }).first()).toBeVisible();
+  await shot(page, '6-archived');
+  expect((await headerOrder(archivedPane)).slice(-2)).toEqual(['more', 'close']);
+  await archivedPane.locator('[data-thread-more]').click();
+  await expect(page.getByRole('menuitem', { name: 'Unarchive thread' })).toBeVisible();
+  await expect(page.getByRole('menuitem', { name: 'Archive thread', exact: true })).toHaveCount(0);
+  await expect(page.locator('[data-thread-menu] :is([data-thread-read-item], [data-thread-snooze-item])')).toHaveCount(0);
+  await page.keyboard.press('Escape');
+});
+
+for (const phone of [
+  { name: 'Pixel 7', options: devices['Pixel 7'] },
+  { name: '320 px', options: { ...devices['Pixel 7'], viewport: { width: 320, height: 640 } } },
+]) {
+  test(`a phone (${phone.name}): ‹ Inbox, the subject, Artifacts, Expand and ⋯ More at the right edge, 44 px targets; Mark read and Snooze lead ⋯`, async ({ browser }) => {
+    const { threads } = world;
+    const { defaultBrowserType: _ignored, ...options } = phone.options as typeof phone.options & { defaultBrowserType?: string };
+    const context = await browser.newContext({ ...options, colorScheme: 'light' });
+    try {
+      const page = await context.newPage();
+      await page.goto(`${world.url}#thread=${threads.invoices}`);
+      const pane = page.locator(`section.ib-pane[data-thread-id="${threads.invoices}"]`);
+      await expect(pane.locator('[data-phone-back]')).toBeVisible();
+      await shot(page, `7-phone-${phone.name.replace(/\W+/g, '-').toLowerCase()}`, ['light', 'dark']);
+      expect(await headerOrder(pane)).toEqual(['back', 'artifacts', 'expand', 'more']);
+      // The title (this named thread's name, its subject after it) is drawn with room to read (approval "inbox-thread-header").
+      const title = pane.locator('.ib-phead [data-header-subject]');
+      await expect(title.locator('[data-header-name-words]')).toHaveText('invoices');
+      await expect(title.locator('[data-header-after]')).toHaveText('Invoice list: cards or a table?');
+      expect(await title.evaluate((h) => h.getBoundingClientRect().width)).toBeGreaterThanOrEqual(88);
+      // The read button and Snooze moved into the ⋯ sheet, where they lead.
+      await pane.locator('[data-thread-more]').click();
+      const sheet = page.locator('[data-thread-menu]');
+      await expect(sheet.getByRole('menuitem').first()).toHaveText('Mark read');
+      await expect(sheet.getByRole('menuitem').nth(1)).toHaveText('Snooze');
+      await page.keyboard.press('Escape');
+      await expect(sheet).toHaveCount(0);
+      // The pin lives in ⋯ More's menu (a phone's way to pin), not the header.
+      await expect(pane.locator('[data-pin-toggle]')).toHaveCount(0);
+      // Every header control is a 44 px target and none overlaps another (the title too, a button when cut).
+      // Measured against the header itself (the thread may still be sliding in).
+      const boxes = await pane.locator('.ib-phead').evaluate((head) => {
+        const h = head.getBoundingClientRect();
+        return [...head.querySelectorAll('button')].map((b) => {
+          const r = b.getBoundingClientRect();
+          return { name: b.getAttribute('aria-label') ?? b.textContent?.trim() ?? '', x: r.x - h.x, w: r.width, h: r.height, right: r.right - h.x, head: h.width };
+        });
+      });
+      for (const box of boxes) expect(box.h, `${box.name} is ${Math.round(box.w)}x${Math.round(box.h)}`).toBeGreaterThanOrEqual(43.9);
+      for (const box of boxes) expect(box.w, `${box.name} is ${Math.round(box.w)}x${Math.round(box.h)}`).toBeGreaterThanOrEqual(43.9);
+      const sorted = [...boxes].sort((a, b) => a.x - b.x);
+      for (let i = 1; i < sorted.length; i++) expect(sorted[i].x, `${sorted[i - 1].name} overlaps ${sorted[i].name}`).toBeGreaterThanOrEqual(sorted[i - 1].right - 0.5);
+      expect(sorted.at(-1)!.right).toBeLessThanOrEqual(sorted.at(-1)!.head);
+      // ⋯ More (the copy menu, design record "inbox-copy-message", which holds Archive) ends the row.
+      expect(sorted.at(-1)!.name).toBe('More');
+      expect(sorted.map((b) => b.name)).not.toContain('Archive the thread');
+    } finally {
+      await context.close();
+    }
+  });
+}

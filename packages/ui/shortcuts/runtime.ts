@@ -5,6 +5,7 @@ import {
   matchesShortcutBinding,
   matchesShortcutBindingGroup,
   parseDoubleTapBinding,
+  resolveShortcutBindings,
 } from './core';
 
 type ShortcutActionId<TScope extends ShortcutScopeDefinition<any>> = keyof TScope['shortcuts'] & string;
@@ -27,6 +28,12 @@ export interface UseShortcutScopeOptions<TScope extends ShortcutScopeDefinition<
   handlers: ShortcutHandlers<TScope>;
   target?: ShortcutEventTarget;
   stopOnMatch?: boolean;
+  /**
+   * Listen in the capture phase: the scope sees a key before the focused
+   * element does (a guard that must run before a component's own handler).
+   * Default false (bubble), so a component that used the key first can say so.
+   */
+  capture?: boolean;
 }
 
 interface ShortcutSequenceCandidate {
@@ -40,7 +47,8 @@ interface ShortcutSequenceState {
   readonly expiresAt: number;
 }
 
-const SHORTCUT_SEQUENCE_WINDOW_MS = 500;
+/** How long a sequence (`G P`) waits for its next key. */
+export const SHORTCUT_SEQUENCE_WINDOW_MS = 500;
 
 function normalizeShortcutHandler(handler: ShortcutHandler): ShortcutHandlerConfig {
   if (typeof handler === 'function') {
@@ -80,7 +88,7 @@ export function dispatchShortcutEvent<TScope extends ShortcutScopeDefinition<any
   for (const [actionId, shortcut] of getShortcutEntries(scope)) {
     const handler = handlers[actionId];
     if (!handler) continue;
-    if (!shortcut.bindings.some(binding => matchesShortcutBinding(event, binding))) continue;
+    if (!resolveShortcutBindings(shortcut).some(binding => matchesShortcutBinding(event, binding, scope))) continue;
 
     const { when, handle } = normalizeShortcutHandler(handler);
     if (when && !when(event)) continue;
@@ -123,6 +131,7 @@ export function useShortcutScope<TScope extends ShortcutScopeDefinition<any>>({
   handlers,
   target = 'window',
   stopOnMatch = true,
+  capture = false,
 }: UseShortcutScopeOptions<TScope>) {
   const handlersRef = useRef(handlers);
   const sequenceRef = useRef<ShortcutSequenceState | null>(null);
@@ -151,7 +160,7 @@ export function useShortcutScope<TScope extends ShortcutScopeDefinition<any>>({
 
       for (const candidate of active) {
         const group = candidate.groups[candidate.nextIndex];
-        if (!group || !matchesShortcutBindingGroup(keyboardEvent, group)) continue;
+        if (!group || !matchesShortcutBindingGroup(keyboardEvent, group, scope)) continue;
         if (candidate.nextIndex === candidate.groups.length - 1) {
           const shortcut = scope.shortcuts[candidate.actionId];
           const handler = handlersRef.current[candidate.actionId];
@@ -179,22 +188,25 @@ export function useShortcutScope<TScope extends ShortcutScopeDefinition<any>>({
       for (const [actionId, shortcut] of getShortcutEntries(scope)) {
         const handler = handlersRef.current[actionId];
         if (!handler) continue;
-        const { when } = normalizeShortcutHandler(handler);
-        if (when && !when(keyboardEvent)) continue;
-
-        for (const binding of shortcut.bindings) {
+        // The sequences this key starts, before the guard: a guard can read the whole page, and most keys start none.
+        const starts: string[][] = [];
+        for (const binding of resolveShortcutBindings(shortcut)) {
           const groups = binding.trim().split(/\s+/).filter(Boolean);
           const doubleTapKey = parseDoubleTapBinding(binding);
           if (
             groups.length < 2
             || groups.includes('hold')
             || (doubleTapKey !== null && ['Alt', 'Shift', 'Mod'].includes(doubleTapKey))
-            || !matchesShortcutBindingGroup(keyboardEvent, groups[0] ?? '')
+            || !matchesShortcutBindingGroup(keyboardEvent, groups[0] ?? '', scope)
           ) {
             continue;
           }
-          started.push({ actionId, groups, nextIndex: 1 });
+          starts.push(groups);
         }
+        if (starts.length === 0) continue;
+        const { when } = normalizeShortcutHandler(handler);
+        if (when && !when(keyboardEvent)) continue;
+        for (const groups of starts) started.push({ actionId, groups, nextIndex: 1 });
       }
 
       sequenceRef.current = started.length > 0
@@ -206,11 +218,11 @@ export function useShortcutScope<TScope extends ShortcutScopeDefinition<any>>({
       if (started.length > 0) keyboardEvent.preventDefault();
     };
 
-    eventTarget.addEventListener('keydown', handleKeyDown);
+    eventTarget.addEventListener('keydown', handleKeyDown, capture);
     return () => {
-      eventTarget.removeEventListener('keydown', handleKeyDown);
+      eventTarget.removeEventListener('keydown', handleKeyDown, capture);
     };
-  }, [scope, stopOnMatch, target]);
+  }, [scope, stopOnMatch, target, capture]);
 }
 
 export function createShortcutScopeHook<TScope extends ShortcutScopeDefinition<any>>(scope: TScope) {
@@ -268,7 +280,7 @@ export function useDoubleTapShortcuts<TScope extends ShortcutScopeDefinition<any
     // Pre-parse which actions have double-tap bindings
     const doubleTapActions: Array<{ actionId: ShortcutActionId<TScope>; keyName: string; preventDefault: boolean }> = [];
     for (const [actionId, shortcut] of getShortcutEntries(scope)) {
-      for (const binding of shortcut.bindings) {
+      for (const binding of resolveShortcutBindings(shortcut)) {
         const keyName = parseDoubleTapBinding(binding);
         if (keyName) {
           doubleTapActions.push({ actionId, keyName, preventDefault: shortcut.preventDefault === true });

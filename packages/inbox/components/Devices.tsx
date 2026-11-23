@@ -3,6 +3,9 @@ import { inboxApi, type LanState, type PairedDevice, type TailnetState, type Tai
 import { shortTime } from '../format';
 import { Icon, TailscaleMark } from '../icons';
 import { PairFlow } from './PairFlow';
+import { Tip } from './Tip';
+import { ThroughCloudflare } from './ThroughCloudflare';
+import { Switch } from './SettingSwitch';
 
 const PLATFORM: Record<string, string> = { ios: 'iPhone', android: 'Android' };
 
@@ -11,8 +14,55 @@ function grouped(hex: string): string {
   return hex.match(/.{1,4}/g)?.join(' ') ?? hex;
 }
 
-/** Remove, asked twice like Delete thread: "Remove? Click again", then the phone's token stops working. */
+/**
+ * Remove, asked twice like Delete thread: "Remove? Click again", then the
+ * phone's token stops working. Its words, shown and spoken, are the phone
+ * list's own and stay as they are; Settings → Machines' Unlink has its own
+ * (UnlinkLink).
+ */
 function RemoveLink({ name, onRemove }: { name: string; onRemove: () => Promise<void> }) {
+  return (
+    <AskTwiceButton
+      onRemove={onRemove}
+      text="Remove"
+      label={`Remove ${name}`}
+      confirmText="Remove? Click again"
+      confirmLabel={`Remove ${name}: click again to remove`}
+    />
+  );
+}
+
+/**
+ * Settings → Machines: Unlink, asked twice the same way. `warning`: what the
+ * second click costs, said in the confirm itself (answers that will not be sent).
+ */
+export function UnlinkLink({ name, onRemove, warning }: { name: string; onRemove: () => Promise<void>; warning?: string }) {
+  const confirmText = warning ? `Unlink? ${warning} Click again` : 'Unlink? Click again';
+  return (
+    <AskTwiceButton
+      onRemove={onRemove}
+      text="Unlink"
+      label={`Unlink ${name}`}
+      confirmText={confirmText}
+      confirmLabel={warning ? `Unlink ${name}: ${warning} Click again to unlink` : `Unlink ${name}: click again to unlink`}
+    />
+  );
+}
+
+/** The button both ask with: the first click asks (for 4 s), the second acts. `label`/`confirmLabel`: what a screen reader says in each state. */
+function AskTwiceButton({
+  onRemove,
+  text,
+  label,
+  confirmText,
+  confirmLabel,
+}: {
+  onRemove: () => Promise<void>;
+  text: string;
+  label: string;
+  confirmText: string;
+  confirmLabel: string;
+}) {
   const [state, setState] = useState<'idle' | 'confirm' | 'busy'>('idle');
   useEffect(() => {
     if (state !== 'confirm') return;
@@ -24,7 +74,7 @@ function RemoveLink({ name, onRemove }: { name: string; onRemove: () => Promise<
       type="button"
       className={`ib-del-l${state === 'confirm' ? ' ib-confirm' : ''}`}
       disabled={state === 'busy'}
-      aria-label={state === 'confirm' ? `Remove ${name}: click again to remove` : `Remove ${name}`}
+      aria-label={state === 'confirm' ? confirmLabel : label}
       onClick={() => {
         if (state === 'idle') return setState('confirm');
         if (state !== 'confirm') return;
@@ -32,7 +82,7 @@ function RemoveLink({ name, onRemove }: { name: string; onRemove: () => Promise<
         onRemove().finally(() => setState('idle'));
       }}
     >
-      {state === 'confirm' ? 'Remove? Click again' : 'Remove'}
+      {state === 'confirm' ? confirmText : text}
     </button>
   );
 }
@@ -140,21 +190,6 @@ export function devicesNeedAttention(phones: PhonesState | null, tailscale: Tail
 }
 
 /** A switch whose name is its row's visible title (label in name). */
-function Switch({ on, labelledBy, disabled, onClick, label }: { on: boolean; labelledBy?: string; label?: string; disabled?: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      className="ib-sw"
-      aria-checked={on}
-      aria-labelledby={labelledBy}
-      aria-label={label}
-      disabled={disabled}
-      onClick={onClick}
-    />
-  );
-}
-
 /**
  * Over your tailnet, in Devices: the browser on your other devices, which
  * the phone app does not need (owner, decision 2: written out). One switch,
@@ -176,16 +211,23 @@ function OverYourTailnet({
   const exposedPorts = (state.exposed ?? []).map((e) => e.https_port).filter((p): p is number => p !== null);
   const remote = via === 'tailnet';
   const who = state.allowed.length > 0 ? state.allowed.join(', ') : (state.owner ?? 'the Tailscale login that owns this computer');
+  const logins = state.allowed.length > 1 ? state.allowed : null;
   const locked = state.env !== null;
   const exposed = (state.exposed?.length ?? 0) > 0;
   return (
     <section className="ib-sgroup" data-settings-tailscale={state.on ? 'on' : 'off'} aria-labelledby="ib-g-tailscale">
       <h2 id="ib-g-tailscale">Over your tailnet</h2>
-      <p>Open the Inbox window in a browser on your laptop or tablet, through Tailscale, over HTTPS. Your phone&apos;s app does not need this.</p>
+      <p>
+        Open the Inbox window in a browser on your laptop or tablet, through{' '}
+        <a href="https://tailscale.com/" target="_blank" rel="noreferrer">
+          Tailscale
+        </a>
+        , over HTTPS. Your phone&apos;s app does not need this.
+      </p>
       <div className="ib-card">
         <div className="ib-prow">
           <span className="ib-tile">
-            <Icon name="globe" />
+            <TailscaleMark />
           </span>
           <span className="ib-txt">
             <span className="ib-l">
@@ -200,17 +242,25 @@ function OverYourTailnet({
                   <a href={state.url} target="_blank" rel="noreferrer">
                     {state.url}
                   </a>{' '}
-                  · only {who} can open it
+                  · only {logins ? 'these logins' : who} can open it{logins ? ':' : ''}
                 </>
               ) : state.on ? (
                 'On · not published'
               ) : (
-                `Off · only ${who} could open it`
+                `Off · only ${logins ? 'these logins' : who} could open it${logins ? ':' : ''}`
+              )}
+              {/* Several logins, one per line: never one long sentence of addresses. */}
+              {logins && (state.url || !state.on) && (
+                <span className="ib-logins" data-tailscale-logins="">
+                  {logins.map((login) => (
+                    <span key={login}>{login}</span>
+                  ))}
+                </span>
               )}
             </span>
           </span>
           <span className="ib-ctl">
-            <Switch on={state.on} labelledBy="ib-ts-label" disabled={busy || locked || (remote && !state.on)} onClick={() => onToggle(!state.on)} />
+            <Switch on={state.on} labelledBy="ib-ts-label" disabled={busy || locked} onClick={() => onToggle(!state.on)} />
           </span>
         </div>
         {exposed && (
@@ -219,7 +269,7 @@ function OverYourTailnet({
             <span>
               A tailscale serve mapping{exposedPorts.length ? ` on port ${exposedPorts.join(', ')}` : ''} points at the Inbox&apos;s own port. It exposes the whole
               Inbox, agent tools included, to everyone on your tailnet, so the Inbox refuses every request that comes through it.{' '}
-              {!remote && !locked && (
+              {!locked && (
                 <button type="button" className="ib-lnk" data-tailscale-replace="" disabled={busy} onClick={() => onToggle(true, true)}>
                   Replace it with the owner-only address
                 </button>
@@ -238,7 +288,7 @@ function OverYourTailnet({
         <Icon name="info" />
         {locked ? (
           `PLANNOTATOR_INBOX_TAILSCALE is set in this Inbox's environment, so it stays ${state.env ? 'on' : 'off'}.`
-        ) : remote ? (
+        ) : remote && state.source !== 'flag' ? (
           'You opened this page over your tailnet. Turning this off ends that connection; turn it on again from this computer.'
         ) : state.source === 'flag' ? (
           <span>
@@ -278,7 +328,7 @@ function WayRow({ kind, state, busy, onSwitch }: { kind: 'wifi' | 'tailscale'; s
                 {lan?.fingerprint && (
                   <span data-lan-fingerprint={lan.fingerprint}>
                     {' '}
-                    · certificate <span className="ib-sfp" title={grouped(lan.fingerprint)}>{grouped(lan.fingerprint).slice(0, 19)}…</span>
+                    · certificate <Tip content={<span className="ib-tip-fp">{grouped(lan.fingerprint)}</span>}><span className="ib-sfp" data-fingerprint={grouped(lan.fingerprint)}>{grouped(lan.fingerprint).slice(0, 19)}…</span></Tip>
                   </span>
                 )}
               </>
@@ -330,7 +380,7 @@ export interface DevicesSectionProps {
  * out (owner, decision 2).
  */
 export function DevicesSection({ phones, tailscale, via, tailscaleBusy, onToggleTailscale, pairing, onPairing }: DevicesSectionProps) {
-  const remote = via === 'tailnet';
+  // The owner pairs and switches from this computer or any of their own devices over the tailnet (owner ruling 2026-11-11).
   const pairButton = useRef<HTMLButtonElement>(null);
   const [justPaired, setJustPaired] = useState(false);
   const wasPairing = useRef(pairing);
@@ -347,16 +397,7 @@ export function DevicesSection({ phones, tailscale, via, tailscaleBusy, onToggle
           <section className="ib-sgroup" data-settings-phones="" aria-labelledby="ib-g-phones">
             <h2 id="ib-g-phones">Phones</h2>
             <p>Read and answer the Inbox from Plannotator on your phone. Each phone gets its own key, and Remove takes it back.</p>
-            {remote && (
-              <div className="ib-callout" data-pair-remote="">
-                <Icon name="lock" />
-                <span>
-                  You opened this page over your tailnet. Pair a phone and its switches work only from this computer&apos;s own screen, so a code is never shown to
-                  another device.
-                </span>
-              </div>
-            )}
-            {pairing && !remote ? (
+            {pairing ? (
               <PairFlow
                 lan={phones.lan}
                 tailnet={phones.tailnet}
@@ -405,7 +446,6 @@ export function DevicesSection({ phones, tailscale, via, tailscaleBusy, onToggle
                       ref={pairButton}
                       type="button"
                       className={`ib-btn${devices.length === 0 ? ' ib-pri' : ''}`}
-                      disabled={remote}
                       onClick={() => {
                         setJustPaired(false);
                         onPairing(true);
@@ -426,19 +466,20 @@ export function DevicesSection({ phones, tailscale, via, tailscaleBusy, onToggle
             )}
           </section>
           {/* While pairing, step 1 holds the two ways and their switches: one thing in one place. */}
-          {!(pairing && !remote) && (
+          {!pairing && (
           <section className="ib-sgroup" data-settings-ways="" aria-labelledby="ib-g-ways">
             <h2 id="ib-g-ways">How your phone reaches this computer</h2>
             <p>Turn on one or both. The phone uses whichever works where it is.</p>
             <div className="ib-card">
-              <WayRow kind="wifi" state={phones.lan} busy={phones.busy || remote} onSwitch={(on) => void phones.switchLan(on)} />
-              <WayRow kind="tailscale" state={phones.tailnet} busy={phones.busy || remote} onSwitch={(on) => void phones.switchTailnet(on)} />
+              <WayRow kind="wifi" state={phones.lan} busy={phones.busy} onSwitch={(on) => void phones.switchLan(on)} />
+              <WayRow kind="tailscale" state={phones.tailnet} busy={phones.busy} onSwitch={(on) => void phones.switchTailnet(on)} />
             </div>
           </section>
           )}
         </>
       )}
       {tailscale && <OverYourTailnet state={tailscale} via={via} busy={tailscaleBusy} onToggle={onToggleTailscale} />}
+      <ThroughCloudflare />
     </>
   );
 }

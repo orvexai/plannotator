@@ -1,15 +1,22 @@
+import { createPortal } from 'react-dom';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CodeGuideData, GuideSection } from '@plannotator/core/guide';
 import type { DiffFile } from './types';
 import { useGuideHost } from './host';
-import { renderInlineMarkdown } from './renderInlineMarkdown';
+import { parseGuideLink } from '@plannotator/core/guide-links';
+import { renderInlineMarkdown, type GuideLinkRenderer } from './renderInlineMarkdown';
 import { GuideSectionCard } from './GuideSectionCard';
+import { GuideOverview } from './GuideOverview';
 import { GUIDE_EAGER_MOUNT_MAX_FILES, GuideViewportProvider } from './GuideViewportManager';
+import { GuideGlobalCommentButton, GuideGlobalCommentList } from './GuideGlobalComments';
+import { GuideHeading } from './GuideHeading';
 
 interface GuideViewProps {
   guide: CodeGuideData;
   reviewed: boolean[];
   onToggleReviewed: (index: number) => void;
+  /** False: the chapters take no "Reviewed" tick (the Inbox's walkthrough: nothing to review). Default true. */
+  showReviewed?: boolean;
   /** e.g. "Claude" / "Codex" — omitted when the generating job/engine is unknown. */
   engineLabel?: string;
   focusedFile: string | null;
@@ -20,6 +27,26 @@ interface GuideViewProps {
   sourceLine?: React.ReactNode;
   /** Host-provided controls rendered top-right of the header (in-app: the export button). */
   headerActions?: React.ReactNode;
+  /**
+   * Drawn under the host's own title (the Inbox's PR review names the PR in its header): no heading block (title,
+   * counts, source line) and the host's 16px page margins, so the width goes to the code.
+   */
+  bare?: boolean;
+  /** Bare: draw the actions (Global comment, `headerActions`) in this element of the host's, not on a row of their own. */
+  actionsHost?: HTMLElement | null;
+  /**
+   * Drawn under a host's top bar that names the review and lists its chapters (the Inbox's review): the heading reads
+   * like a thread's (GuideHeading), with the review's actions on its title's line. Default off: the heading as before.
+   */
+  threadHeading?: boolean;
+  /**
+   * Each file's box as tall as its diff (an estimate from the hunks' rows, then the height the renderer reports;
+   * capped as before). Opt-in for a host whose renderer reports it (the Inbox's AllFilesCodeView). Default: on in
+   * `bare`, off otherwise (the fixed estimate the review app, guides.show and VS Code use).
+   */
+  fitFileHeights?: boolean;
+  /** Given the guide's root element, for a host's own listeners on it (the Inbox's link hover cards). */
+  rootRef?: React.RefObject<HTMLDivElement | null>;
 }
 
 export interface ResolvedGuideSections {
@@ -64,19 +91,30 @@ export const GuideView: React.FC<GuideViewProps> = ({
   guide,
   reviewed,
   onToggleReviewed,
+  showReviewed = true,
   engineLabel,
   focusedFile,
   onFocusFile,
   onRegenerate,
   sourceLine,
   headerActions,
+  actionsHost,
+  bare = false,
+  threadHeading = false,
+  fitFileHeights,
+  rootRef,
 }) => {
+  const fit = fitFileHeights ?? bare;
   const host = useGuideHost();
+  const overviewFigure = host.renderOverviewFigure?.() ?? null;
+  const headActions = threadHeading ? (host.renderHeadActions?.() ?? null) : null;
+  const addGlobalComment = host.globalComments?.onAdd;
   const resolved = useMemo(() => resolveGuideSectionFiles(guide, host.files), [guide, host.files]);
   // Only the guide's own files register shells; in-app the review may hold many more.
   const guideFileCount = resolved.sectionFiles.reduce((n, files) => n + files.length, 0) + resolved.unplacedFiles.length;
   const hasUnplaced = (guide.unplacedFiles?.length ?? 0) > 0;
-  const cardTotal = guide.sections.length + (hasUnplaced ? 1 : 0);
+  // The header counts sections, so the cards do too: "Everything else" is unnumbered.
+  const cardTotal = guide.sections.length;
   const reviewedCount = reviewed.filter(Boolean).length;
   const effectiveFocusedFile = focusedFile
     ?? resolved.sectionFiles.find((files) => files.length > 0)?.[0]?.path
@@ -120,6 +158,51 @@ export const GuideView: React.FC<GuideViewProps> = ({
     handleRequestReveal(activeSearchMatch.filePath);
   }, [activeSearchMatch?.id, activeSearchMatch?.filePath, handleRequestReveal]);
 
+  // Guide links (overview and chapter prose): `chapter:N` jumps to that
+  // chapter; `code:path` jumps to that file's diff when the guide shows it.
+  // Everything else (symbols, files outside the guide) stays plain text: the
+  // chain has no language server and no file to open outside the change.
+  const guideFilePaths = useMemo(
+    () => new Set([...resolved.sectionFiles.flat(), ...resolved.unplacedFiles].map((file) => file.path)),
+    [resolved],
+  );
+  const viewRef = useRef<HTMLDivElement>(null);
+  const jumpToChapter = useCallback(
+    (index: number) => {
+      const first = resolved.sectionFiles[index]?.[0];
+      if (first) {
+        handleRequestReveal(first.path);
+        return;
+      }
+      viewRef.current?.querySelector(`[data-guide-section="${index}"]`)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    },
+    [resolved, handleRequestReveal],
+  );
+  const renderLink = useCallback<GuideLinkRenderer>(
+    (href, label, key) => {
+      const parsed = parseGuideLink(href);
+      if (!parsed?.ok) return host.renderLink?.(href, label, key) ?? null;
+      const link = parsed.link;
+      let onClick: (() => void) | null = null;
+      if (link.kind === 'chapter' && link.chapter <= guide.sections.length) onClick = () => jumpToChapter(link.chapter - 1);
+      if (link.kind === 'code' && guideFilePaths.has(link.path)) onClick = () => handleRequestReveal(link.path);
+      if (!onClick) return host.renderLink?.(href, label, key) ?? null;
+      return (
+        <button
+          key={key}
+          type="button"
+          onClick={onClick}
+          data-guide-link={href}
+          title={link.kind === 'chapter' ? `Go to chapter ${link.chapter}` : `Go to ${link.kind === 'code' ? link.path : ''}`}
+          className="text-primary underline-offset-2 hover:underline"
+        >
+          {label}
+        </button>
+      );
+    },
+    [guide.sections.length, guideFilePaths, jumpToChapter, handleRequestReveal, host.renderLink],
+  );
+
   const unplacedSection = useMemo<GuideSection | null>(
     () =>
       hasUnplaced
@@ -132,11 +215,50 @@ export const GuideView: React.FC<GuideViewProps> = ({
     [guide.unplacedFiles, hasUnplaced],
   );
 
+  // The thread's heading holds the actions itself, on its title's line.
+  const actions = !threadHeading && (headerActions || addGlobalComment) ? (
+    <>
+      {addGlobalComment && <GuideGlobalCommentButton onAdd={addGlobalComment} />}
+      {headerActions}
+    </>
+  ) : null;
+  // The first card drawn: the first section, or "Everything else" when the guide has none.
+  const firstCardIndex = guide.sections.length > 0 ? 0 : unplacedSection ? guide.sections.length : -1;
+  const firstCardTab = bare && firstCardIndex >= 0 ? host.renderSectionTab?.(firstCardIndex, { folded: false, diffs: 1, title: '' }) : null;
+  const actionsOnTab = !!actions && !actionsHost && firstCardTab !== null && firstCardTab !== undefined && firstCardTab !== false;
+
   return (
-    <GuideViewportProvider className="w-full px-3 py-5 sm:px-6 sm:py-6 lg:px-10 lg:py-8" eager={guideFileCount <= GUIDE_EAGER_MOUNT_MAX_FILES}>
+    <GuideViewportProvider className={threadHeading ? 'gv-guide' : bare ? 'w-full px-4 pt-3.5 pb-6' : 'w-full px-3 py-5 sm:px-6 sm:py-6 lg:px-10 lg:py-8'} eager={guideFileCount <= GUIDE_EAGER_MOUNT_MAX_FILES} rootRef={rootRef}>
       {/* Header actions sit in a row above the title on narrow screens and float beside it from md up (desktop unchanged). */}
-      {headerActions && <div className="mb-3 flex items-center justify-end gap-2 md:float-right md:mb-0 md:ml-6">{headerActions}</div>}
-      <div className="max-w-[72ch]">
+      {/* The host's global comments add their button to the same row, ahead of the host's own controls. Bare (no title
+          to float beside), the row stays above the content at every width. */}
+      {/* Bare, with a tab on the first card (the Inbox's Split | Unified), the actions sit on the tab's row instead. */}
+      {actions && !actionsOnTab && actionsHost && createPortal(actions, actionsHost)}
+      {actions && !actionsOnTab && !actionsHost && (
+        <div className={bare ? 'mb-3 flex items-center justify-end gap-2' : 'mb-3 flex items-center justify-end gap-2 md:float-right md:mb-0 md:ml-6'}>
+          {actions}
+        </div>
+      )}
+      {threadHeading && (
+        <GuideHeading
+          title={guide.intent}
+          facts={[
+            ...(engineLabel ? `Written by ${engineLabel}`.split(' · ') : []),
+            ...(guide.moved ? ['Generated on a different version of this branch'] : []),
+            ...(typeof sourceLine === 'string' ? sourceLine.split(' · ').filter(Boolean) : sourceLine ? [sourceLine] : []),
+          ]}
+          actions={
+            (headActions || headerActions || addGlobalComment) && (
+              <>
+                {headActions}
+                {headerActions}
+                {addGlobalComment && <GuideGlobalCommentButton onAdd={addGlobalComment} />}
+              </>
+            )
+          }
+        />
+      )}
+      {!bare && !threadHeading && <div className="max-w-[72ch]">
         <h1 className="text-[22px] font-semibold tracking-tight text-foreground [text-wrap:balance]">{guide.title}</h1>
         {guide.intent && (
           <p className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground">{renderInlineMarkdown(guide.intent)}</p>
@@ -144,7 +266,7 @@ export const GuideView: React.FC<GuideViewProps> = ({
         <p className="mt-2 flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground/60">
           <span>
             {guide.sections.length} section{guide.sections.length !== 1 ? 's' : ''}
-            {reviewedCount > 0 && ` · ${reviewedCount}/${guide.sections.length} reviewed`}
+            {showReviewed && reviewedCount > 0 && ` · ${reviewedCount}/${guide.sections.length} reviewed`}
             {engineLabel && ` · generated by ${engineLabel}`}
           </span>
           {guide.saved && (
@@ -176,9 +298,14 @@ export const GuideView: React.FC<GuideViewProps> = ({
             )}
           </p>
         )}
-      </div>
+      </div>}
 
-      <div className="mt-6 space-y-4">
+      {host.globalComments && <GuideGlobalCommentList globalComments={host.globalComments} />}
+
+      {guide.overview && <GuideOverview overview={guide.overview} renderLink={renderLink} plain={threadHeading} />}
+      {!guide.overview?.diagram && overviewFigure}
+
+      <div ref={viewRef} className={threadHeading ? 'gv-chapters' : bare ? 'space-y-4' : 'mt-6 space-y-4'}>
         {guide.sections.map((section, index) => (
           <GuideSectionCard
             key={`${section.title}:${index}`}
@@ -187,11 +314,15 @@ export const GuideView: React.FC<GuideViewProps> = ({
             index={index}
             total={cardTotal}
             reviewed={!!reviewed[index]}
+            showReviewed={showReviewed}
             onToggleReviewed={() => onToggleReviewed(index)}
             focusedFile={effectiveFocusedFile}
             revealTarget={revealTarget}
             onActivate={onFocusFile}
             onRequestReveal={handleRequestReveal}
+            renderLink={renderLink}
+            fitFileHeights={fit}
+            {...(actionsOnTab && index === 0 ? { tabLead: actions } : {})}
           />
         ))}
 
@@ -202,10 +333,13 @@ export const GuideView: React.FC<GuideViewProps> = ({
             index={guide.sections.length}
             total={cardTotal}
             showReviewed={false}
+            numbered={false}
             focusedFile={effectiveFocusedFile}
             revealTarget={revealTarget}
             onActivate={onFocusFile}
             onRequestReveal={handleRequestReveal}
+            fitFileHeights={fit}
+            {...(actionsOnTab && firstCardIndex === guide.sections.length ? { tabLead: actions } : {})}
           />
         )}
       </div>

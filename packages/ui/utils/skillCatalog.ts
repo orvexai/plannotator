@@ -42,7 +42,7 @@ function normalizeEntry(raw: unknown): SkillCatalogEntry | null {
   const { name, root, description, humanOnly, dir } = raw as Record<string, unknown>;
   if (typeof name !== 'string' || !name) return null;
   const rootId: SkillRootId =
-    root === 'claude' || root === 'codex' || root === 'universal' ? root : 'universal';
+    root === 'claude' || root === 'codex' || root === 'universal' || root === 'plannotator' ? root : 'universal';
   return {
     name,
     root: rootId,
@@ -81,6 +81,18 @@ async function requestCatalog(): Promise<SkillCatalogEntry[]> {
   }
 }
 
+// Whether a fetched catalog is registered for the per-comment feedback export
+// (skillReferenceExportBlock). Default on: Plannotator's exporters list each
+// comment's references. A host that composes ONE block per message itself
+// (the Plannotator Inbox) turns it off, so a comment's `$name` stays plain
+// text in its export instead of carrying a second "Skills referenced" list.
+let exportRegistration = true;
+
+export function setSkillCatalogExportRegistration(on: boolean): void {
+  exportRegistration = on;
+  if (!on) setSkillCatalogForExport([]);
+}
+
 let cached: { at: number; skills: SkillCatalogEntry[] } | null = null;
 let inflight: Promise<SkillCatalogEntry[]> | null = null;
 // Bumped by resetSkillCatalogCache. A request that resolves after a reset (or
@@ -111,7 +123,7 @@ export function fetchSkillCatalog(): Promise<SkillCatalogEntry[]> {
     } else {
       cached = { at: Date.now(), skills: cached.skills };
     }
-    setSkillCatalogForExport(cached.skills);
+    if (exportRegistration) setSkillCatalogForExport(cached.skills);
     return cached.skills;
   });
   inflight = promise;
@@ -146,6 +158,27 @@ export function resetSkillCatalogCache(): void {
   resetSkillContentsForExport();
 }
 
+const reloadListeners = new Set<() => void>();
+
+/**
+ * The catalog changed at its source (a host switch that adds or removes
+ * skills, e.g. the Inbox's Code review): drop the cache, and every mounted
+ * composer reads it again at once (`onSkillCatalogReload`), so an open "/"
+ * list never offers, or paints, a skill that is gone.
+ */
+export function reloadSkillCatalog(): void {
+  resetSkillCatalogCache();
+  for (const listener of [...reloadListeners]) listener();
+}
+
+/** Called after each `reloadSkillCatalog`; returns the unsubscribe. */
+export function onSkillCatalogReload(listener: () => void): () => void {
+  reloadListeners.add(listener);
+  return () => {
+    reloadListeners.delete(listener);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Human-only skill contents (lazy, per referenced skill)
 // ---------------------------------------------------------------------------
@@ -176,7 +209,8 @@ export function resetSkillContentTransport(): void {
   contentTransport = defaultContentTransport;
 }
 
-function normalizeSkillContent(raw: unknown): SkillExportContent | null {
+/** A raw `{ content, truncated, dir, path }` record as an export content, or null when any part is missing. */
+export function normalizeSkillContent(raw: unknown): SkillExportContent | null {
   if (!raw || typeof raw !== 'object') return null;
   const { content, truncated, dir, path } = raw as Record<string, unknown>;
   if (typeof content !== 'string' || !content) return null;

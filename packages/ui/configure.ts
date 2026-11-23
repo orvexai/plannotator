@@ -7,18 +7,32 @@ import { setFileTreeBackend, type FileTreeBackend } from './hooks/useFileBrowser
 import { setDraftTransport, type DraftTransport } from './hooks/useAnnotationDraft';
 import { setExternalAnnotationTransport, type ExternalAnnotationTransport } from './hooks/useExternalAnnotations';
 import { setAITransport, type AITransport } from './hooks/useAIChat';
-import { setSkillCatalogTransport, setSkillContentTransport, type SkillCatalogTransport, type SkillContentTransport } from './utils/skillCatalog';
+import { setSkillCatalogExportRegistration, setSkillCatalogTransport, setSkillContentTransport, type SkillCatalogTransport, type SkillContentTransport } from './utils/skillCatalog';
 import { setWebMcpPolicy, type WebMcpPolicy } from './webmcp/policy';
 import { setMathRendererLoader, type MathRenderer, type MathRendererLoader } from './utils/math';
 import { setIdentityGenerator, type IdentityGenerator } from './utils/generateIdentity';
 import { setAlertIconRenderer, type AlertIconRenderer } from './components/blocks/AlertBlock';
+import { setSkillInstructionsDestination } from './components/SkillReferenceMenu';
 import { setFenceThemeResolver, type FenceThemeResolver } from './utils/syntaxTheme';
+import { setCodeHighlightWorker, setDeferOffscreenCodeHighlight, type CodeHighlightWorker } from './utils/codeHighlight';
 import { configStore } from './config';
 import type { ServerSyncFn } from './config/configStore';
 import type { ExternalAnnotationEvent, VaultNode } from './types';
+import { setComponentTooltips } from './components/HostTitle';
+import { setRichCopyEnabled } from './utils/richCopyPolicy';
+import { setCommentCardEnabled, setVisibleCommentDrafts, type CommentCardLayout } from './utils/commentCardPolicy';
+import { setTouchSelectionToolbar } from './utils/touchToolbarPlacement';
+import { setPageMarks } from './utils/pageMarks';
+import { setClickAWord } from './utils/clickAWordPolicy';
+import { setDiagramRemoteLoads } from './utils/diagramRemoteLoadsPolicy';
+import { setCrossRepoRefsWithoutRepo, setDigitHexIssueRefs, type CrossRepoRefsWithoutRepo } from './components/InlineMarkdown';
+import { setRefCardBitbucket, setRefCardTransport, type RefCardTransport } from './utils/refCard';
+import { setRefCardAction, type RefCardAction } from './utils/refCardAction';
+import { setRefCardClick } from './utils/refCardClick';
 
 // One-stop type barrel: every seam contract a host implements is importable
 // from this module, next to configurePlannotatorUI itself.
+export type { CommentCardLayout } from './utils/commentCardPolicy';
 export type {
   ImageSrcResolver,
   DocPreviewFetcher,
@@ -42,6 +56,9 @@ export type {
   IdentityGenerator,
   AlertIconRenderer,
   FenceThemeResolver,
+  RefCardTransport,
+  RefCardAction,
+  CodeHighlightWorker,
 };
 
 type ExternalAnnotationBase = { id: string; source?: string };
@@ -66,6 +83,19 @@ export interface PlannotatorUIConfig {
   skillCatalogTransport?: SkillCatalogTransport;
   /** Human-only skill contents request for feedback injection. Default: `GET /api/skills/content?name=` on the page origin. */
   skillContentTransport?: SkillContentTransport;
+  /**
+   * Register the fetched skill catalog for the per-comment feedback export
+   * (each comment's "Skills referenced" list). Default: true. A host that
+   * composes one block per message itself passes false, so a comment's
+   * `$name` stays plain text in its export.
+   */
+  skillReferenceExport?: boolean;
+  /**
+   * What a composer's "Includes skill instructions" line says a human-only
+   * skill's instructions go with. Default: "your feedback". The Plannotator
+   * Inbox, where a comment rides a reply, says "your reply".
+   */
+  skillInstructionsDestination?: string;
   serverSync?: ServerSyncFn;
   /**
    * WebMCP provider policy: `{ enabled, namePrefix }`. Default: enabled
@@ -104,6 +134,148 @@ export interface PlannotatorUIConfig {
    * pane keeps its own pair. An unknown theme name renders plain text.
    */
   fenceTheme?: FenceThemeResolver;
+  /**
+   * Draw ui's own hover text (the annotation panel's and toolbar's buttons, a
+   * question card's decision tag, a host-resolved local link's
+   * `LocalLinkResolution.title`) as ui's `Tooltip` instead of a native
+   * `title` (`components/HostTitle`). Default: false, native titles exactly
+   * as before. The Plannotator Inbox passes true.
+   */
+  componentTooltips?: boolean;
+  /**
+   * Render a digit-only 6/8-digit `#123456` (word boundary, no leading zero)
+   * as an issue ref instead of a hex colour swatch, when a ref link can be
+   * built (a repo on a known forge). Default: false, swatches exactly as
+   * before. The Plannotator Inbox passes true (#1932).
+   */
+  digitHexIssueRefs?: boolean;
+  /**
+   * Link an `owner/repo#123` ref where the text's caller names no repo of
+   * its own (`InlineMarkdown` without `githubRepo`). `true`: on github.com.
+   * `{ host }`: on that host, by `forgeRefLinks`' rule (GitLab's
+   * `/-/issues/N`; a host it cannot form a link for leaves refs plain).
+   * Default: false, such refs stay plain text exactly as before. A caller
+   * that names its repo is unchanged, and bare `#123` still needs that repo.
+   * May be called again later: mounted text re-renders with the new host.
+   * The Plannotator Inbox passes the host most of its projects use.
+   */
+  crossRepoRefsWithoutRepo?: CrossRepoRefsWithoutRepo;
+  /**
+   * Make the selection toolbar's Copy button (Viewer and HtmlViewer) copy rich
+   * text: text/html plus text/plain in one clipboard write, and show Copy
+   * where `hideCopyButton` hid it (the Viewer on desktop). Default: false,
+   * Copy exactly as before. Plannotator's plan review, annotate, code review
+   * and Inbox pass true (#1972, `utils/richCopyPolicy`).
+   */
+  richCopy?: boolean;
+  /**
+   * Draw `CommentPopover` as the small comment card (no header line, no
+   * blurred page behind, a chevron that closes and keeps the words, a solid
+   * "Comment" button at the row's right end). Import
+   * `@plannotator/ui/comment-card.css` with it. An object turns it on and
+   * names, as CSS selectors, the host's pane (where a docked card spans) and
+   * the things at its foot the card never covers. Default: false, the popover
+   * exactly as before. The Plannotator Inbox turns it on
+   * (`utils/commentCardPolicy`).
+   */
+  commentCard?: boolean | CommentCardLayout;
+  /**
+   * Keep a closed text-selection comment that holds words visible: a pale
+   * highlight and a floating "Draft" badge under the words' end, a press on
+   * either reopening the box (Viewer). Default: false, a closed box leaves no
+   * mark, as before. The Plannotator Inbox passes true.
+   */
+  visibleCommentDrafts?: boolean;
+  /**
+   * On a touch screen (main pointer a finger), put the selection toolbar
+   * (`AnnotationToolbar`) below the selection, where iOS Safari's own edit
+   * menu does not go, keep it inside the visible screen with an 8px margin
+   * and the safe-area insets, and give its buttons 44px targets
+   * (`utils/touchToolbarPlacement`).
+   * Default: false, the toolbar placed and sized exactly as before. With it
+   * on, nothing changes with a mouse or trackpad. Plannotator's plan review,
+   * annotate, code review and Inbox pass true.
+   */
+  touchSelectionToolbar?: boolean;
+  /**
+   * Mark the page's root while a part a theme.css or comments.css `:has()` on
+   * `html` or `body` keys on is there: `<body data-pn-popout>` while a popout
+   * dialog is open, `<html data-pn-selection-chooser>` while the diff's
+   * selection chooser shows (`utils/pageMarks`). For a host that rewrites
+   * those `:has()` selectors to the marks in its build: on a long page each
+   * such `:has()` costs a style pass over the whole document on every DOM
+   * change. Default: false, nothing is marked. The Plannotator Inbox passes
+   * true (build/inbox-page-marks.ts).
+   */
+  pageMarks?: boolean;
+  /**
+   * Click a word: in the Viewer's Select input method one click on a word
+   * highlights it (after 300 ms, so double and triple click stay the
+   * browser's), through the same path as a drag over that word
+   * (`hooks/useClickWord`, `utils/clickAWordPolicy`). Default: true. False: a
+   * click on text makes nothing, as before. A Viewer's own `clickAWord` prop
+   * wins over this. Read when a Viewer mounts.
+   */
+  clickAWord?: boolean;
+  /**
+   * Fetch an issue / PR / MR hover card's data (`components/RefHoverCard`).
+   * Default: none, so no card is drawn and nothing is requested. The
+   * Plannotator Inbox passes one over its `/api/inbox/ref` route.
+   */
+  refCardTransport?: RefCardTransport;
+  /**
+   * Bitbucket Cloud pull request links get a hover card too. Default: off, so
+   * they stay plain links. The Inbox turns it on: its server reads them.
+   */
+  refCardBitbucket?: boolean;
+  /**
+   * The host's own link on a ref card, left of "Open on GitHub" (`utils/refCardAction`): `(ref, result) => { label,
+   * open } | null`, asked each time a card draws. Default: none, only the forge's link. The Inbox gives "Open in
+   * Reviews" for a pull request its Reviews lists.
+   */
+  refCardAction?: RefCardAction | null;
+  /**
+   * A plain click, tap, Enter or Space on an issue / PR / MR reference written in prose (a `#12`, an `owner/repo#12`,
+   * a bare pasted URL to the page itself) opens its card pinned instead of following the link (`utils/refCardClick`).
+   * Default false: a click follows the link, as before. Any other link follows its href either way.
+   */
+  refCardClick?: boolean;
+  /**
+   * Highlight a code fence only when it comes near the screen (a screen
+   * above or below it), and the rest in idle time, nearest first
+   * (`utils/codeHighlight`). A fence on screen is still highlighted before
+   * it is drawn; one farther away keeps its plain text (the same characters
+   * and size) until then. For a host that shows many fences at once (a long
+   * thread), where highlighting all of them at once blocks the page for
+   * seconds. Default: false, every fence highlighted when it mounts, as
+   * before. The Plannotator Inbox passes true.
+   */
+  deferOffscreenCodeHighlight?: boolean;
+  /**
+   * With `deferOffscreenCodeHighlight`: make a waiting fence's markup off the
+   * main thread (`utils/codeHighlight` `CodeHighlightWorker`, e.g. a Web
+   * Worker with its own Shiki core). Only the markup is written on the page.
+   * Default: none, every fence's tokens made on the page. The Plannotator
+   * Inbox passes one (`packages/inbox/codeHighlightWorker.ts`).
+   */
+  codeHighlightWorker?: CodeHighlightWorker;
+  /**
+   * Whether a rendered diagram may load anything from another host: a
+   * label's picture or media, a style's `url()`, a picture node. Default:
+   * true, as before (the page's own policy decides). False, for a host that
+   * must never let a diagram call another host: Mermaid's label pass and the
+   * sanitizer keep only `#fragment` references and `data:` pictures
+   * (png, jpeg, gif, webp, avif), drop every style declaration and attribute
+   * that fetches, and directives and front matter can no longer set CSS
+   * (`themeCSS`, the font families). Some sources still load while Mermaid
+   * draws, before any sanitizer: a diagram's own `style` / `classDef`
+   * statements, which Mermaid applies itself (seen in state, class, block and
+   * treemap diagrams), plus picture nodes and sequence actor icons. For a
+   * guarantee the page's CSP is REQUIRED, not optional:
+   * `img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:`
+   * (HANDOFF.md "Diagrams that load nothing from another host"). Read at each render.
+   */
+  diagramRemoteLoads?: boolean;
   /** Re-hydrate settings from the installed (SYNCHRONOUS) storageBackend after install. */
   loadSettingsFromBackend?: boolean;
 }
@@ -120,12 +292,30 @@ export function configurePlannotatorUI(config: PlannotatorUIConfig): void {
   if (config.aiTransport) setAITransport(config.aiTransport);
   if (config.skillCatalogTransport) setSkillCatalogTransport(config.skillCatalogTransport);
   if (config.skillContentTransport) setSkillContentTransport(config.skillContentTransport);
+  if (config.skillReferenceExport !== undefined) setSkillCatalogExportRegistration(config.skillReferenceExport);
+  if (config.skillInstructionsDestination) setSkillInstructionsDestination(config.skillInstructionsDestination);
   if (config.serverSync) configStore.setServerSync(config.serverSync);
   if (config.webmcp) setWebMcpPolicy(config.webmcp);
   if (config.mathRendererLoader) setMathRendererLoader(config.mathRendererLoader);
   if (config.identityGenerator) setIdentityGenerator(config.identityGenerator);
   if (config.alertIconRenderer) setAlertIconRenderer(config.alertIconRenderer);
   if (config.fenceTheme) setFenceThemeResolver(config.fenceTheme);
+  if (config.componentTooltips !== undefined) setComponentTooltips(config.componentTooltips);
+  if (config.digitHexIssueRefs !== undefined) setDigitHexIssueRefs(config.digitHexIssueRefs);
+  if (config.crossRepoRefsWithoutRepo !== undefined) setCrossRepoRefsWithoutRepo(config.crossRepoRefsWithoutRepo);
+  if (config.richCopy !== undefined) setRichCopyEnabled(config.richCopy);
+  if (config.commentCard !== undefined) setCommentCardEnabled(config.commentCard);
+  if (config.visibleCommentDrafts !== undefined) setVisibleCommentDrafts(config.visibleCommentDrafts);
+  if (config.touchSelectionToolbar !== undefined) setTouchSelectionToolbar(config.touchSelectionToolbar);
+  if (config.pageMarks !== undefined) setPageMarks(config.pageMarks);
+  if (config.clickAWord !== undefined) setClickAWord(config.clickAWord);
+  if (config.diagramRemoteLoads !== undefined) setDiagramRemoteLoads(config.diagramRemoteLoads);
+  if (config.refCardTransport) setRefCardTransport(config.refCardTransport);
+  if (config.refCardBitbucket !== undefined) setRefCardBitbucket(config.refCardBitbucket);
+  if (config.refCardAction !== undefined) setRefCardAction(config.refCardAction);
+  if (config.refCardClick !== undefined) setRefCardClick(config.refCardClick);
+  if (config.deferOffscreenCodeHighlight !== undefined) setDeferOffscreenCodeHighlight(config.deferOffscreenCodeHighlight);
+  if (config.codeHighlightWorker) setCodeHighlightWorker(config.codeHighlightWorker);
   // Re-hydrate AFTER storageBackend is installed (load-bearing order — gated last).
   if (config.loadSettingsFromBackend) configStore.loadFromBackend();
 }

@@ -1,5 +1,5 @@
 /**
- * Phones in the Inbox window's Settings → Devices (mobile plan steps P1 and
+ * Phones in the Inbox window's Settings → Remote devices (mobile plan steps P1 and
  * P2; adr/implementation/inbox-mobile.md sections 1 to 3; Pair a phone as a
  * guided flow, design of record `.product/approved/inbox-settings-tabs/`),
  * proved in a real browser against the compiled binary under a temp
@@ -33,7 +33,7 @@
  * PNGs, light and dark at 1440 by 900, land in .local/proof/phones/.
  */
 
-import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import { expect, test, type Browser, type BrowserContext, type Page } from './inbox-test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -41,6 +41,7 @@ import { qrModules } from '../../packages/inbox/qr';
 import { pinnedRequest } from '../helpers/pinned-phone';
 import { E2E_MAGIC as MAGIC, fakeTailscale } from './fake-tailscale';
 import { inboxScratch, removeInboxScratch, stopScratchInbox } from './inbox-scratch';
+import { NO_BROWSER } from '../helpers/no-browser';
 
 const repo = resolve(__dirname, '../..');
 const binary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
@@ -101,7 +102,7 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   const root = inboxScratch('plannotator-inbox-phones-e2e-');
   const dataDir = join(root, 'data');
   const ts = fakeTailscale(join(root, 'ts'));
-  const env = { PATH: `${ts}:${process.env.PATH ?? ''}`, HOME: root, PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
+  const env = { PATH: `${ts}:${process.env.PATH ?? ''}`, HOME: root, PLANNOTATOR_DATA_DIR: dataDir, PLANNOTATOR_BROWSER: NO_BROWSER, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'light' });
@@ -248,7 +249,7 @@ test("the owner's no-loop rule: Tailscale's check says signed out, its switch is
   expect(world.errors).toEqual([]);
 });
 
-test("a code closed by five wrong tries, and the Tailscale switch's two error states (a mapping that is not the Inbox's on 8443; Tailscale stopped)", async () => {
+test("a code closed by five wrong tries, and the Tailscale switch's two error states (mappings that are not the Inbox's on every port from 8443 to 8450; Tailscale stopped)", async () => {
   const { page } = world;
   await page.goto('about:blank');
   await page.goto(`${world.url}#settings/devices/pair`);
@@ -270,15 +271,21 @@ test("a code closed by five wrong tries, and the Tailscale switch's two error st
   await expect(mine).toHaveAttribute('aria-checked', 'false');
 
   // A second Inbox whose `tailscale` is a script on PATH, so CI and this Mac show the same states without a tailnet.
+  // Every port the door may take is held by a mapping that is not the Inbox's.
   const root = inboxScratch('plannotator-inbox-phones-tailscale-');
   const bin = join(root, 'bin');
   mkdirSync(bin);
+  const held = [8443, 8444, 8445, 8446, 8447, 8448, 8449, 8450];
+  const taken = JSON.stringify({
+    TCP: Object.fromEntries(held.map((p) => [String(p), { HTTPS: true }])),
+    Web: Object.fromEntries(held.map((p) => [`x.ts.net:${p}`, { Handlers: { '/': { Proxy: 'http://127.0.0.1:3000' } } }])),
+  });
   writeFileSync(
     join(bin, 'tailscale'),
-    `#!/bin/sh\nif [ "$(cat '${join(root, 'mode')}')" = down ]; then echo 'Tailscale is stopped.' >&2; exit 1; fi\nif [ "$1" = serve ] && [ "$2" = status ]; then echo '{"TCP":{"8443":{"HTTPS":true}},"Web":{"x.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}'; exit 0; fi\nexit 1\n`,
+    `#!/bin/sh\nif [ "$(cat '${join(root, 'mode')}')" = down ]; then echo 'Tailscale is stopped.' >&2; exit 1; fi\nif [ "$1" = serve ] && [ "$2" = status ]; then echo '${taken}'; exit 0; fi\nexit 1\n`,
   );
   chmodSync(join(bin, 'tailscale'), 0o755);
-  const env = { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
+  const env = { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: NO_BROWSER, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   const other = await world.context.newPage();
@@ -288,7 +295,7 @@ test("a code closed by five wrong tries, and the Tailscale switch's two error st
     const phones = other.locator('[data-settings-phones]');
     const toggle = other.getByRole('switch', { name: 'Tailscale', exact: true });
     for (const [mode, words, name] of [
-      ['taken', 'Another tailscale serve mapping already uses port 8443', 'settings-phones-tailnet-port-taken'],
+      ['taken', 'Other tailscale serve mappings already use every port the Inbox can take (8443 to 8450)', 'settings-phones-tailnet-port-taken'],
       ['down', 'Tailscale could not publish the Inbox', 'settings-phones-tailnet-unavailable'],
     ] as const) {
       writeFileSync(join(root, 'mode'), mode);
@@ -349,7 +356,7 @@ test('This Wi-Fi: turned on in step 1, the code carries the address and the cert
   await flow.getByRole('button', { name: 'Done' }).click();
   await expect(page.locator('[data-lan-address]')).toHaveAttribute('data-lan-address', lan);
   await expect(page.locator('[data-lan-fingerprint]')).toHaveAttribute('data-lan-fingerprint', fingerprint);
-  await expect(page.locator('[data-lan-fingerprint] .ib-sfp')).toHaveAttribute('title', fingerprint.match(/.{4}/g)!.join(' '));
+  await expect(page.locator('[data-lan-fingerprint] .ib-sfp')).toHaveAttribute('data-fingerprint', fingerprint.match(/.{4}/g)!.join(' '));
   const bonjour = process.platform === 'darwin' || onPath('avahi-publish') !== null;
   await expect(page.locator('[data-lan-no-bonjour]')).toHaveCount(bonjour ? 0 : 1);
   // A phone holding another fingerprint refuses the connection itself.
@@ -374,7 +381,7 @@ test('This Wi-Fi where nothing can announce it (no Bonjour) and where openssl fa
   writeFileSync(join(root, 'mode'), 'ok');
   writeFileSync(join(bin, 'openssl'), `#!/bin/sh\nread mode < '${join(root, 'mode')}'\nif [ "$mode" = broken ]; then echo 'openssl: broken' >&2; exit 1; fi\nexec '${real!}' "$@"\n`);
   chmodSync(join(bin, 'openssl'), 0o755);
-  const env = { PATH: bin, HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
+  const env = { PATH: bin, HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: NO_BROWSER, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1', PLANNOTATOR_TEST_SANDBOX: root };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   const other = await world.context.newPage();
@@ -434,7 +441,7 @@ test('Tailscale for phones: the door answers at the MagicDNS name on 8443, nothi
   test.skip(process.env.PLANNOTATOR_E2E_TAILNET !== '1', 'needs a Mac signed in to Tailscale (PLANNOTATOR_E2E_TAILNET=1)');
   // A real tailnet: an Inbox whose PATH is the person's own (the scripted tailscale is not on it).
   const root = inboxScratch('plannotator-inbox-phones-real-tailnet-');
-  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
+  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: NO_BROWSER, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_INBOX_PHONES: '1' };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   const page = await world.context.newPage();

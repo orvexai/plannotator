@@ -14,9 +14,13 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { PlannotatorMod } from '../controller'
-import type { Host, HttpResult, ProcessResult } from '../host'
+import { submitOrThrow, type Host, type HttpResult, type ProcessResult } from '../host'
 import { discoverInboxTools } from '../inbox'
+import { disposesOnSessionEnd, healAction } from '../self-heal'
 import type { InboxToolInfo } from '../inbox-contract'
+
+/** What Claude Code's `$.prompt.submit` resolves `{ drop }` with after the person stopped the session. */
+export const STOPPED_DROP_REASON = 'the session was stopped and nobody has sent input since'
 
 /** The engine's frame around a plugin's prompt at `turn.start`. */
 export const PLUGIN_FRAME = 'The plannotator plugin sent a message: '
@@ -33,24 +37,36 @@ export interface RealHostOptions {
 export interface RealHost extends Host {
   /** What `$.prompt.submit` was asked to send, in order. */
   submits: string[]
+  /** User rows `$.session.append` put into the conversation (Send now), in order. */
+  appended: string[]
+  /** Notices `$.session.append` put into the transcript, in order. */
+  notices: string[]
   toasts: string[]
   logs: string[]
   aborted: string[]
   fetches: string[]
   timers: Set<ReturnType<typeof setInterval>>
-  /** Set by the session: `$.prompt.submit`'s turn. */
-  onSubmit: (text: string) => Promise<void>
+  /** Set by the session: `$.prompt.submit`'s turn; what it resolves with (`{ drop }`: refused) goes through register.ts's reading. */
+  onSubmit: (text: string) => Promise<unknown>
+  /** Called as `$.session.append` stores a user row (a test ends the turn here). */
+  onAppend: (text: string) => Promise<void>
+  /** Called before every `$.process.run` (a test acts at a given step, e.g. the delivery claim). */
+  onRun: (argv: readonly string[]) => void
 }
 
 export function realHost(options: RealHostOptions): RealHost {
   const host: RealHost = {
     submits: [],
+    appended: [],
+    notices: [],
     toasts: [],
     logs: [],
     aborted: [],
     fetches: [],
     timers: new Set(),
     onSubmit: async () => undefined,
+    onAppend: async () => undefined,
+    onRun: () => undefined,
     now: async () => Date.now(),
     sleep: (ms, signal) =>
       new Promise((resolve, reject) => {
@@ -79,6 +95,7 @@ export function realHost(options: RealHostOptions): RealHost {
       }
     },
     run: async (argv, init) => {
+      host.onRun(argv)
       const proc = Bun.spawn([...argv], {
         cwd: init?.cwd ?? options.cwd,
         env: { ...options.env, ...init?.env },
@@ -102,9 +119,18 @@ export function realHost(options: RealHostOptions): RealHost {
     storeSet: async (key, value) => {
       options.store.set(key, JSON.parse(JSON.stringify(value)))
     },
-    submit: async (text) => {
-      host.submits.push(text)
-      await host.onSubmit(text)
+    submit: (text) =>
+      submitOrThrow(async () => {
+        host.submits.push(text)
+        return host.onSubmit(text)
+      }),
+    appendUserRow: async (text) => {
+      host.appended.push(text)
+      await host.onAppend(text)
+    },
+    sessionAppendAvailable: async () => true,
+    appendNotice: async (text) => {
+      host.notices.push(text)
     },
     suggest: async () => undefined,
     status: () => undefined,
@@ -137,7 +163,10 @@ export class ClaudeSession {
   turns: { id: string; text: string }[] = []
   /** Keep the plugin's turns running until `endTurn` (default: they answer at once). */
   holdPluginTurns = false
-  private idleWaiters: (() => void)[] = []
+  /** Why plugin prompts are dropped now (`stop`), until the person types; null: they go in. */
+  inputHeld: string | null = null
+  private idleWaiters: ((discarded: boolean) => void)[] = []
+  private discarding = false
   private sequence = 0
 
   private constructor(host: RealHost, mod: PlannotatorMod, inboxTools: readonly InboxToolInfo[] | null, private readonly dataDir: string, private readonly cwd: string) {
@@ -166,13 +195,24 @@ export class ClaudeSession {
 
   /** `/clear`: `session.end` disposes the instance; the next hook makes one for the new id (register.ts `currentMod`). */
   clear(newSessionId: string): void {
-    this.mod.dispose()
+    const previous = this.mod
+    previous.dispose()
     this.mod = new PlannotatorMod(this.host, {
       sessionId: newSessionId,
       dataDir: this.dataDir,
       interactive: true,
       ...(this.inboxTools ? { inboxTools: this.inboxTools, cwd: async () => this.cwd } : {}),
     })
+    this.mod.carryQueued(previous)
+  }
+
+  /**
+   * An engine that discards the plugin prompts still waiting for idle (a build
+   * that does so at `/clear`): their `$.prompt.submit` rejects when the running
+   * turn ends, and no turn starts for them.
+   */
+  discardQueuedPrompts(): void {
+    this.discarding = true
   }
 
   /** The process quits (or the session ends for good). */
@@ -180,6 +220,55 @@ export class ClaudeSession {
     this.mod.dispose()
     for (const timer of this.host.timers) clearInterval(timer)
     this.host.timers.clear()
+  }
+
+  /** When this session's own `endSession` disposed the instance (self-heal.ts `healAction`). */
+  private endedAt: number | null = null
+
+  /**
+   * `session.end` raised with `sessionId` (and `agentId` for a subagent's): the
+   * instance is disposed only when register.ts would (`disposesOnSessionEnd`).
+   * The process goes on either way. Returns whether it disposed.
+   */
+  endSession(sessionId: string, agentId?: string): boolean {
+    const current = this.mod.isDisposed ? null : this.mod
+    const disposes = disposesOnSessionEnd(current ? current.session : null, { sessionId, ...(agentId ? { agentId } : {}) })
+    if (current && disposes) {
+      current.dispose()
+      this.endedAt = Date.now()
+    }
+    return disposes
+  }
+
+  /**
+   * A stand-in for register.ts's self-heal (whose wiring
+   * register-self-heal.test.ts proves on the real hooks), every `everyMs`
+   * (MOD_HEAL_EVERY_MS there), for proofs against a real Inbox: a
+   * disposed instance is made again for the same session id, quietly (no
+   * touch), and a live one's Inbox tick is looked at.
+   */
+  startSelfHeal(everyMs: number): void {
+    let healing = false
+    this.host.every(everyMs, () => {
+      if (healing) return
+      healing = true
+      void (async () => {
+        const action = healAction(this.mod, this.endedAt, Date.now(), everyMs)
+        if (action === 'check') return await this.mod.inbox?.ensureTicking()
+        if (action === 'wait') return
+        const previous = this.mod
+        this.mod = new PlannotatorMod(this.host, {
+          sessionId: previous.session.sessionId,
+          dataDir: this.dataDir,
+          interactive: true,
+          healed: true,
+          ...(this.inboxTools ? { inboxTools: this.inboxTools, cwd: async () => this.cwd } : {}),
+        })
+        this.mod.carryQueued(previous)
+      })().finally(() => {
+        healing = false
+      })
+    })
   }
 
   /** The tool call register.ts answers for `mcp__plannotator__plannotator_inbox`. */
@@ -196,26 +285,66 @@ export class ClaudeSession {
     return id
   }
 
-  endTurn(answer = 'Done.'): void {
+  /** A main-loop model request of the running turn goes out (`turn.step`). */
+  step(): void {
+    if (this.running) this.mod.onMainStep(this.running.id)
+  }
+
+  /** The running turn completes; `aborted` as the engine reports a turn `$.turn.abort` stopped. */
+  endTurn(answer = 'Done.', aborted = false): void {
     const turn = this.running
     if (!turn) return
     this.running = null
-    this.mod.onTurnComplete(turn.id, answer, false)
-    for (const wake of this.idleWaiters.splice(0)) wake()
+    this.mod.onTurnComplete(turn.id, answer, aborted)
+    const discarded = this.discarding
+    this.discarding = false
+    for (const wake of this.idleWaiters.splice(0)) wake(discarded)
+  }
+
+  /**
+   * Claude Code holds plugins' input (the person stopped the session, Esc or a
+   * remote interrupt; seen too after an idle compaction): a running turn ends
+   * aborted, and until someone types every plugin prompt is dropped
+   * (`$.prompt.submit` resolves `{ drop: reason }`, which the mod reads as
+   * `PromptDropped`) without starting a turn.
+   */
+  stop(reason: string = STOPPED_DROP_REASON): void {
+    this.endTurn('', true)
+    this.inputHeld = reason
   }
 
   /** The person presses Enter: at idle it starts a turn; mid-turn it joins the running one (take-over). */
   async type(text: string): Promise<void> {
+    this.inputHeld = null
     const ref = { fromUs: false, originKind: 'composer', ...(this.running ? { turnId: this.running.id } : {}) }
     this.mod.onPromptSubmitting(ref)
     this.mod.onPromptEntered({ ...ref, text })
     if (!this.running) await this.startTurn(text)
   }
 
-  /** `$.prompt.submit`: waits for idle, then its turn starts under the plugin's frame. */
-  private async pluginTurn(text: string): Promise<void> {
-    while (this.running) await new Promise<void>((resolve) => this.idleWaiters.push(resolve))
+  /**
+   * Another plugin's `$.prompt.submit` (a connector delivering its own message), at idle: our
+   * prompt.submit hook sees it bare with origin `plugin`, then its turn starts under that plugin's frame.
+   */
+  async otherPluginPrompt(name: string, text: string): Promise<string> {
+    if (this.running) throw new Error('another plugin prompts at idle')
+    const ref = { fromUs: false, originKind: 'plugin' }
+    this.mod.onPromptSubmitting(ref)
+    this.mod.onPromptEntered({ ...ref, text })
+    return this.startTurn(`The ${name} plugin sent a message: ${text}`)
+  }
+
+  /** `$.prompt.submit`: waits for idle, then its turn starts under the plugin's frame; resolves `{ drop }` while input is held. */
+  private async pluginTurn(text: string): Promise<{ drop: string } | undefined> {
+    if (this.inputHeld !== null) return { drop: this.inputHeld }
+    while (this.running) {
+      const discarded = await new Promise<boolean>((resolve) => this.idleWaiters.push(resolve))
+      if (discarded) throw new Error('The engine discarded the prompt.')
+      // Waiting when the person stopped the session: dropped with the others.
+      if (this.inputHeld !== null) return { drop: this.inputHeld }
+    }
     await this.startTurn(`${PLUGIN_FRAME}${text}`)
     if (!this.holdPluginTurns) setTimeout(() => this.endTurn('Thanks, on it.'), 20)
+    return undefined
   }
 }

@@ -12,6 +12,7 @@ import {
 	getVcsDiffFingerprint,
 	getVcsFileContentsForDiff,
 	getVcsFileBytesForDiff,
+	listVcsFiles,
 	canStageFiles,
 	runVcsDiff,
 	stageFile,
@@ -30,6 +31,7 @@ import type { AnnotateBundleFile } from "./generated/annotate-bundle.ts";
 import { openBrowser, isRemoteSession } from "./server/network.ts";
 import { detectProjectName } from "./server/project.ts";
 import { parsePRUrl, checkPRAuth, fetchPR } from "./server/pr.ts";
+import { reviewRuntimeWithEnv } from "./server/vcs.ts";
 import {
 	getMRLabel,
 	getMRNumberLabel,
@@ -43,7 +45,7 @@ import {
 } from "./generated/pr-provider.ts";
 import { parseRemoteUrl } from "./generated/repo.ts";
 import { fetchRef, createWorktree, removeWorktree, ensureObjectAvailable } from "./generated/worktree.ts";
-import { loadConfig, resolveDefaultDiffType, resolveSharingEnabled } from "./generated/config.ts";
+import { loadConfig, resolveDefaultDiffType, resolveDefaultDiffTypeFor, resolveSharingEnabled } from "./generated/config.ts";
 import {
 	WorkspaceReviewSession,
 	type WorkspaceDiffType,
@@ -54,7 +56,18 @@ import {
 	getStartupErrorMessage,
 	hasPlanBrowserHtml,
 	hasReviewBrowserHtml,
+	reviewDiagramEngineDirectory,
+	reviewSemDiffDirectory,
 } from "./plannotator-browser-runtime.ts";
+import { diagramEngineSourcesFromDir, type DiagramEngineSources } from "./generated/diagram-engine-assets.ts";
+import { semDiffSourcesFromDir, type SemDiffSources } from "./generated/sem-diff-assets.ts";
+
+/** The diagram engine files, read once per extension process (the first review that needs them). */
+let reviewDiagramEngineSources: Promise<DiagramEngineSources | null> | undefined;
+const readReviewDiagramEngine = () =>
+	(reviewDiagramEngineSources ??= diagramEngineSourcesFromDir(reviewDiagramEngineDirectory)());
+let reviewSemDiffSources: Promise<SemDiffSources | null> | undefined;
+const readReviewSemDiff = () => (reviewSemDiffSources ??= semDiffSourcesFromDir(reviewSemDiffDirectory)());
 export { getLastAssistantMessageText } from "./assistant-message.ts";
 export {
 	getStartupErrorMessage,
@@ -135,6 +148,8 @@ type CodeReviewOptions = {
 	 * `config.gitRemoteCheck`.
 	 */
 	gitRemoteCheck?: boolean;
+	/** The caller shows the URL in its own in-turn message (`sessionOpenedMessage`). */
+	announcedInTurn?: boolean;
 };
 
 export type CodeReviewDecision = {
@@ -251,12 +266,27 @@ export async function startServerWithSelfPreemption<T>(
 	}
 }
 
-async function openBrowserForServer(serverUrl: string, ctx: ExtensionContext): Promise<void> {
+/**
+ * Open the browser, then tell the person what they need after the turn.
+ *
+ * Slash commands, the `plannotator` tool and plan review show the URL in
+ * their in-turn "opened" message (`sessionOpenedMessage`), so for them this
+ * only speaks up when the launch failed. The archive and the event API have
+ * no in-turn message, so they get the URL here.
+ */
+async function openBrowserForServer(serverUrl: string, ctx: ExtensionContext, announcedInTurn = false): Promise<void> {
 	const browserResult = await openBrowser(serverUrl);
-	if (ctx.mode === "rpc" || isRemoteSession()) {
-		ctx.ui.notify(`[Plannotator] ${serverUrl}`, "info");
-	} else if (!browserResult.opened) {
-		ctx.ui.notify(`Open this URL to review: ${serverUrl}`, "info");
+	// PLANNOTATOR_BROWSER=none is a choice, not a failure: the in-turn message
+	// already said so, and a caller without one says it here.
+	const notOpening = browserResult.notOpening;
+	const failedLocally = !notOpening && !isRemoteSession() && !browserResult.opened;
+	if (!announcedInTurn) {
+		const suffix = notOpening
+			? ` — ${notOpening}`
+			: failedLocally ? " (could not open a browser automatically; open this URL)" : "";
+		ctx.ui.notify(`Plannotator session ready: ${serverUrl}${suffix}`, "info");
+	} else if (failedLocally) {
+		ctx.ui.notify(`Could not open a browser automatically. Open ${serverUrl} to review.`, "info");
 	}
 }
 
@@ -272,6 +302,7 @@ async function buildLocalWorkspaceReview(
 		runVcsDiff,
 		getVcsFileContentsForDiff,
 		getVcsFileBytesForDiff,
+		listVcsFiles,
 		getVcsDiffFingerprint,
 		canStageFiles,
 		stageFile,
@@ -314,6 +345,7 @@ export function startBrowserDecisionSession<T>(
 	ctx: ExtensionContext,
 	waitForResult: () => Promise<T>,
 	signal?: AbortSignal,
+	options: { announcedInTurn?: boolean } = {},
 ): BrowserDecisionSession<T> {
 	let stopped = false;
 	let stopReject: ((err: Error) => void) | undefined;
@@ -337,7 +369,7 @@ export function startBrowserDecisionSession<T>(
 		// Nothing may escape: an unhandled rejection here (a launcher that failed,
 		// or a `ctx` invalidated by a session replacement while the browser was
 		// opening) is an uncaught error that kills the whole pi process.
-		void openBrowserForServer(server.url, ctx).catch((err: unknown) => {
+		void openBrowserForServer(server.url, ctx, options.announcedInTurn === true).catch((err: unknown) => {
 			console.error(
 				`Plannotator: could not announce the browser URL ${server.url}: ${err instanceof Error ? err.message : String(err)}`,
 			);
@@ -373,7 +405,7 @@ export async function startPlanReviewBrowserSession(
 	ctx: ExtensionContext,
 	planContent: string,
 	signal?: AbortSignal,
-	options: { sessionBridge?: SessionBridge; planRevisions?: boolean } = {},
+	options: { sessionBridge?: SessionBridge; planRevisions?: boolean; announcedInTurn?: boolean } = {},
 ): Promise<PlanReviewBrowserSession> {
 	if (!ctx.hasUI) {
 		throw new Error("Plannotator browser review is unavailable in this session.");
@@ -392,9 +424,14 @@ export async function startPlanReviewBrowserSession(
 		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
 		sessionBridge: options.sessionBridge,
 		planRevisions: options.planRevisions,
+		// Pi delivers an approval's notes (deliverPlanDecision's approved-with-
+		// notes prompt; the event API's review result carries `feedback`).
+		approvalNotesSupported: true,
 	}));
 
-	const session = startBrowserDecisionSession(server, ctx, server.waitForDecision, signal);
+	const session = startBrowserDecisionSession(server, ctx, server.waitForDecision, signal, {
+		announcedInTurn: options.announcedInTurn,
+	});
 	server.onDecision(() => {
 		setTimeout(() => session.stop(), 1500);
 	});
@@ -427,6 +464,11 @@ export async function openCodeReview(
 ): Promise<CodeReviewDecision> {
 	const session = await startCodeReviewBrowserSession(ctx, options);
 	return session.waitForDecision();
+}
+
+export function piLiveReviewAgent(ctx: unknown): { host: "pi"; session: string } | null {
+	const session = (ctx as { sessionManager?: { getSessionId?: () => string | undefined } } | null)?.sessionManager?.getSessionId?.();
+	return typeof session === "string" && session ? { host: "pi", session } : null;
 }
 
 export async function startCodeReviewBrowserSession(
@@ -496,18 +538,26 @@ async function createCodeReviewBrowserSession(
 				"Supported formats:\n" +
 				"  GitHub: https://github.com/owner/repo/pull/123\n" +
 				"  GitLab: https://gitlab.com/group/project/-/merge_requests/42\n" +
-				"  Bitbucket Cloud: https://bitbucket.org/workspace/repo/pull-requests/7",
+				"  Bitbucket Cloud: https://bitbucket.org/workspace/repo/pull-requests/7\n" +
+				"  Forgejo / Gitea: https://codeberg.org/owner/repo/pulls/5",
 			);
 		}
 
 		const cliName = getCliName(prRef);
 		const cliUrl = getCliInstallUrl(prRef);
 
+		// For a GitHub PR the active gh account can't see, another signed-in
+		// account that can is used for this review only (#2157): its gh calls
+		// go through the provider's per-repo override, and the checkout's
+		// clone and fork fetch below get its token as well.
+		let ghAccountEnv: Record<string, string> | undefined;
 		try {
-			await checkPRAuth(prRef);
+			const access = await checkPRAuth(prRef);
+			if (access.notice) ctx.ui.notify(access.notice, "info");
+			ghAccountEnv = access.childEnv;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			// REST-only platforms (Bitbucket) have no CLI to be missing; their auth
+			// REST-only platforms (Bitbucket, Forgejo) have no CLI to be missing; their auth
 			// error already names the env vars and token scopes to set.
 			if (cliName && (msg.includes("not found") || msg.includes("ENOENT"))) {
 				throw new Error(`${getPlatformLabel(prRef)} CLI (${cliName}) is not installed. Install it from ${cliUrl}`);
@@ -531,6 +581,8 @@ async function createCodeReviewBrowserSession(
 			let sessionDir: string | undefined;
 			try {
 				const repoDir = options.cwd ?? ctx.cwd;
+				// This PR's checkout fetches run as the gh account chosen for it (#2157).
+				const checkoutRuntime = ghAccountEnv ? reviewRuntimeWithEnv(ghAccountEnv) : reviewRuntime;
 				const identifier = `${getDisplayRepo(prMetadata).replace(/\//g, "-")}-${getPRNumber(prMetadata)}`;
 				const suffix = Math.random().toString(36).slice(2, 8);
 				const prNumber = getPRNumber(prMetadata);
@@ -543,8 +595,8 @@ async function createCodeReviewBrowserSession(
 				const headRemote = headFetch.remote ?? "origin";
 				// A fork URL fetch must never stop to prompt for credentials.
 				const fetchHead = async (args: string[], cwd: string) => {
-					if (!headFetch.remote) return reviewRuntime.runGit(args, { cwd });
-					const r = spawnSync("git", args, { cwd, encoding: "utf-8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+					if (!headFetch.remote) return checkoutRuntime.runGit(args, { cwd });
+					const r = spawnSync("git", args, { cwd, encoding: "utf-8", env: { ...process.env, ...ghAccountEnv, GIT_TERMINAL_PROMPT: "0" }, windowsHide: true });
 					return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", exitCode: r.status ?? 1 };
 				};
 
@@ -555,7 +607,7 @@ async function createCodeReviewBrowserSession(
 				// Detect same-repo vs cross-repo (must match both owner/repo AND host)
 				let isSameRepo = false;
 				try {
-					const remoteResult = await reviewRuntime.runGit(["remote", "get-url", "origin"], { cwd: repoDir });
+					const remoteResult = await checkoutRuntime.runGit(["remote", "get-url", "origin"], { cwd: repoDir });
 					if (remoteResult.exitCode === 0) {
 						const remoteUrl = remoteResult.stdout.trim();
 						const currentRepo = parseRemoteUrl(remoteUrl);
@@ -572,16 +624,16 @@ async function createCodeReviewBrowserSession(
 				if (isSameRepo) {
 					// ── Same-repo: fast worktree path ──
 					setCodeReviewProgress(ctx, `Preparing local ${getMRLabel(prRef)} checkout...`);
-					await fetchRef(reviewRuntime, prMetadata.baseBranch, { cwd: repoDir });
-					await ensureObjectAvailable(reviewRuntime, prMetadata.baseSha, { cwd: repoDir });
+					await fetchRef(checkoutRuntime, prMetadata.baseBranch, { cwd: repoDir });
+					await ensureObjectAvailable(checkoutRuntime, prMetadata.baseSha, { cwd: repoDir });
 					if (headFetch.remote) {
 						const res = await fetchHead(["fetch", headRemote, "--", fetchRefStr], repoDir);
 						if (res.exitCode !== 0) throw new Error(`git fetch ${headRemote} ${fetchRefStr} failed: ${res.stderr.trim()}`);
 					} else {
-						await fetchRef(reviewRuntime, fetchRefStr, { cwd: repoDir });
+						await fetchRef(checkoutRuntime, fetchRefStr, { cwd: repoDir });
 					}
 
-					await createWorktree(reviewRuntime, {
+					await createWorktree(checkoutRuntime, {
 						ref: "FETCH_HEAD",
 						path: localPath,
 						detach: true,
@@ -592,7 +644,7 @@ async function createCodeReviewBrowserSession(
 					exitHandler = () => {
 						try {
 							for (const entry of worktreePool?.entries() ?? []) {
-								spawnSync("git", ["worktree", "remove", "--force", entry.path], { cwd: wtRepoDir });
+								spawnSync("git", ["worktree", "remove", "--force", entry.path], { cwd: wtRepoDir, env: process.env, windowsHide: true });
 							}
 						} catch {}
 						if (sessionDir) try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
@@ -610,11 +662,11 @@ async function createCodeReviewBrowserSession(
 					// gh/glab repo clone doesn't accept --hostname, so the clone
 					// command carries GH_HOST/GITLAB_HOST env overrides instead.
 					const cloneCommand = getPRCloneCommand(prMetadata, localPath);
-					const cloneEnv = cloneCommand.env ? { ...process.env, ...cloneCommand.env } : undefined;
+					const cloneEnv = cloneCommand.env || ghAccountEnv ? { ...process.env, ...ghAccountEnv, ...cloneCommand.env } : undefined;
 					const [cloneCmd, ...cloneArgs] = cloneCommand.argv;
 
 					setCodeReviewProgress(ctx, `Cloning ${prRepo}...`);
-					const cloneResult = spawnSync(cloneCmd, cloneArgs, { encoding: "utf-8", env: cloneEnv });
+					const cloneResult = spawnSync(cloneCmd, cloneArgs, { encoding: "utf-8", env: cloneEnv ?? process.env, windowsHide: true });
 					if ((cloneResult.status ?? 1) !== 0) {
 						throw new Error(`${cloneCmd === "git" ? "git clone" : `${cloneCmd} repo clone`} failed: ${(cloneResult.stderr ?? "").trim()}`);
 					}
@@ -623,18 +675,18 @@ async function createCodeReviewBrowserSession(
 					const fetchResult = await fetchHead(["fetch", "--depth=200", headRemote, fetchRefStr], localPath);
 					if (fetchResult.exitCode !== 0) throw new Error(`Failed to fetch PR head ref: ${fetchResult.stderr.trim()}`);
 
-					const checkoutResult = await reviewRuntime.runGit(["checkout", "FETCH_HEAD"], { cwd: localPath });
+					const checkoutResult = await checkoutRuntime.runGit(["checkout", "FETCH_HEAD"], { cwd: localPath });
 					if (checkoutResult.exitCode !== 0) {
 						throw new Error(`git checkout FETCH_HEAD failed: ${checkoutResult.stderr.trim()}`);
 					}
 
 					// Best-effort: create base refs so agent diffs work
-					const baseFetch = await reviewRuntime.runGit(["fetch", "--depth=200", "origin", prMetadata.baseSha], { cwd: localPath });
+					const baseFetch = await checkoutRuntime.runGit(["fetch", "--depth=200", "origin", prMetadata.baseSha], { cwd: localPath });
 					if (baseFetch.exitCode !== 0) {
 						ctx.ui.notify("Failed to fetch the PR base commit; agent diffs may be inaccurate.", "warning");
 					}
-					await reviewRuntime.runGit(["branch", "--", prMetadata.baseBranch, prMetadata.baseSha], { cwd: localPath });
-					await reviewRuntime.runGit(["update-ref", `refs/remotes/origin/${prMetadata.baseBranch}`, prMetadata.baseSha], { cwd: localPath });
+					await checkoutRuntime.runGit(["branch", "--", prMetadata.baseBranch, prMetadata.baseSha], { cwd: localPath });
+					await checkoutRuntime.runGit(["update-ref", `refs/remotes/origin/${prMetadata.baseBranch}`, prMetadata.baseSha], { cwd: localPath });
 
 					exitHandler = () => {
 						if (sessionDir) try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
@@ -744,7 +796,7 @@ async function createCodeReviewBrowserSession(
 				vcsType: options.vcsType,
 				requestedDiffType,
 				requestedBase,
-				configuredDiffType: resolveDefaultDiffType(config),
+				configuredDiffType: resolveDefaultDiffTypeFor(config, managedVcs?.id),
 				hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
 			});
 			gitCtx = result.gitContext;
@@ -780,6 +832,7 @@ async function createCodeReviewBrowserSession(
 
 	const server = await startServerWithSelfPreemption(() => startReviewServer({
 		sessionBridge: options.sessionBridge,
+		liveReviewAgent: piLiveReviewAgent(ctx),
 		rawPatch,
 		gitRef,
 		error: diffError,
@@ -800,6 +853,8 @@ async function createCodeReviewBrowserSession(
 		agentCwd,
 		worktreePool,
 		htmlContent: reviewHtmlContent,
+		diagramEngine: readReviewDiagramEngine,
+		semDiff: readReviewSemDiff,
 		sharingEnabled: resolveSharingEnabled(loadConfig()),
 		// Pi's review consumer (index.ts) sends approve-time feedback after the
 		// approved prompt, so the advert is unconditional — same shape as the
@@ -810,7 +865,9 @@ async function createCodeReviewBrowserSession(
 		onCleanup: worktreeCleanup,
 	}));
 
-	return startBrowserDecisionSession(server, ctx, server.waitForDecision);
+	return startBrowserDecisionSession(server, ctx, server.waitForDecision, undefined, {
+		announcedInTurn: options.announcedInTurn,
+	});
 }
 
 export async function openMarkdownAnnotation(
@@ -857,6 +914,16 @@ export async function startMarkdownAnnotationSession(
 	sessionBridge?: SessionBridge,
 	/** Several files reviewed as one (mode "annotate-bundle"), in review order. */
 	bundleFiles?: AnnotateBundleFile[],
+	/** The caller shows the URL in its own in-turn message (`sessionOpenedMessage`). */
+	announcedInTurn?: boolean,
+	/**
+	 * Whether a gated local session gets the blocking CLI's client lease (a
+	 * closed tab settles as dismissed after 30 s, #1143). On for callers that
+	 * await the decision (the event bus, `openMarkdownAnnotation`). The tool and
+	 * the slash commands pass false: they return at once, and the review must
+	 * stay open after tab loss until an explicit decision or close.
+	 */
+	clientLease = true,
 ): Promise<BrowserDecisionSession<AnnotateDecision>> {
 	if (!ctx.hasUI) {
 		throw new Error("Plannotator annotation browser is unavailable in this session.");
@@ -908,7 +975,7 @@ export async function startMarkdownAnnotationSession(
 		sourceConverted,
 		gate,
 		approvalNotesSupported: true,
-		clientLeaseSupported: gate === true && !isRemoteSession(),
+		clientLeaseSupported: clientLease && gate === true && !isRemoteSession(),
 		rawHtml,
 		renderHtml,
 		convertHtml,
@@ -920,7 +987,11 @@ export async function startMarkdownAnnotationSession(
 		project: detectProjectName(),
 	}));
 
-	return startBrowserDecisionSession(server, ctx, server.waitForDecision);
+	if (liveTargetUrl && server.liveProxyPort !== undefined) {
+		ctx.ui.notify(`Live app: ${liveTargetUrl} (proxy port ${server.liveProxyPort})`, "info");
+	}
+
+	return startBrowserDecisionSession(server, ctx, server.waitForDecision, undefined, { announcedInTurn });
 }
 
 export async function openLastMessageAnnotation(
@@ -939,6 +1010,10 @@ export async function startLastMessageAnnotationSession(
 	gate?: boolean,
 	recentMessages?: { messageId: string; text: string; timestamp?: string }[],
 	sessionBridge?: SessionBridge,
+	/** The caller shows the URL in its own in-turn message (`sessionOpenedMessage`). */
+	announcedInTurn?: boolean,
+	/** See `startMarkdownAnnotationSession`: false from the tool and commands. */
+	clientLease = true,
 ): Promise<BrowserDecisionSession<AnnotateDecision>> {
 	return startMarkdownAnnotationSession(
 		ctx,
@@ -955,6 +1030,9 @@ export async function startLastMessageAnnotationSession(
 		recentMessages,
 		undefined,
 		sessionBridge,
+		undefined,
+		announcedInTurn,
+		clientLease,
 	);
 }
 

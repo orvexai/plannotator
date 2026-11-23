@@ -8,6 +8,7 @@ import { ConfirmDialog, type ConfirmDialogProps } from './ConfirmDialog';
 import { useDismissablePopover } from '../hooks/useDismissablePopover';
 import { useCompactTouchLayout } from '../hooks/useIsMobile';
 import { cn } from '../lib/utils';
+import { isCommentSubmitKey } from '../utils/commentSubmitKey';
 import type {
   DecisionActionId,
   DecisionComposer,
@@ -57,6 +58,28 @@ export interface DecisionControlProps {
   dismissOnIframeFocus?: boolean;
   /** Confirm surface override; defaults to the ui ConfirmDialog. */
   confirmDialog?: React.ComponentType<ConfirmDialogProps>;
+  /**
+   * Rows rendered under the decisions, inside the same menu (#1057: plan
+   * review's "After approval, switch to" agent picker and Claude Code's
+   * permission-mode line). Not decisions: they never close the menu by
+   * themselves. Interactive rows use `role="menuitem"` or
+   * `role="menuitemradio"` so the arrow keys reach them. Absent: the menu is
+   * the decisions alone, exactly as before. A function receives
+   * `closeMenu`, for a row that leaves the menu (e.g. one opening Settings).
+   */
+  menuFooter?: React.ReactNode | ((api: { closeMenu: () => void }) => React.ReactNode);
+  /**
+   * The notes, held by the host (keyed by decision id), with
+   * `onDraftsChange`: the host keeps them past this control (a close, a
+   * reload) and clears them itself once its decision went, so a send that
+   * fails keeps the note. Absent: the control holds them, and clears a
+   * note when its decision is handed over, exactly as before.
+   */
+  drafts?: Record<string, string>;
+  onDraftsChange?: (drafts: Record<string, string>) => void;
+  /** Bumped by the host's Mod+Shift+Enter: opens the first note composer
+   *  (e.g. "Send with a note") so a note needs no mouse. */
+  openNoteRequest?: number;
 }
 
 const NOTE_MAX_HEIGHT_PX = 144;
@@ -98,13 +121,21 @@ export interface DecisionNoteFieldProps {
   placeholder?: string;
   disabled?: boolean;
   autoFocus?: boolean;
+  /**
+   * The field is a COMMENT composer (the review sidebar's "+ General
+   * comment"), so the "Enter saves a comment" setting applies: pass its value
+   * and a plain Enter also submits (Shift+Enter stays a new line). Default
+   * false: in the decision control's own composer a note rides a decision,
+   * and only Mod+Enter fires it.
+   */
+  enterSubmits?: boolean;
 }
 
 /**
  * The shared multi-line note field: two rows at rest, grows to 144px, then
  * scrolls. Controlled — the owner keeps the text so stepping back does not
  * discard a half-typed note. Exported separately because a third consumer
- * (the review sidebar's "+ General comment") composes it outside the control.
+ * (the review sidebar's "+ Global comment") composes it outside the control.
  */
 export const DecisionNoteField: React.FC<DecisionNoteFieldProps> = ({
   text,
@@ -114,6 +145,7 @@ export const DecisionNoteField: React.FC<DecisionNoteFieldProps> = ({
   placeholder = 'Add a note...',
   disabled = false,
   autoFocus = true,
+  enterSubmits = false,
 }) => {
   const ref = useAutoGrow(text);
 
@@ -132,15 +164,15 @@ export const DecisionNoteField: React.FC<DecisionNoteFieldProps> = ({
         onCancel();
         return;
       }
-      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      if (enterSubmits ? isCommentSubmitKey(event, true) : event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
         event.stopPropagation();
         if (!disabled) onSubmit();
       }
-      // Plain Enter falls through: the field is multi-line and Enter's job is
-      // a newline.
+      // Otherwise plain Enter falls through: the field is multi-line and
+      // Enter's job is a newline.
     },
-    [disabled, onCancel, onSubmit],
+    [disabled, enterSubmits, onCancel, onSubmit],
   );
 
   return (
@@ -255,6 +287,10 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
   labelBreakpoint = 'md',
   dismissOnIframeFocus = false,
   confirmDialog,
+  menuFooter,
+  drafts: hostDrafts,
+  onDraftsChange,
+  openNoteRequest,
 }) => {
   const rootRef = useRef<HTMLDivElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -263,7 +299,22 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
   const [activeItemId, setActiveItemId] = useState<DecisionMenuItem['id'] | null>(null);
   // Drafts are keyed per item so stepping back from a composer (Esc, back
   // button, even closing the popover) keeps the half-typed note.
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [ownDrafts, setOwnDrafts] = useState<Record<string, string>>({});
+  const hostHolds = hostDrafts !== undefined && onDraftsChange !== undefined;
+  const drafts = hostHolds ? hostDrafts : ownDrafts;
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+  const setDrafts = useCallback(
+    (next: (prev: Record<string, string>) => Record<string, string>) => {
+      if (!hostHolds) {
+        setOwnDrafts(next);
+        return;
+      }
+      draftsRef.current = next(draftsRef.current);
+      onDraftsChange(draftsRef.current);
+    },
+    [hostHolds, onDraftsChange],
+  );
   // L2: only the ID is state — the confirm's title/message/handler resolve
   // from the LIVE spec at render, so a spec update while the dialog is up
   // can never confirm stale copy (e.g. an outdated count).
@@ -362,6 +413,18 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
     handlers[item.id]?.();
   }, [closePopover, handlers]);
 
+  // Starts at the value seen at mount: a control mounted after a request (a
+  // layout switch remounts the header's) must not take it as a new one.
+  const handledNoteRequest = useRef(openNoteRequest);
+  useEffect(() => {
+    if (openNoteRequest === handledNoteRequest.current) return;
+    handledNoteRequest.current = openNoteRequest;
+    if (!openNoteRequest || busy) return;
+    const item = spec.items.find((candidate) => candidate.composer && !candidate.muted);
+    if (item) selectItem(item);
+    // Only a new request opens the composer, never a spec or busy change.
+  }, [openNoteRequest]);
+
   const submitComposer = useCallback(() => {
     if (!activeItem) return;
     const trimmed = (drafts[activeItem.id] ?? '').trim();
@@ -373,14 +436,17 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
         ?.focus();
       return;
     }
-    setDrafts((prev) => {
-      const next = { ...prev };
-      delete next[activeItem.id];
-      return next;
-    });
+    // A host holding the notes clears one when its decision went.
+    if (!hostHolds) {
+      setDrafts((prev) => {
+        const next = { ...prev };
+        delete next[activeItem.id];
+        return next;
+      });
+    }
     closePopover();
     handlers[activeItem.id]?.(trimmed);
-  }, [activeItem, closePopover, drafts, handlers]);
+  }, [activeItem, closePopover, drafts, handlers, hostHolds, setDrafts]);
 
   const backToMenu = useCallback(() => {
     setPopover('menu');
@@ -402,7 +468,9 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
       const keys = ['ArrowDown', 'ArrowUp', 'Home', 'End'];
       if (!keys.includes(event.key)) return;
       const items = Array.from(
-        popoverRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
+        popoverRef.current?.querySelectorAll<HTMLButtonElement>(
+          '[role="menuitem"]:not(:disabled), [role="menuitemradio"]:not(:disabled)',
+        ) ?? [],
       );
       if (items.length === 0) return;
       event.preventDefault();
@@ -453,8 +521,8 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
         }
         className={cn(
           'rounded-r-none border-r-0',
-          // Same mute treatment the old platform ApproveButton wore.
-          spec.primary.muted && 'opacity-40 cursor-not-allowed bg-muted text-muted-foreground hover:bg-muted',
+          // One control with its caret, which stays live: quiet words on the same fill, never half of a coloured pill.
+          spec.primary.muted && 'cursor-not-allowed bg-muted text-muted-foreground [@media(hover:hover)_and_(pointer:fine)]:hover:bg-muted',
         )}
       >
         {spec.primary.shortLabel ? (
@@ -510,7 +578,7 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
         aria-expanded={popover !== null}
         aria-label="More decisions"
         data-decision-caret="true"
-        className="rounded-l-none px-1.5"
+        className={cn('rounded-l-none px-1.5', spec.primary.muted && 'bg-muted text-foreground [@media(hover:hover)_and_(pointer:fine)]:hover:bg-muted/70')}
       >
         <ChevronDown
           className={cn('size-3.5 transition-transform duration-150', popover && 'rotate-180')}
@@ -548,6 +616,9 @@ export const DecisionControl: React.FC<DecisionControlProps> = ({
                   />
                 </React.Fragment>
               ))}
+              {typeof menuFooter === 'function'
+                ? menuFooter({ closeMenu: () => closePopover() })
+                : menuFooter}
             </div>
           ) : activeItem?.composer ? (
             <div className="p-2">

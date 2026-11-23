@@ -12,6 +12,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { AgentJobInfo, AgentJobEvent, AgentCapabilities } from '../types';
+import { noteServerSessionMismatch, withServerSession, withServerSessionQuery } from '../utils/serverSession';
 
 const POLL_INTERVAL_MS = 500;
 const STREAM_URL = '/api/agents/jobs/stream';
@@ -44,7 +45,7 @@ export type AgentLaunchParams = {
 
 /** Does a job belong to the given review context? Jobs launched against a PR
  *  are stamped with that PR's url; local-diff jobs carry none. Used to scope
- *  guide/tour auto-opens, the guide takeover, and "Open guide" affordances so
+ *  guide auto-opens, the guide takeover, and "Open guide" affordances so
  *  an artifact from PR A never opens (or offers to open) while reviewing PR B.
  *  `currentPrUrl` undefined ⇒ local-diff mode.
  *
@@ -53,7 +54,7 @@ export type AgentLaunchParams = {
  *  screen. In PR mode only prUrl is compared (a PR checkout has no separate
  *  worktree axis). In local-diff mode, `currentWorktreePath` distinguishes a
  *  review retargeted at a git worktree (`worktree:<path>:<subType>` diff
- *  types — see parseWorktreeDiffType) from the main tree, so a guide/tour
+ *  types — see parseWorktreeDiffType) from the main tree, so a guide
  *  launched against worktree A never opens while reviewing worktree B. Jobs
  *  launched before this field existed, and jobs from providers that never set
  *  `diffContext`, coalesce to the main tree (`null`) — deliberate, so old jobs
@@ -61,7 +62,7 @@ export type AgentLaunchParams = {
  *
  *  DELIBERATELY matches by prUrl/worktreePath only — NOT diffScope/mode/base,
  *  even though jobs carry them. Annotations scope by diffScope because they
- *  pin exact line positions in a specific patch; guides/tours reference FILES
+ *  pin exact line positions in a specific patch; guides reference FILES
  *  and degrade per-file ("no longer in the current diff") when the diff
  *  shifts underneath them. Layer→full-stack is a superset (the artifact
  *  fully resolves — hiding it would be hostile); full-stack→layer and local
@@ -273,15 +274,21 @@ export function useAgentJobs(
       const res = await fetch(JOBS_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
+        // The stale-tab guard (a no-op for a host that never adopted a session).
+        body: JSON.stringify(withServerSession(params)),
       });
       if (!res.ok) {
+        await noteServerSessionMismatch(res);
         throw new Error(await readResponseError(res));
       }
 
       const data: unknown = await res.json();
       const job = parseLaunchJob(data);
-      if (job) setJobs((prev) => upsertJob(prev, job));
+      // The response shows a launch the stream has not announced yet (#980).
+      // It never replaces a job the stream already has: a job that exits
+      // within the POST's round trip is already done there, and this copy
+      // ("running") would leave it running for good.
+      if (job) setJobs((prev) => (prev.some((current) => current.id === job.id) ? prev : [...prev, job]));
       return job;
     },
     [],
@@ -289,9 +296,10 @@ export function useAgentJobs(
 
   const killJob = useCallback(async (id: string) => {
     try {
-      await fetch(`${JOBS_URL}/${encodeURIComponent(id)}`, {
+      const res = await fetch(withServerSessionQuery(`${JOBS_URL}/${encodeURIComponent(id)}`), {
         method: 'DELETE',
       });
+      await noteServerSessionMismatch(res);
     } catch {
       // SSE will reconcile
     }
@@ -299,7 +307,8 @@ export function useAgentJobs(
 
   const killAll = useCallback(async () => {
     try {
-      await fetch(JOBS_URL, { method: 'DELETE' });
+      const res = await fetch(withServerSessionQuery(JOBS_URL), { method: 'DELETE' });
+      await noteServerSessionMismatch(res);
     } catch {
       // SSE will reconcile
     }

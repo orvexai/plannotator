@@ -1,0 +1,767 @@
+import { forwardRef, useCallback, useContext, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type RefObject, type SyntheticEvent } from 'react';
+import { formatInboxVideoTime, inboxAttachmentKindLabel, inboxVideoMeta, readInboxAttachmentKind, readInboxVideoTime, type InboxAttachmentState } from '@plannotator/core/inbox-types';
+import { ImageAnnotator } from '@plannotator/ui/components/ImageAnnotator';
+import { getImageSrc } from '@plannotator/ui/components/ImageThumbnail';
+import type { Annotation, ImageAttachment } from '@plannotator/ui/types';
+import { InboxApiError } from '../api';
+import { useInboxFileSource, type FileSuggestion } from '../fileSource';
+import { compareVideoTimes, videoCommentAnnotation, videoFrameName, videoTimeOf } from '../attachments';
+import { formatBytes, plural } from '../format';
+import { Icon } from '../icons';
+import { FileName } from './FileName';
+import { Tip } from './Tip';
+import { FullScreenCommentBin, FullScreenComposer, FullScreenComposerContext } from './FullScreenComposer';
+import { useConfigValue } from '@plannotator/ui/config';
+import { isCommentSubmitKey } from '@plannotator/ui/utils/commentSubmitKey';
+import { addedToComment, markupOf, markupWords, noteOnto } from '../markup';
+import { useCommentFiles } from '../commentFiles';
+import { DRAWING_SCREEN, KeptMarkup, markupAddedToast, OverWindow, type Notice } from './Markup';
+import { useRowDraft } from '../fileCommentDrafts';
+import { markImageComposer } from '../pageMarks';
+import { AudioScrub, useAudioPeaks } from './AudioPlayer';
+import { PlaybackSpeed, readPlaybackRate, writePlaybackRate } from './PlaybackSpeed';
+import { useTouchPhone } from '../phone';
+
+/** A fresh annotation id. */
+function newId(): string {
+  return typeof crypto.randomUUID === 'function' ? `ann-vid-${crypto.randomUUID()}` : `ann-vid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * The frame a `<video>` shows now, as a JPEG at its own size, or null (no
+ * frame decoded yet, no canvas, or a frame the browser will not hand over).
+ * The film comes from the Inbox's own origin, so the canvas is never tainted.
+ */
+export function captureVideoFrame(video: HTMLVideoElement | null, quality = 0.85): Promise<Blob | null> {
+  if (!video || !video.videoWidth || !video.videoHeight) return Promise.resolve(null);
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext('2d');
+    if (!context) return Promise.resolve(null);
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return new Promise((resolve) => {
+      try {
+        canvas.toBlob((blob) => resolve(blob), 'image/jpeg', quality);
+      } catch {
+        resolve(null);
+      }
+    });
+  } catch {
+    return Promise.resolve(null);
+  }
+}
+
+export interface VideoAttachmentViewHandle {
+  /** Seek to a comment's moment and pause there (a card or a time chip in the panel). */
+  seekTo: (annotationId: string) => void;
+}
+
+/** A frame grabbed for the comment being written: the JPEG and a local URL to show it. */
+interface Frame {
+  blob: Blob;
+  url: string;
+}
+
+/**
+ * A video attachment in the pane (design record "inbox-video", approved
+ * 2026-10-15): the native `<video controls>` fit to the stage, a rail under
+ * it with one dot per comment (a click seeks there), and a comment row with
+ * the moment, the paused frame, Mark up and Comment. Typing pauses the film
+ * and pins the moment; a click on the moment seeks back to it. On Comment the
+ * frame (or the person's marked-up copy, drawn with Plannotator's image
+ * annotator) is kept through the markups route and rides the comment, so the
+ * agent can Read the moment it cannot watch. A film the browser cannot play
+ * shows the Download card. The film streams by HTTP Range from the
+ * attachment's `video` route; nothing is read whole.
+ *
+ * On a phone the comments list under the rail, and the row opens from
+ * "Comment at 1:42" at the foot.
+ *
+ * A recording (`audio`; the owner's ask, 2026-11-09) is the same view with a
+ * player card in place of the film: play / pause, the waveform to scrub
+ * (AudioPlayer.tsx), the time, and the same rail, comment row, panel and
+ * contract. It has no frame, so no Mark up; its comments carry only the moment.
+ *
+ * Mark up works as on an image (approval "inbox-markup-flow"): the drawing
+ * screen's ✓ adds the marked-up frame to the reply at once, as a comment at
+ * the pinned moment, with the window's toast and its Undo; the row keeps the
+ * drawing (click: draw again; ×: take it out) beside "Note (optional)", whose
+ * words go onto that same comment. Playing the film again lets the row go back
+ * to following it. The row is the image's floating one-row card.
+ */
+export const VideoAttachmentView = forwardRef<VideoAttachmentViewHandle, {
+  attachment: InboxAttachmentState;
+  version: 'current' | 'sent';
+  annotations: readonly Annotation[];
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  readOnly: boolean;
+  onSave: (annotation: Annotation) => Promise<boolean>;
+  onError: (message: string) => void;
+  phone?: boolean;
+  /** A still to show before it plays; absent: the film's first frame. */
+  poster?: string;
+  /**
+   * A suggested comment (the tour's): the first pause fills the box with it and pins that moment and its
+   * frame, as typing does; the person keeps it with one press, or writes over it.
+   */
+  suggestion?: FileSuggestion;
+  /** Take a comment out of the reply (the drawing's × and the toast's Undo). */
+  onRemove?: (id: string) => Promise<void> | void;
+  /** The window's toast ("Markup added to your reply · Undo"). */
+  onNotice?: Notice;
+}>(function VideoAttachmentView({ attachment, version, annotations, selectedId, onSelect, readOnly, onSave, onError, phone, poster, suggestion, onRemove, onNotice }, ref) {
+  /** Full screen's composer (the pane gives it there): the comment row goes inside it. */
+  const fullComposer = useContext(FullScreenComposerContext);
+  const source = useInboxFileSource();
+  const suggested = useRef(false);
+  /** A recording: the player card instead of the film, and no frame to grab or draw on. */
+  const audio = readInboxAttachmentKind(attachment.kind) === 'audio';
+  const videoRef = useRef<HTMLMediaElement | null>(null);
+  const textRef = useRef<HTMLTextAreaElement>(null);
+  const [duration, setDuration] = useState<number | null>(attachment.duration_ms ? attachment.duration_ms / 1000 : null);
+  const enterSavesComment = useConfigValue('enterSavesComment');
+  const [current, setCurrent] = useState(0);
+  const [ratio, setRatio] = useState(attachment.width && attachment.height ? attachment.width / attachment.height : 16 / 9);
+  const [failed, setFailed] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  /** The speed it plays at: the one picked earlier in this tab, else 1x. */
+  const [rate, setRate] = useState(readPlaybackRate);
+  // Words, the pinned moment, its frame and a drawing the row held when this file last closed: back in it, and
+  // read again as it closes.
+  const waiting = useRowDraft(() => {
+    const kept = files.kept();
+    const late = files.flying();
+    return readOnly || (sentWords.current === text && kept.length === 0 && late.length === 0) ? null : { kind: 'row', text, markup, time: pinned, frame: frameRef.current?.blob ?? null, files: kept, late };
+  });
+  const [text, setText] = useState(waiting?.text ?? '');
+  const [pinned, setPinned] = useState<number | null>(waiting?.time ?? null);
+  const [frame, setFrame] = useState<Frame | null>(() => (waiting?.frame ? { blob: waiting.frame, url: URL.createObjectURL(waiting.frame) } : null));
+  const [markup, setMarkup] = useState<ImageAttachment | null>(waiting?.markup ?? null);
+  // Pictures and files added to the comment (the reply box's paperclip, paste and drop): they go with its words.
+  const textNow = useRef(text);
+  textNow.current = text;
+  const files = useCommentFiles({
+    initial: waiting?.files,
+    late: waiting?.late,
+    phone,
+    inCard: fullComposer !== null,
+    field: () => textRef.current,
+    text: { get value() { return textNow.current; }, set: setText },
+  });
+  /** The row's words as a save took them: the file closing before the save answers (and the row clears) keeps no draft of them. */
+  const sentWords = useRef<string | null>(null);
+  const sendRow = async (annotation: Annotation) => {
+    sentWords.current = text;
+    const back = files.sending(annotation.images);
+    const ok = await onSave(annotation);
+    if (!ok) {
+      sentWords.current = null;
+      back();
+    }
+    return ok;
+  };
+  // The drawing the ✓ just added to the reply: its comment, for a note, a redraw or ×.
+  const [kept, setKept] = useState<{ id: string; image: ImageAttachment; time: number } | null>(null);
+  // One drawing per opening of the drawing screen: set as it opens, taken by the first ✓ or Enter. ui calls
+  // onAccept once per press, each after its own encode, so a later press (even one landing after the first
+  // drawing is in the reply) adds nothing.
+  const acceptable = useRef(false);
+  // The kept drawing's comment as it reads now; gone once removed (the panel, Undo) or sent, and the row lets it go.
+  const keptNow = kept ? annotations.find((a) => a.id === kept.id) ?? null : null;
+  useEffect(() => {
+    if (kept && !keptNow) setKept(null);
+  }, [kept, keptNow]);
+  const [annotating, setAnnotating] = useState(false);
+  const touchPhone = useTouchPhone();
+  useEffect(() => {
+    if (annotating) acceptable.current = true;
+  }, [annotating]);
+  const [saving, setSaving] = useState(false);
+  /** A phone opens the row from "Comment at 1:42" (open already when it holds kept words). */
+  const [composing, setComposing] = useState(waiting !== null);
+  // The `#t` fragment asks for the first frame, a free poster (a recording has none).
+  const mediaUrl = source.videoUrl(attachment, version);
+  const src = audio ? mediaUrl : `${mediaUrl}#t=0.001`;
+  // A recording's waveform: its peaks once decoded (a small file), else the plain bar.
+  const peaks = useAudioPeaks(audio ? mediaUrl : '', audio ? (attachment.current?.size ?? attachment.size) : Number.POSITIVE_INFINITY);
+
+  // A frame's local URL is let go once it is replaced or the view goes.
+  const frameRef = useRef<Frame | null>(null);
+  frameRef.current = frame;
+  useEffect(() => () => {
+    if (frameRef.current) URL.revokeObjectURL(frameRef.current.url);
+  }, []);
+  const replaceFrame = useCallback((next: Frame | null) => {
+    setFrame((previous) => {
+      if (previous && previous !== next) URL.revokeObjectURL(previous.url);
+      return next;
+    });
+  }, []);
+
+  // The speed holds through a new source too (the default is what a load resets to).
+  useEffect(() => {
+    const media = videoRef.current;
+    if (!media) return;
+    media.defaultPlaybackRate = rate;
+    media.playbackRate = rate;
+  }, [rate, failed]);
+  const pickRate = (next: number) => {
+    setRate(next);
+    writePlaybackRate(next);
+  };
+
+  const sorted = useMemo(() => [...annotations].filter((a) => readInboxVideoTime(a) !== null).sort(compareVideoTimes), [annotations]);
+  const span = duration && Number.isFinite(duration) && duration > 0 ? duration : null;
+  const at = (time: number) => `${Math.min(100, Math.max(0, (time / span!) * 100))}%`;
+
+  const seek = useCallback((time: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
+    try {
+      video.currentTime = time;
+    } catch {
+      // Not seekable yet: the metadata is still loading.
+    }
+    setCurrent(time);
+  }, []);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      seekTo: (id) => {
+        const time = readInboxVideoTime(annotations.find((a) => a.id === id));
+        if (time !== null) seek(time);
+      },
+    }),
+    [annotations, seek],
+  );
+
+  // A comment selected elsewhere (the panel, the chip's list) brings the film to its moment.
+  const lastSelected = useRef<string | null>(null);
+  useEffect(() => {
+    if (!selectedId || selectedId === lastSelected.current) return;
+    lastSelected.current = selectedId;
+    const time = readInboxVideoTime(annotations.find((a) => a.id === selectedId));
+    if (time !== null) seek(time);
+  }, [selectedId, annotations, seek]);
+
+  // Kept words come back at their moment.
+  useEffect(() => {
+    if (waiting?.time != null) seek(waiting.time);
+    // Once, as the row mounts with them.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Pause and pin the moment the comment is about, and grab its frame. */
+  const pin = useCallback(async (): Promise<Frame | null> => {
+    const video = videoRef.current;
+    if (pinned !== null) return frameRef.current;
+    video?.pause();
+    const time = videoTimeOf(video?.currentTime ?? current);
+    setPinned(time);
+    // A recording has no frame: its comment carries the moment only.
+    const blob = audio ? null : await captureVideoFrame(video as HTMLVideoElement | null);
+    const next = blob ? { blob, url: URL.createObjectURL(blob) } : null;
+    replaceFrame(next);
+    return next;
+  }, [pinned, current, replaceFrame, audio]);
+
+  /**
+   * The row starts over; its added files go too unless `keepFiles` (they did not ride the comment just saved): then
+   * a phone's row stays open with them, as the row beside the thread does, so no file waits out of sight.
+   */
+  const reset = (keepFiles = false) => {
+    setText('');
+    setPinned(null);
+    setMarkup(null);
+    setKept(null);
+    replaceFrame(null);
+    if (keepFiles) return;
+    setComposing(false);
+    files.clear();
+  };
+
+  const shownTime = pinned ?? current;
+  const canSave = !saving && !files.uploading && (text.trim() !== '' || markup !== null || files.ready > 0);
+
+  /** Take the added drawing out of the reply (its × or the toast's Undo). */
+  const removeKept = (id: string) => {
+    setKept((now) => (now?.id === id ? null : now));
+    onSelect(null);
+    void onRemove?.(id);
+  };
+
+  /**
+   * The ✓: the marked-up frame goes into the reply now, as a comment at the
+   * pinned moment (a redraw replaces the picture of the one already added).
+   * Words already typed go with it; with none, the row offers a note.
+   */
+  const addDrawing = async (image: ImageAttachment) => {
+    const words = text.trim();
+    // A redraw: the comment as it reads now, its frame replaced (and any words typed, as a note).
+    const redraw = kept && keptNow ? keptNow : null;
+    const time = redraw && kept ? kept.time : pinned ?? videoTimeOf(videoRef.current?.currentTime ?? current);
+    const id = redraw?.id ?? newId();
+    // Pictures and files added in the row go with the words typed (with none, they wait for the note).
+    const added = words && !files.uploading ? files.images() : [];
+    const made = redraw ? ({ ...redraw, text: noteOnto(redraw, words), images: [image, ...addedToComment(redraw)] } as Annotation) : videoCommentAnnotation({ id, name: attachment.name, time, text: markupWords(words, true), frame: image });
+    const ok = await sendRow(added.length > 0 ? { ...made, images: [...(made.images ?? []), ...added] } : made);
+    if (!ok) {
+      // Not saved (the error shows): the drawing waits in the row for Comment, as before.
+      setMarkup(image);
+      return;
+    }
+    setMarkup(null);
+    // Files still uploading did not go with the words: they stay in the row for the next comment.
+    if (words) reset(added.length === 0 && (files.uploading || files.ready > 0));
+    else {
+      setText('');
+      setKept({ id, image, time });
+    }
+    onSelect(id);
+    // A new comment says so, with Undo; a redraw only replaced the frame (Undo would take the whole comment).
+    if (!redraw) onNotice?.(markupAddedToast(() => removeKept(id)));
+  };
+
+  const submit = async () => {
+    if (!canSave) return;
+    // A note: onto the drawing the ✓ added, the same comment at the same moment.
+    if (kept && keptNow) {
+      setSaving(true);
+      // (A redraw whose save failed waits as `markup`: it goes with the note.)
+      const added = files.images();
+      const images = [...(markup ? [markup, ...addedToComment(keptNow)] : (keptNow.images ?? [])), ...added];
+      const ok = await sendRow({ ...keptNow, text: noteOnto(keptNow, text), ...(markup || added.length > 0 ? { images } : {}) } as Annotation);
+      setSaving(false);
+      if (ok) reset();
+      return;
+    }
+    setSaving(true);
+    const time = pinned ?? videoTimeOf(videoRef.current?.currentTime ?? current);
+    let image: ImageAttachment | null = markup;
+    if (!image && frame) {
+      try {
+        const kept = await source.keepMarkup(frame.blob);
+        image = { path: kept.path, name: videoFrameName(attachment.name, time) };
+      } catch (cause) {
+        // The comment still goes; only the frame is missing.
+        onError(cause instanceof InboxApiError ? `The frame was not kept: ${cause.message}` : 'The frame was not kept; the comment was saved without it.');
+      }
+    }
+    const made = videoCommentAnnotation({ id: newId(), name: attachment.name, time, text: markupWords(text, markup !== null), frame: image });
+    const added = files.images();
+    const ok = await sendRow(added.length > 0 ? { ...made, images: [...(made.images ?? []), ...added] } : made);
+    setSaving(false);
+    if (ok) reset();
+  };
+
+  const openMarkup = async () => {
+    const grabbed = frame ?? (await pin());
+    if (grabbed) setAnnotating(true);
+    else onError('This frame could not be grabbed to draw on.');
+  };
+
+  if (failed) {
+    return (
+      <div className="ib-docscroll" data-download-card="" data-video-unplayable="">
+        <div className="ib-att-t ib-dlcard">
+          <span className="ib-fi">
+            <Icon name={audio ? 'music' : 'film'} size={18} />
+          </span>
+          <span className="ib-att-text">
+            <FileName name={attachment.name} className="ib-nm" wrap />
+            <span className="ib-kd">
+              {formatBytes(attachment.current?.size ?? attachment.size)}. This {audio ? 'recording' : 'video'}&rsquo;s format can&rsquo;t play here; download it to open it.
+            </span>
+          </span>
+          {source.writes && (
+            <a className="ib-btn ib-pri" href={source.downloadUrl(attachment, version)} download={attachment.name}>
+              <Icon name="download" size={14} />
+              Download
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // The moment: following the film, or pinned while a comment is written (then a click goes back to it).
+  const chip =
+    pinned !== null ? (
+      <Tip content={`The comment is pinned at ${formatInboxVideoTime(pinned)}; go back to it`}>
+        <button
+          type="button"
+          className="ib-vtime"
+          onClick={() => seek(pinned)}
+          aria-label={`Pinned at ${formatInboxVideoTime(pinned)}, go back to it`}
+          data-video-time=""
+          data-pinned=""
+        >
+          {formatInboxVideoTime(pinned)}
+        </button>
+      </Tip>
+    ) : (
+      <span className="ib-vtime" data-video-time="">
+        {formatInboxVideoTime(current)}
+      </span>
+    );
+
+  // The comment row: under the film beside the thread (a phone opens it from "Comment at"), inside the
+  // full-screen composer's Comment tab in full screen.
+  const commentCard = (
+    <div className="ib-ccard" onPaste={files.onPaste} {...files.drop?.handlers}>
+      {files.tiles}
+      {files.dropTarget}
+      {chip}
+      {kept ? (
+        <KeptMarkup image={kept.image} onRedraw={() => setAnnotating(true)} onRemove={() => removeKept(kept.id)} wide />
+      ) : (
+        (markup || frame) && (
+          // `ib-markup` on a drawing: the pane (unsavedComposers) knows a drawing not yet commented.
+          <Tip content={markup ? 'Your marked-up frame rides this comment' : `The frame at ${formatInboxVideoTime(shownTime)} rides this comment`}>
+            <span className={`ib-vframe${markup ? ' ib-markup' : ''}`} data-video-frame="">
+              <img src={markup ? getImageSrc(markup.path) : frame!.url} alt="" />
+              {markup && (
+                <span className="ib-vpen" aria-hidden="true">
+                  <Icon name="pen" size={9} />
+                </span>
+              )}
+            </span>
+          </Tip>
+        )
+      )}
+      <textarea
+        ref={textRef}
+        className="ib-ta"
+        rows={1}
+        value={text}
+        placeholder={kept ? 'Note (optional)' : `Comment at ${formatInboxVideoTime(shownTime)}…`}
+        aria-label={kept ? `A note with your drawing at ${formatInboxVideoTime(kept.time)}` : `Comment on ${attachment.name} at ${formatInboxVideoTime(shownTime)}`}
+        onChange={(event) => {
+          const value = event.target.value;
+          setText(value);
+          // Typing pauses the film and pins the moment; clearing the words lets the moment follow the film again
+          // (a phone's row opened from "Comment at" keeps its moment until Cancel; full screen's composer has no
+          // Cancel, so there clearing the words lets go of it, and the next moment is pinned as before).
+          if (value.trim() !== '' && pinned === null) void pin();
+          else if (value.trim() === '' && !markup && !kept && (!phone || fullComposer)) {
+            setPinned(null);
+            replaceFrame(null);
+          }
+        }}
+        onFocus={() => {
+          // A phone in full screen's composer: a tap in the comment field is "Comment at" (that button is gone
+          // there), so the film pauses and the moment pins as the field takes focus, not at the first keystroke.
+          if (phone && fullComposer && pinned === null && !kept && !markup) void pin();
+        }}
+        onKeyDown={(event) => {
+          if (isCommentSubmitKey(event, enterSavesComment)) {
+            event.preventDefault();
+            event.stopPropagation();
+            void submit();
+          }
+        }}
+      />
+      {!audio && (
+        <Tip content="Draw on this frame (pen, arrow, circle)">
+          <button type="button" className="ib-btn ib-cbtn" onClick={() => void openMarkup()} data-markup-open="" aria-label={markup || kept ? 'Redraw' : 'Mark up'}>
+            <Icon name="pen" size={15} />
+            <span className="ib-cbtn-l" aria-hidden="true">
+              {markup || kept ? 'Redraw' : 'Mark up'}
+            </span>
+          </button>
+        </Tip>
+      )}
+      {files.clip}
+      {phone && !fullComposer && (
+        <button type="button" className="ib-btn ib-ccancel" onClick={() => reset()} data-video-cancel="">
+          Cancel
+        </button>
+      )}
+      <FullScreenCommentBin />
+      <button type="button" className="ib-btn ib-pri ib-csave" onClick={() => void submit()} disabled={!canSave} data-video-comment-save="">
+        {kept ? 'Add note' : 'Comment'}
+      </button>
+      {files.drop?.cover}
+    </div>
+  );
+  const composer = fullComposer ? (
+    <FullScreenComposer
+      value={fullComposer}
+      noun={audio ? 'recording' : 'video'}
+      comment={
+        readOnly ? null : (
+          <div className="ib-fcomp-comment" data-video-composer="" data-image-composer="">
+            {commentCard}
+          </div>
+        )
+      }
+    />
+  ) : (
+    !readOnly &&
+    (!phone || composing) && (
+      <div ref={markImageComposer} className="ib-imgcompose ib-vidcompose" data-video-composer="" data-image-composer="">
+        {commentCard}
+      </div>
+    )
+  );
+
+  // A recording's length is the one its header gave, else the one the player learned.
+  const meta = inboxVideoMeta(attachment) || (audio && span !== null ? formatInboxVideoTime(span) : '');
+
+  // The film's and the recording's events alike: the length, the moment, the suggestion on the first pause, a format
+  // that can't play.
+  const mediaProps = {
+    src,
+    preload: 'metadata',
+    'aria-label': attachment.name,
+    'data-video-player': '',
+    onLoadedMetadata: (event: SyntheticEvent<HTMLMediaElement>) => {
+      const media = event.currentTarget;
+      if (Number.isFinite(media.duration) && media.duration > 0) setDuration(media.duration);
+      if (media instanceof HTMLVideoElement && media.videoWidth && media.videoHeight) setRatio(media.videoWidth / media.videoHeight);
+    },
+    onDurationChange: (event: SyntheticEvent<HTMLMediaElement>) => {
+      const d = event.currentTarget.duration;
+      if (Number.isFinite(d) && d > 0) setDuration(d);
+    },
+    onTimeUpdate: (event: SyntheticEvent<HTMLMediaElement>) => setCurrent(event.currentTarget.currentTime),
+    onPlay: () => {
+      setPlaying(true);
+      // Playing on after a drawing went into the reply: the row follows the film again (the comment stays);
+      // never while a redraw that failed to save waits in the row.
+      if (kept && text.trim() === '' && !markup && files.ready === 0 && !files.uploading) reset();
+    },
+    onPause: () => {
+      setPlaying(false);
+      // The first pause, with nothing written yet: the suggestion fills the box, and the moment pins.
+      // A phone shows the row only from "Comment at", or in full screen's composer (always there).
+      if (!suggestion || suggested.current || readOnly || text.trim() !== '' || (phone && !fullComposer)) return;
+      suggested.current = true;
+      setText(suggestion.comment);
+      void pin();
+    },
+    onEnded: () => setPlaying(false),
+    // A speed picked in the browser's own player menu shows on the button, and holds for the next file.
+    onRateChange: (event: SyntheticEvent<HTMLMediaElement>) => {
+      const next = event.currentTarget.playbackRate;
+      if (next !== rate && Number.isFinite(next) && next > 0) pickRate(next);
+    },
+    onSeeked: (event: SyntheticEvent<HTMLMediaElement>) => setCurrent(event.currentTarget.currentTime),
+    onError: (event: SyntheticEvent<HTMLMediaElement>) => {
+      const code = event.currentTarget.error?.code;
+      // Aborted by the person (code 1) is not a format problem.
+      if (code !== 1) setFailed(true);
+    },
+  };
+
+  // The film's speed: in a line the Inbox draws, never over the browser's own controls (each browser lays those out its
+  // own way, and moves and hides them). The recording's sits in its own player row below.
+  const filmSpeed = !audio && <PlaybackSpeed rate={rate} onRate={pickRate} side="top" className="ib-speed-vid" phone={phone} />;
+  const phoneMeta = phone && (
+    <div className="ib-vmeta" data-video-meta="">
+      <span>{meta}</span>
+      <span className="ib-sp" />
+      <span>{plural(sorted.length, 'comment')}</span>
+      {filmSpeed}
+    </div>
+  );
+
+  // One dot per comment at its moment (a click seeks there and selects it), the comment being written, the playhead.
+  const rail = (
+    <div className="ib-vrail" role="group" aria-label="Comments on the timeline" data-video-rail="">
+      {span !== null &&
+        sorted.map((annotation) => {
+          const time = readInboxVideoTime(annotation)!;
+          return (
+            <Tip key={annotation.id} content={`${formatInboxVideoTime(time)}: ${annotation.text ?? ''}`}>
+              <button
+                type="button"
+                className={`ib-vdot${annotation.id === selectedId ? ' ib-on' : ''}`}
+                style={{ left: at(time) }}
+                onClick={() => {
+                  seek(time);
+                  onSelect(annotation.id);
+                }}
+                aria-label={`Go to the comment at ${formatInboxVideoTime(time)}`}
+                data-video-dot={annotation.id}
+              />
+            </Tip>
+          );
+        })}
+      {span !== null && pinned !== null && <span className="ib-vdot ib-draft" style={{ left: at(pinned) }} aria-hidden="true" data-video-draft-dot="" />}
+      {span !== null && !audio && <span className="ib-vplay" style={{ left: at(current) }} aria-hidden="true" />}
+    </div>
+  );
+
+  /** Play or pause the recording (its own button: the `<audio>` has no controls of its own). */
+  const togglePlay = () => {
+    const media = videoRef.current;
+    if (!media) return;
+    if (media.paused) void media.play().catch(() => {});
+    else media.pause();
+  };
+
+  /** A press or a drag on the recording's bar: the moment moves there, and it plays on if it was playing. */
+  const scrubTo = (time: number) => {
+    const media = videoRef.current;
+    if (!media) return;
+    try {
+      media.currentTime = time;
+    } catch {
+      // Not seekable yet: the metadata is still loading.
+    }
+    setCurrent(time);
+  };
+
+  const stageBody = audio ? (
+    <div className="ib-audbox" data-audio-player="">
+      <audio ref={videoRef as RefObject<HTMLAudioElement>} {...mediaProps} />
+      {/* Its name (a phone in full screen shows no header), and its type and length (a phone's length is in the line under the bar). */}
+      <div className="ib-audtop">
+        <span className="ib-audic" aria-hidden="true">
+          <Icon name="music" size={16} />
+        </span>
+        <span className="ib-audnm">
+          <FileName name={attachment.name} />
+        </span>
+        <span className="ib-audmeta">{[inboxAttachmentKindLabel(attachment.kind, attachment.name, attachment.media_type), phone ? '' : meta].filter(Boolean).join(' · ')}</span>
+      </div>
+      <div className="ib-audrow">
+        <button type="button" className="ib-audplay" onClick={togglePlay} aria-label={playing ? 'Pause' : 'Play'} data-audio-play={playing ? 'playing' : 'paused'}>
+          <Icon name={playing ? 'pause' : 'play'} size={18} />
+        </button>
+        <div className="ib-audtrack">
+          <AudioScrub name={attachment.name} peaks={peaks} current={current} span={span} onSeek={scrubTo} onFocusChange={setFocused}>
+            {span !== null && <span className="ib-vplay" style={{ left: at(current) }} aria-hidden="true" />}
+          </AudioScrub>
+          {rail}
+        </div>
+        <span className="ib-audtime" data-video-time-now="">
+          {formatInboxVideoTime(current)}
+          {span !== null && <span className="ib-mut"> / {formatInboxVideoTime(span)}</span>}
+        </span>
+        <PlaybackSpeed rate={rate} onRate={pickRate} side="bottom" className="ib-speed-aud" phone={phone} />
+      </div>
+      {phoneMeta}
+    </div>
+  ) : (
+    <div className="ib-vidbox" style={{ '--ib-ar': String(ratio) } as CSSProperties}>
+      <video
+        ref={videoRef as RefObject<HTMLVideoElement>}
+        className="ib-video"
+        {...mediaProps}
+        controls
+        poster={poster}
+        playsInline
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+      />
+      {phoneMeta}
+      {phone ? (
+        rail
+      ) : (
+        // The line under the film: its comments' rail, and the speed at its right end.
+        <div className="ib-vidunder" data-video-foot="">
+          {rail}
+          {filmSpeed}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className={`ib-vidview${phone ? ' ib-vidphone' : ''}${audio ? ' ib-audview' : ''}`} data-video-view={attachment.id} data-audio-view={audio ? attachment.id : undefined}>
+      <div className={`ib-vidstage${audio ? ' ib-audstage' : ''}`} data-claims-arrows={focused ? 'true' : undefined}>
+        {stageBody}
+        {phone && sorted.length > 0 && (
+          <div className="ib-vlist" data-video-list="">
+            <div className="ib-vlbl">Comments</div>
+            {sorted.map((annotation) => {
+              const time = readInboxVideoTime(annotation)!;
+              const image = markupOf(annotation);
+              return (
+                <button
+                  key={annotation.id}
+                  type="button"
+                  className={`ib-vcard${annotation.id === selectedId ? ' ib-on' : ''}`}
+                  onClick={() => {
+                    seek(time);
+                    onSelect(annotation.id);
+                  }}
+                  data-video-card={annotation.id}
+                >
+                  <span className="ib-vtop">
+                    <span className="ib-vtime">{formatInboxVideoTime(time)}</span>
+                    {image && (
+                      <span className="ib-vframe">
+                        <img src={getImageSrc(image.path)} alt="" />
+                        {/marked up$/.test(image.name) && (
+                          <span className="ib-vpen" aria-hidden="true">
+                            <Icon name="pen" size={9} />
+                          </span>
+                        )}
+                      </span>
+                    )}
+                  </span>
+                  <span className="ib-vtext">{annotation.text}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      {composer}
+      {phone && !readOnly && !composing && !fullComposer && (
+        <div className="ib-vbar" data-file-foot="">
+          <button
+            type="button"
+            className="ib-btn ib-pri ib-vbig"
+            onClick={() => {
+              setComposing(true);
+              if (suggestion && !suggested.current && text.trim() === '') {
+                suggested.current = true;
+                setText(suggestion.comment);
+              }
+              void pin();
+              requestAnimationFrame(() => textRef.current?.focus());
+            }}
+            data-video-compose=""
+          >
+            Comment at {formatInboxVideoTime(current)}
+          </button>
+        </div>
+      )}
+      <OverWindow>
+        <ImageAnnotator
+          imageSrc={frame?.url ?? ''}
+          isOpen={annotating && frame !== null}
+          escapeCancels={DRAWING_SCREEN.escapeCancels}
+          hint={DRAWING_SCREEN.hint}
+          // A touch phone draws on the frame full screen, zoomable, as on an image (ImageAttachmentView).
+          zoomable={touchPhone || undefined}
+          onClose={() => {
+            setAnnotating(false);
+            requestAnimationFrame(() => textRef.current?.focus());
+          }}
+          onAccept={async (blob, hasDrawings) => {
+            // Nothing drawn: the plain frame still rides the comment.
+            if (!hasDrawings || !acceptable.current) return;
+            acceptable.current = false;
+            try {
+              const keptFile = await source.keepMarkup(blob);
+              await addDrawing({ path: keptFile.path, name: `${videoFrameName(attachment.name, kept?.time ?? pinned ?? current)}, marked up` });
+            } catch (cause) {
+              onError(cause instanceof InboxApiError ? cause.message : 'The drawing was not kept.');
+            }
+          }}
+        />
+      </OverWindow>
+    </div>
+  );
+});

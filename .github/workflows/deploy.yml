@@ -1,5 +1,34 @@
 name: Deploy
 
+# Deploys after the Test workflow passes on a push to main: workflow_run starts
+# this workflow when that Test run completes, so nothing waits on a runner.
+# Only a Test run for a push to main in this repository can deploy. A PR run of
+# Test (a fork's included, even from a branch named main) also completes and
+# starts this workflow, but every job below skips it, so no code from a PR ever
+# runs next to the deploy secrets.
+#
+# The site lane: a push to main that touches apps/marketing/ also starts this
+# workflow (push, this repository only; never a PR). The site-lane job decides
+# whether every commit since the last main commit whose Test run passed (the
+# base detect-changes diffs from) changes only the marketing site, and docs the
+# site is not built from (scripts/site-lane.ts). If so, it runs the site's own
+# checks (install, build, every test under apps/marketing/ with
+# security-build.test.ts, and the tests the change reaches, as a PR's plan picks
+# them) and then the same deploy-marketing job publishes the pushed commit,
+# without waiting for Test. Anything else the site is built from (the shared
+# packages and skills it imports, the lockfile, a manifest), a site file the
+# product fetches at runtime (PUSH_RUNTIME_SITE in scripts/ci-affected.ts), any
+# other path, or a base it cannot read leaves the push to the path above. The
+# repo variable SITE_LANE=off turns the lane off. A failed lane is a failed
+# Deploy run on the commit and publishes nothing; Test is not touched by it.
+#
+# Both paths reach one deploy-marketing job: one definition, one concurrency
+# group. Before it syncs, scripts/site-deploy.ts reads the commit live now (a
+# record in the bucket, _site-deploy/<commit>, added before each sync; a
+# person reads https://plannotator.ai/_site-deploy/live.txt or the Deploy run's
+# notice) and never publishes a commit older than it (in its history), nor the
+# same commit or one with no change to what the site is built from again. A
+# manual run publishes what it is asked to.
 on:
   push:
     tags:
@@ -22,200 +51,305 @@ permissions:
   contents: read
 
 jobs:
-  # Deploy remains automatic, but only after the exact commit has passed the
-  # repository's full Test workflow. The workflows start together on a main
-  # push; this job waits for Test instead of allowing deployment to race it.
-  verify:
-    name: Require successful Test run
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  detect-changes:
+    # A manual run deploys the commit it runs on; it still needs a passed Test
+    # run there (checked below, no waiting).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: read
-    steps:
-    - name: Wait for Test on this commit
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPOSITORY: ${{ github.repository }}
-        COMMIT_SHA: ${{ github.sha }}
-      shell: bash
-      run: |
-        deadline=$((SECONDS + 2400))
-        previous_state=""
-
-        while (( SECONDS < deadline )); do
-          run_json="$(gh api --method GET \
-            "repos/${REPOSITORY}/actions/workflows/test.yml/runs" \
-            -f head_sha="$COMMIT_SHA" \
-            -f per_page=100)"
-
-          # Manual Test runs are an explicit recovery path when the original
-          # push run was skipped or cannot be recovered. Ignore PR runs and
-          # retain the exact-SHA requirement enforced by the API query.
-          run="$(jq -c '
-            [.workflow_runs[]
-              | select(
-                  .head_sha == env.COMMIT_SHA and
-                  (.event == "push" or .event == "workflow_dispatch")
-                )]
-            | sort_by(.created_at)
-            | last // {}
-          ' <<<"$run_json")"
-
-          trigger="$(jq -r '.event // ""' <<<"$run")"
-          status="$(jq -r '.status // "missing"' <<<"$run")"
-          conclusion="$(jq -r '.conclusion // ""' <<<"$run")"
-          run_url="$(jq -r '.html_url // ""' <<<"$run")"
-          state="${trigger}:${status}:${conclusion}"
-
-          if [[ "$state" != "$previous_state" ]]; then
-            if [[ -n "$run_url" ]]; then
-              echo "Test workflow for ${COMMIT_SHA}: ${state} (${run_url})"
-            else
-              echo "Test workflow for ${COMMIT_SHA}: ${state}"
-            fi
-            previous_state="$state"
-          fi
-
-          if [[ "$status" == "completed" ]]; then
-            if [[ "$conclusion" == "success" ]]; then
-              exit 0
-            fi
-            echo "Test workflow did not succeed for ${COMMIT_SHA}: ${conclusion} (${run_url})" >&2
-            exit 1
-          fi
-
-          sleep 15
-        done
-
-        echo "Timed out waiting for the Test workflow on ${COMMIT_SHA}." >&2
-        exit 1
-
-  detect-changes:
-    needs: verify
-    runs-on: ubuntu-latest
     outputs:
+      sha: ${{ steps.changes.outputs.sha }}
       marketing: ${{ steps.changes.outputs.marketing }}
       portal: ${{ steps.changes.outputs.portal }}
       paste: ${{ steps.changes.outputs.paste }}
       waitlist: ${{ steps.changes.outputs.waitlist }}
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7.0.0
-      with:
-        persist-credentials: false
-
-    - name: Check for changes
-      id: changes
-      env:
-        EVENT_NAME: ${{ github.event_name }}
-        TARGET: ${{ inputs.target }}
-        BEFORE_SHA: ${{ github.event.before }}
-        CURRENT_SHA: ${{ github.sha }}
-      run: |
-        if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-          if [[ "$TARGET" == "all" || "$TARGET" == "marketing" ]]; then
-            echo "marketing=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "marketing=false" >> "$GITHUB_OUTPUT"
-          fi
-          if [[ "$TARGET" == "all" || "$TARGET" == "portal" ]]; then
-            echo "portal=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "portal=false" >> "$GITHUB_OUTPUT"
-          fi
-          if [[ "$TARGET" == "all" || "$TARGET" == "paste" ]]; then
-            echo "paste=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "paste=false" >> "$GITHUB_OUTPUT"
-          fi
-          if [[ "$TARGET" == "all" || "$TARGET" == "waitlist" ]]; then
-            echo "waitlist=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "waitlist=false" >> "$GITHUB_OUTPUT"
-          fi
-        else
-          # For push events, check what changed
-          git fetch origin "$BEFORE_SHA" --depth=1 2>/dev/null || true
-
-          MARKETING_CHANGED=$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null | grep -E '^(apps/marketing/|packages/)' || true)
-          PORTAL_CHANGED=$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null | grep -E '^(apps/portal/|packages/)' || true)
-          PASTE_CHANGED=$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null | grep -E '^apps/paste-service/' || true)
-          WAITLIST_CHANGED=$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null | grep -E '^apps/waitlist-service/' || true)
-
-          if [[ -n "$MARKETING_CHANGED" ]]; then
-            echo "marketing=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "marketing=false" >> "$GITHUB_OUTPUT"
+      # A Test preview (a manual run given as_if_changed, named "Test preview: ...")
+      # runs only part of Test, so it does not count.
+      - name: Manual run needs a passed Test run on this commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          conclusion="$(gh api "repos/${REPOSITORY}/actions/workflows/test.yml/runs?head_sha=${COMMIT_SHA}&per_page=100" \
+            --jq '[.workflow_runs[] | select(.event == "push" or (.event == "workflow_dispatch" and ((.display_title // "") | startswith("Test preview:") | not)))] | sort_by(.created_at) | last | .conclusion // "missing"')"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "The latest Test run on ${COMMIT_SHA} is ${conclusion}, not success. Run Test on this commit first." >&2
+            exit 1
           fi
 
-          if [[ -n "$PORTAL_CHANGED" ]]; then
-            echo "portal=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "portal=false" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # A workflow_run checks out the default branch's tip by default, which
+          # may be newer than the commit Test passed on.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Check for changes
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+          CURRENT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TEST_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "sha=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+            for site in marketing portal paste waitlist; do
+              if [[ "$TARGET" == "all" || "$TARGET" == "$site" ]]; then
+                echo "$site=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "$site=false" >> "$GITHUB_OUTPUT"
+              fi
+            done
+            exit 0
           fi
 
-          if [[ -n "$PASTE_CHANGED" ]]; then
-            echo "paste=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "paste=false" >> "$GITHUB_OUTPUT"
+          # The passed Test runs of pushes to main, newest first (one call).
+          RUNS="$(gh api "repos/${REPOSITORY}/actions/workflows/test.yml/runs?branch=main&event=push&status=success&per_page=50")"
+
+          # What changed since the last push to main that passed Test. Every
+          # push to main runs Test, so that is where the last deploy came
+          # from; a push whose Test failed is deployed with the next one.
+          BEFORE_SHA="$(jq -r "[.workflow_runs[] | select(.id < ${TEST_RUN_ID})] | first | .head_sha // empty" <<< "$RUNS")"
+          if [[ -z "$BEFORE_SHA" ]] || ! git fetch --no-tags --depth=1 origin "$BEFORE_SHA"; then
+            BEFORE_SHA="${CURRENT_SHA}^1"
           fi
 
-          if [[ -n "$WAITLIST_CHANGED" ]]; then
-            echo "waitlist=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "waitlist=false" >> "$GITHUB_OUTPUT"
+          # A newer main commit already passed Test (runs finish out of order,
+          # or this one was rerun): deploy that newer tree instead of this
+          # older one, which would overwrite it. It contains this commit, and
+          # the diff from this run's base covers this commit's changes too.
+          # "Newer" means the commit contains this one (GitHub's compare says
+          # "ahead"), not only a later Test run: a run id is no proof of order
+          # on main, and deploying an older tree would put old pages live.
+          NEWEST_ID="$(jq -r '.workflow_runs[0].id // 0' <<< "$RUNS")"
+          NEWEST_SHA="$(jq -r '.workflow_runs[0].head_sha // empty' <<< "$RUNS")"
+          if (( NEWEST_ID > TEST_RUN_ID )) && [[ -n "$NEWEST_SHA" && "$NEWEST_SHA" != "$CURRENT_SHA" ]]; then
+            ORDER="$(gh api "repos/${REPOSITORY}/compare/${CURRENT_SHA}...${NEWEST_SHA}" --jq '.status' || echo unknown)"
+            if [[ "$ORDER" == "ahead" ]]; then
+              CURRENT_SHA="$NEWEST_SHA"
+              echo "Test run ${NEWEST_ID} passed on a newer main commit; deploying its tree ${CURRENT_SHA}."
+              git fetch --no-tags --depth=1 origin "$CURRENT_SHA"
+            else
+              echo "Test run ${NEWEST_ID} is on ${NEWEST_SHA}, which is ${ORDER} of this commit, not ahead; deploying this commit."
+            fi
           fi
-        fi
+          echo "sha=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Changes ${BEFORE_SHA}..${CURRENT_SHA}"
+          # --no-renames: a moved file lists its old path too, so a page moved out
+          # of a site still deploys that site.
+          CHANGED="$(git diff --no-renames --name-only "$BEFORE_SHA" "$CURRENT_SHA")"
 
+          changed() { grep -Eq "$1" <<< "$CHANGED" && echo true || echo false; }
+          # The marketing site's pattern is SITE_INPUTS in scripts/site-deploy.ts
+          # (scripts/site-lane.test.ts holds the two together).
+          {
+            echo "marketing=$(changed '^(apps/marketing/|apps/skills/|packages/|patches/|bun\.lock$|package\.json$|bunfig\.toml$|\.github/workflows/deploy\.yml$)')"
+            echo "portal=$(changed '^(apps/portal/|packages/)')"
+            echo "paste=$(changed '^apps/paste-service/')"
+            echo "waitlist=$(changed '^apps/waitlist-service/')"
+          } >> "$GITHUB_OUTPUT"
+
+  # A push to main that touches the site: is everything since the last passed
+  # Test run site-only (scripts/site-lane.ts), and do the site's own checks
+  # pass? Then deploy-marketing publishes the pushed commit. No secrets and no
+  # environment here: the token reads Test's runs and GitHub's compare, and
+  # only the deciding step gets it. Not site-only ends green with a notice
+  # saying why; a failed check fails the run and nothing is published.
+  site-lane:
+    name: Site lane (site-only push, the site's own checks)
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'backnotprop/plannotator'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      publish: ${{ steps.ready.outputs.publish }}
+      sha: ${{ steps.range.outputs.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      # Before the install: a push that is not site-only stops here, in seconds.
+      - name: Is every commit since the last passed Test run site-only?
+        id: range
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SITE_LANE: ${{ vars.SITE_LANE }}
+          CI_AFFECTED: ${{ vars.CI_AFFECTED }}
+        run: bun run scripts/site-lane.ts range
+
+      - name: Install dependencies
+        if: steps.range.outputs.eligible == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Generate Pi extension shared copies
+        if: steps.range.outputs.eligible == 'true'
+        run: bash apps/pi-extension/vendor.sh
+
+      - name: Pick the site's tests
+        id: tests
+        if: steps.range.outputs.eligible == 'true'
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: bun run scripts/site-lane.ts tests
+
+      - name: Build marketing
+        if: steps.tests.outputs.eligible == 'true'
+        run: bun run build:marketing
+
+      - name: Run the site's tests
+        if: steps.tests.outputs.eligible == 'true'
+        env:
+          CI_AFFECTED_TESTS: ${{ steps.tests.outputs.unit_tests }}
+          CI_AFFECTED_SHARDS: '1'
+        run: bun run scripts/ci-test-lane.ts unit-1
+
+      - name: Run the site's DOM tests
+        if: steps.tests.outputs.eligible == 'true' && steps.tests.outputs.dom_tests != '[]'
+        env:
+          CI_AFFECTED_TESTS: ${{ steps.tests.outputs.dom_tests }}
+          CI_AFFECTED_SHARDS: '1'
+        run: bun run scripts/ci-test-lane.ts dom-1
+
+      - name: Ready to publish
+        id: ready
+        if: steps.tests.outputs.eligible == 'true'
+        run: echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  # The one publish of the marketing site, reached two ways: after Test passes
+  # (detect-changes) and from a site-only push (site-lane). !cancelled() lets
+  # it run when the path it does not come from was skipped; each way must have
+  # succeeded and asked for it.
   deploy-marketing:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.marketing == 'true'
-    runs-on: ubuntu-latest
+    needs: [detect-changes, site-lane]
+    if: >-
+      !cancelled() &&
+      ((needs.detect-changes.result == 'success' && needs.detect-changes.outputs.marketing == 'true') ||
+      (needs.site-lane.result == 'success' && needs.site-lane.outputs.publish == 'true'))
+    # One deploy of a site at a time, queued and never cancelled, so two never
+    # sync over each other. The group is on the deploy jobs, not the workflow:
+    # a skipped Deploy run (a failed Test, a PR) must not replace a pending one.
+    # A queued deploy can replace a pending one, which may be from a newer
+    # commit; that change then goes live with the next deploy after Test, and
+    # the guard below keeps the queued one from publishing an older tree.
+    concurrency:
+      group: deploy-marketing
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
     environment: production
+    env:
+      CANDIDATE: ${{ needs.detect-changes.outputs.sha || needs.site-lane.outputs.sha }}
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7.0.0
-      with:
-        persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.CANDIDATE }}
+          persist-credentials: false
 
-    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6   # v2.2.0
-      with:
-        bun-version: 1.3.14
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
 
-    - name: Install dependencies
-      run: bun install --frozen-lockfile
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
-    - name: Build marketing
-      run: bun run build:marketing
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build marketing
+        run: bun run build:marketing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Configure AWS credentials
-      uses: 
-        aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d       # v6.2.2
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: us-east-1
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
 
-    - name: Deploy to S3
-      run: aws s3 sync apps/marketing/dist/ s3://plannotator-marketing/ --delete
+      # Inside the concurrency group, so nothing publishes between the read
+      # and the record. It lists _site-deploy/ (the sync already lists the
+      # bucket) and asks GitHub's compare which commit is newer; it fails the
+      # job on anything it cannot read. An older commit, the live one again,
+      # or one with no change to what the site is built from is not published,
+      # and the job ends green with a notice saying why.
+      - name: Publish only a commit newer than the live one
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: bun run scripts/site-deploy.ts guard
 
-      # The sync guesses text/markdown with no charset for .md; re-upload the
-      # Inbox install prompt (/inbox/prompt.md) with an explicit charset.
-    - name: Set the Inbox prompt's content type
-      run: |
-        if [ -f apps/marketing/dist/inbox/prompt.md ]; then
-          aws s3 cp apps/marketing/dist/inbox/prompt.md s3://plannotator-marketing/inbox/prompt.md \
+      # Before the sync, so from the moment the bucket may hold this tree the
+      # record names it: a publish cut short (a failed step below, a cancelled
+      # run) leaves both commits named, and the guard refuses anything older
+      # than either. The older record goes once the tree is up (below).
+      - name: Add this commit to the live record
+        if: steps.guard.outputs.publish == 'true'
+        run: bun run scripts/site-deploy.ts mark
+
+      # The site's videos are not in the repository: they are uploaded by hand
+      # to assets/ in this bucket. The excludes keep --delete from removing
+      # them (an excluded key is neither uploaded nor deleted). assets/hosted/
+      # holds other files uploaded by hand, such as pictures an in-app dialog
+      # loads. See "Videos" in docs/agent-guides/project-and-development.md.
+      # _site-deploy/ is the record of the live commit, written below.
+      - name: Deploy to S3
+        if: steps.guard.outputs.publish == 'true'
+        run: >-
+          aws s3 sync apps/marketing/dist/ s3://plannotator-marketing/ --delete
+          --exclude "assets/*.mp4" --exclude "assets/*.webm"
+          --exclude "assets/hosted/*" --exclude "_site-deploy/*"
+
+      # The sync names .md text/markdown and .txt text/plain with no charset, so
+      # an agent reads the agent pages' curly quotes and arrows as Latin-1.
+      # Every .md and .txt the build emits goes up again with UTF-8 named
+      # (apps/marketing/llms.test.ts checks the patterns cover them).
+      - name: Set the agent pages' content type
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          aws s3 cp apps/marketing/dist/ s3://plannotator-marketing/ --recursive \
+            --exclude "*" --include "*.md" \
             --content-type "text/markdown; charset=utf-8"
-        fi
+          aws s3 cp apps/marketing/dist/ s3://plannotator-marketing/ --recursive \
+            --exclude "*" --include "*.txt" \
+            --content-type "text/plain; charset=utf-8"
 
-    - name: Invalidate CloudFront
-      run: |
-        aws cloudfront create-invalidation \
-          --distribution-id E284ON0A27O2H6 \
-          --paths "/*"
+      # The bucket holds this commit's tree now: live.txt names it and the
+      # older records go, before the invalidation.
+      - name: Record the live commit
+        if: steps.guard.outputs.publish == 'true'
+        run: bun run scripts/site-deploy.ts record
+
+      - name: Invalidate CloudFront
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id E284ON0A27O2H6 \
+            --paths "/*"
 
   # NOTE: the /install.sh, /install.ps1, and /install.cmd paths on
   # plannotator.ai are served from the dedicated plannotator-install-scripts
@@ -228,90 +362,101 @@ jobs:
   deploy-portal:
     needs: detect-changes
     if: needs.detect-changes.outputs.portal == 'true'
-    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-portal
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
     environment: production
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7.0.0
-      with:
-        persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.detect-changes.outputs.sha }}
+          persist-credentials: false
 
-    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6   # v2.2.0
-      with:
-        bun-version: 1.3.14
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
 
-    - name: Install dependencies
-      run: bun install --frozen-lockfile
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
-    - name: Build portal
-      run: bun run build:portal
+      - name: Build portal
+        run: bun run build:portal
 
-    - name: Configure AWS credentials
-      uses: 
-        aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d       # v6.2.2
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: us-east-1
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
 
-    - name: Deploy to S3
-      run: aws s3 sync apps/portal/dist/ s3://plannotator-portal/ --delete
+      - name: Deploy to S3
+        run: aws s3 sync apps/portal/dist/ s3://plannotator-portal/ --delete
 
-    - name: Invalidate CloudFront
-      run: |
-        aws cloudfront create-invalidation \
-          --distribution-id EP0KB9EFUWYXR \
-          --paths "/*"
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id EP0KB9EFUWYXR \
+            --paths "/*"
 
   deploy-paste:
     needs: detect-changes
     if: needs.detect-changes.outputs.paste == 'true'
-    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-paste
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     environment: production
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7.0.0
-      with:
-        persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.detect-changes.outputs.sha }}
+          persist-credentials: false
 
-    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6   # v2.2.0
-      with:
-        bun-version: 1.3.14
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
 
-    - name: Install dependencies
-      run: bun install --frozen-lockfile
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
-    - name: Deploy to Cloudflare
-      working-directory: apps/paste-service
-      run: npx wrangler deploy
-      env:
-        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Deploy to Cloudflare
+        working-directory: apps/paste-service
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   deploy-waitlist:
     needs: detect-changes
     if: needs.detect-changes.outputs.waitlist == 'true'
-    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-waitlist
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     environment: production
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7.0.0
-      with:
-        persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.detect-changes.outputs.sha }}
+          persist-credentials: false
 
-    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6   # v2.2.0
-      with:
-        bun-version: 1.3.14
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
 
-    - name: Install dependencies
-      run: bun install --frozen-lockfile
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
-    - name: Deploy to Cloudflare
-      working-directory: apps/waitlist-service
-      run: npx wrangler deploy
-      env:
-        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Deploy to Cloudflare
+        working-directory: apps/waitlist-service
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

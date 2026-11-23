@@ -14,10 +14,13 @@ import { buildHeadingSlugMap } from '@plannotator/ui/utils/slugify';
 import type { DiffFileStatus } from '../types';
 import { useReviewStateOptional } from '../dock/ReviewStateContext';
 import { useFileContents, type UseFileContentsResult } from '../hooks/useFileContents';
+import { ReviewDiagramFence, diagramFenceKind } from './ReviewDiagramFence';
+import type { DiagramEngineUrls } from '../utils/diagramEngineContract';
 import { fileViewOfRendered, renderedViewOf, type MarkdownPreviewView } from '../hooks/useMarkdownPreview';
 import {
   MARKDOWN_PREVIEW_SIZE_LIMIT,
   REMOTE_IMAGE_HELD_TITLE,
+  REMOTE_IMAGE_NOT_LOADED_TITLE,
   isExternalImageSource,
   isRemoteImageSource,
   markdownPreviewImageUrl,
@@ -27,11 +30,12 @@ import {
   utf8ByteLength,
 } from '../utils/markdownPreview';
 
-// Mermaid and Graphviz fences render as code here, never as diagrams: the
-// single-file review build inlines every dynamic import, so importing a
-// diagram engine anywhere in the review app (even lazily) puts the Mermaid and
-// Graphviz runtimes in every review's page. Owner decision (approval record,
-// 2026-10-12 amendment): performance wins. tests/entry-assets.test.ts guards it.
+// Mermaid and Graphviz fences draw as diagrams through the engine the review
+// server serves as separate files, imported only when a preview holds such a
+// fence (ReviewDiagramFence, owner approval "review-diagrams-on-demand"). The
+// review page itself never carries a diagram runtime: the single-file build
+// inlines every dynamic import, so nothing here may import one, even lazily
+// (tests/entry-assets.test.ts). Without the engine they show as code.
 
 export interface MarkdownFilePreviewProps {
   filePath: string;
@@ -48,6 +52,14 @@ export interface MarkdownFilePreviewProps {
   imageSnapshotId?: string;
   /** Whether the server reads images for this review (static patch / P4: no). */
   imagesAvailable?: boolean;
+  /**
+   * Where an image of the document is read: absent, code review's own
+   * `/api/review-markdown-image?doc=…&side=…&src=…&snapshot=…`. A host with
+   * its own routes (the Inbox) passes a function that turns that URL into
+   * one of its own, as `ImageDiffPreview`'s `fetchImpl` does for a changed
+   * image; `imageSnapshotId` must then be its own.
+   */
+  imageUrl?: (url: string) => string;
   /** Every file path in this review: a link to one of them opens it. */
   reviewFilePaths?: ReadonlySet<string>;
   onOpenReviewFile?: (filePath: string) => void;
@@ -65,6 +77,16 @@ export interface MarkdownFilePreviewProps {
    * off otherwise.
    */
   holdRemoteImages?: boolean;
+  /**
+   * A host whose page never loads a remote image (the Plannotator Inbox,
+   * whose window allows only its own pictures): every remote image is the
+   * quiet placeholder, with no notice, no button and no click to load it.
+   * Wins over `holdRemoteImages`. Absent: as above.
+   */
+  neverLoadRemoteImages?: boolean;
+  /** Where the diagram engine is served; default: review state's advert.
+   *  `null` keeps diagram fences as code. */
+  diagramEngine?: DiagramEngineUrls | null;
 }
 
 /** A comment made in this preview, as the text highlighter sees it. */
@@ -118,6 +140,7 @@ export const MarkdownFilePreview: React.FC<MarkdownFilePreviewProps> = ({
   reviewSnapshotId,
   imageSnapshotId,
   imagesAvailable = false,
+  imageUrl,
   reviewFilePaths,
   onOpenReviewFile,
   variant,
@@ -125,6 +148,8 @@ export const MarkdownFilePreview: React.FC<MarkdownFilePreviewProps> = ({
   view: viewProp,
   onViewChange,
   holdRemoteImages,
+  neverLoadRemoteImages = false,
+  diagramEngine: diagramEngineProp,
 }) => {
   const state = useReviewStateOptional();
   const ownContents = useFileContents({
@@ -187,10 +212,12 @@ export const MarkdownFilePreview: React.FC<MarkdownFilePreviewProps> = ({
 
   const snapshot = imageSnapshotId ?? state?.snapshotId;
   const canLoadImages = imagesAvailable || state?.imagePreviewAvailable === true;
-  const holdRemote = holdRemoteImages ?? !!state?.prMetadata;
+  const holdRemote = !neverLoadRemoteImages && (holdRemoteImages ?? !!state?.prMetadata);
   const [remoteImagesLoaded, setRemoteImagesLoaded] = useState(false);
   const holdingRemote = holdRemote && !remoteImagesLoaded;
   const makeImageResolver = useCallback((side: PlanDiffSide): ImageResolver => (src) => {
+    // Its own title: the held count, the notice and click-to-load only see held ones.
+    if (neverLoadRemoteImages && isRemoteImageSource(src)) return { kind: 'unavailable', title: REMOTE_IMAGE_NOT_LOADED_TITLE };
     if (holdRemote && isRemoteImageSource(src)) {
       return holdingRemote
         ? { kind: 'unavailable', title: REMOTE_IMAGE_HELD_TITLE }
@@ -201,19 +228,25 @@ export const MarkdownFilePreview: React.FC<MarkdownFilePreviewProps> = ({
     // The patch names the file by its display path (a deletion's is its old
     // one). The source goes as written: the route normalizes it the same way
     // it reads the file's references.
-    return { kind: 'src', src: markdownPreviewImageUrl({ doc: filePath, side, src, snapshot }) };
-  }, [canLoadImages, filePath, snapshot, holdRemote, holdingRemote]);
+    const url = markdownPreviewImageUrl({ doc: filePath, side, src, snapshot });
+    return { kind: 'src', src: imageUrl ? imageUrl(url) : url };
+  }, [canLoadImages, filePath, snapshot, neverLoadRemoteImages, holdRemote, holdingRemote, imageUrl]);
   const resolveOldImage = useMemo(() => makeImageResolver('old'), [makeImageResolver]);
   const resolveNewImage = useMemo(() => makeImageResolver('new'), [makeImageResolver]);
 
+  const engineUrls = diagramEngineProp !== undefined ? diagramEngineProp : state?.diagramEngine ?? null;
   const renderBlock = useCallback((block: Block, orderedIndex: number | null, side: PlanDiffSide, headingAnchorId?: string) => {
-    const body = <BlockRenderer block={block} orderedIndex={orderedIndex} headingAnchorId={headingAnchorId} />;
+    let body: React.ReactNode = <BlockRenderer block={block} orderedIndex={orderedIndex} headingAnchorId={headingAnchorId} />;
+    const diagramKind = engineUrls ? diagramFenceKind(block) : null;
+    if (engineUrls && diagramKind) {
+      body = <ReviewDiagramFence block={block} kind={diagramKind} urls={engineUrls} fallback={body} />;
+    }
     return (
       <ImageResolverContext.Provider value={side === 'old' ? resolveOldImage : resolveNewImage}>
         {body}
       </ImageResolverContext.Provider>
     );
-  }, [resolveOldImage, resolveNewImage]);
+  }, [resolveOldImage, resolveNewImage, engineUrls]);
   const renderDiffBlock = useCallback(
     (block: Block, orderedIndex: number | null, side: PlanDiffSide) => renderBlock(block, orderedIndex, side),
     [renderBlock],

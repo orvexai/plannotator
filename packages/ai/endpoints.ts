@@ -96,6 +96,8 @@ export interface QueryRequest {
 export interface AbortRequest {
   /** The session ID to abort. */
   sessionId: string;
+  /** A newer question replaced this answer. Session bridges keep a host turn running. */
+  reason?: "supersede";
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +109,7 @@ export interface AIEndpointDeps {
   registry: ProviderRegistry;
   /**
    * Providers registered ONLY so their model catalogs can be served to the
-   * agent-job launchers (Review Agents, Code Tour, Guided Review), used when a
+   * agent-job launchers (Review Agents, Guided Review), used when a
    * session bridge makes the bridge the sole Ask AI provider. They never take
    * an Ask AI session and are never listed under `providers`: a
    * `?activate=<id>` probe naming one runs its discovery and reports it under
@@ -145,6 +147,13 @@ export interface AIEndpointDeps {
    * `authorizeSessionBridgeRequest` (loopback Host) before the token check.
    */
   pullBridge?: { handle(req: Request): Promise<Response> | null };
+  /**
+   * A dropped `/api/ai/query` stream leaves the question running: the answer
+   * keeps draining and the provider decides what to do with it. The Inbox's
+   * Ask AI saves it, so a reload or a sleeping phone stops nothing. Default off:
+   * a disconnect aborts. `/api/ai/abort` aborts either way.
+   */
+  keepRunningOnDisconnect?: boolean;
 }
 
 /** Error code for a bridge request refused by `authorizeSessionBridgeRequest`. */
@@ -263,7 +272,14 @@ export function createAIEndpoints(deps: AIEndpointDeps) {
     beforeProviderSession,
     authorizeSessionBridgeRequest,
     pullBridge,
+    keepRunningOnDisconnect = false,
   } = deps;
+
+  // Streams whose question /api/ai/abort already handled. The browser drops a
+  // superseded answer's fetch only after that abort is acknowledged, so its
+  // disconnect can arrive after the next question started; it must not abort
+  // again (the session-level abort would hit the new question).
+  const liveStreams = new Map<string, Set<{ handled: boolean }>>();
 
   const handlePullBridge = async (req: Request): Promise<Response> => {
     if (!pullBridge) {
@@ -448,36 +464,49 @@ export function createAIEndpoints(deps: AIEndpointDeps) {
 
       // Stream the response using Server-Sent Events (SSE)
       const encoder = new TextEncoder();
+      const marker = { handled: false };
+      let markers = liveStreams.get(sessionId);
+      if (!markers) liveStreams.set(sessionId, (markers = new Set()));
+      markers.add(marker);
+      const forget = () => {
+        markers!.delete(marker);
+        if (markers!.size === 0 && liveStreams.get(sessionId) === markers) liveStreams.delete(sessionId);
+      };
+      // Set only with `keepRunningOnDisconnect`: the question drains into nothing.
+      let draining = false;
       const stream = new ReadableStream({
         async start(controller) {
+          const send = (text: string) => {
+            if (!draining) controller.enqueue(encoder.encode(text));
+          };
           try {
             const messages = Object.keys(queryOptions).length > 0
               ? entry.session.query(effectivePrompt, queryOptions)
               : entry.session.query(effectivePrompt);
             for await (const message of messages) {
-              const data = JSON.stringify(message);
-              controller.enqueue(
-                encoder.encode(`data: ${data}\n\n`)
-              );
+              send(`data: ${JSON.stringify(message)}\n\n`);
             }
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            send("data: [DONE]\n\n");
           } catch (err) {
             const errorMsg: AIMessage = {
               type: "error",
               error: err instanceof Error ? err.message : String(err),
               code: "stream_error",
             };
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify(errorMsg)}\n\n`)
-            );
+            send(`data: ${JSON.stringify(errorMsg)}\n\n`);
           } finally {
-            controller.close();
+            forget();
+            if (!draining) controller.close();
           }
         },
         cancel() {
           // Client disconnected (Stop fetch abort, superseding question, tab
           // close, navigation). Stop the in-flight turn so it doesn't keep
-          // running on the now long-lived provider process.
+          // running on the now long-lived provider process. Not when an abort
+          // request already handled this question (see liveStreams).
+          draining = keepRunningOnDisconnect;
+          forget();
+          if (marker.handled || draining) return;
           entry.session.abort();
         },
       });
@@ -505,7 +534,12 @@ export function createAIEndpoints(deps: AIEndpointDeps) {
         );
       }
 
-      entry.session.abort();
+      for (const marker of liveStreams.get(body.sessionId) ?? []) marker.handled = true;
+      if (body.reason === "supersede" && entry.session instanceof SessionBridgeSession) {
+        entry.session.supersede();
+      } else {
+        entry.session.abort();
+      }
       return Response.json({ ok: true });
     },
 

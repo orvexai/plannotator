@@ -125,6 +125,16 @@ describe.if(hasDom)('parseHtmlElementAnchor (validated DTO)', () => {
 describe.if(hasDom)('parseBridgeMessage selection additions', () => {
   const rect = { top: 10, left: 10, width: 100, height: 20 };
 
+  test('pin visibility accepts booleans only', () => {
+    for (const visible of [true, false]) {
+      const message = { type: 'plannotator-bridge-pin-visibility', visible };
+      expect(hookModule!.parseBridgeMessage(message)).toEqual({ type: 'plannotator-bridge-pin-visibility', visible });
+    }
+    for (const visible of [undefined, null, 0, 'false', {}]) {
+      expect(hookModule!.parseBridgeMessage({ type: 'plannotator-bridge-pin-visibility', visible })).toBeNull();
+    }
+  });
+
   test('carries a validated anchor and the pinpoint flag', () => {
     const parsed = hookModule!.parseBridgeMessage({
       type: 'plannotator-bridge-selection',
@@ -138,6 +148,29 @@ describe.if(hasDom)('parseBridgeMessage selection additions', () => {
       pinpoint: true,
       anchor: { selector: 'p.intro', tagName: 'p', text: 'Hello' },
     });
+  });
+
+  test('rich copy: the selection only flags support; the answer carries bounded markup', () => {
+    const message = {
+      type: 'plannotator-bridge-selection',
+      text: 'Hello',
+      rect,
+    };
+    expect(hookModule!.parseBridgeMessage({ ...message, richCopy: true })).toMatchObject({ richCopy: true });
+    expect(hookModule!.parseBridgeMessage({ ...message, richCopy: 'yes' })).not.toHaveProperty('richCopy');
+    // Markup on the selection message is ignored: it is built on request only.
+    expect(hookModule!.parseBridgeMessage({ ...message, html: '<b>x</b>' })).not.toHaveProperty('html');
+
+    const answer = { type: 'plannotator-bridge-rich-copy' as const, id: 'rc-1', html: '<strong>Hello</strong>', text: 'Hello' };
+    expect(hookModule!.parseBridgeMessage(answer))
+      .toEqual({ ...answer, truncated: false, tooLarge: false });
+    expect(hookModule!.parseBridgeMessage({ ...answer, truncated: true })).toMatchObject({ truncated: true });
+    expect(hookModule!.parseBridgeMessage({ ...message, richCopy: true, textCut: true })).toMatchObject({ textCut: true });
+    expect(hookModule!.parseBridgeMessage({ ...answer, html: 'x'.repeat(256 * 1024 + 1), tooLarge: true }))
+      .toMatchObject({ html: '', tooLarge: true });
+    expect(hookModule!.parseBridgeMessage({ ...answer, html: 42 })).toMatchObject({ html: '' });
+    expect(hookModule!.parseBridgeMessage({ ...answer, id: '' })).toBeNull();
+    expect(hookModule!.parseBridgeMessage({ ...answer, id: 'x'.repeat(65) })).toBeNull();
   });
 
   test('a malformed anchor is dropped without rejecting the selection', () => {
@@ -270,12 +303,105 @@ describe.if(hasDom)('pinpoint click-to-pin flow', () => {
     expect(document.querySelector('.annotation-toolbar')).toBeNull();
   });
 
+  test('a hidden slide hides its composer without losing the draft or its anchor', async () => {
+    const added: Annotation[] = [];
+    const { postSelection } = await mountViewer({ mode: 'selection', onAdd: (ann) => added.push(ann) });
+    await postSelection({ ...selectionMessage, pinpoint: true });
+    await typeComment('Keep this slide comment');
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: false });
+    expect(document.querySelector('[data-comment-popover]')).toBeNull();
+    expect(added).toHaveLength(0);
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: true });
+    expect(document.querySelector<HTMLTextAreaElement>('[data-comment-popover] textarea')?.value)
+      .toBe('Keep this slide comment');
+    await saveComment();
+    expect(added).toHaveLength(1);
+    expect(added[0]!.text).toBe('Keep this slide comment');
+    expect(added[0]!.htmlAnchor).toEqual(selectionMessage.anchor);
+  });
+
+  const settle = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+
+  test('the page replacing the target brings the hidden composer back with its text', async () => {
+    const added: Annotation[] = [];
+    const { postSelection } = await mountViewer({ mode: 'selection', onAdd: (ann) => added.push(ann) });
+    await postSelection({ ...selectionMessage, pinpoint: true });
+    await typeComment('Comment on the replaced slide');
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: false });
+    expect(document.querySelector('[data-comment-popover]')).toBeNull();
+    // The bridge found the new element through the anchor: it re-anchors the
+    // composer on it, then reports the draft visible again.
+    await postSelection({ type: 'plannotator-bridge-selection-rect', rect: { top: 300, left: 40, width: 120, height: 24 } });
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: true });
+    expect(document.querySelector<HTMLTextAreaElement>('[data-comment-popover] textarea')?.value)
+      .toBe('Comment on the replaced slide');
+    await saveComment();
+    expect(added).toHaveLength(1);
+    expect(added[0]!.text).toBe('Comment on the replaced slide');
+  });
+
+  test('Escape while the composer is hidden closes the hidden draft and is used', async () => {
+    const { postSelection } = await mountViewer({ mode: 'selection', onAdd: () => {} });
+    await postSelection({ ...selectionMessage, pinpoint: true });
+    await typeComment('Draft kept for later');
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: false });
+    (document.activeElement as HTMLElement | null)?.blur();
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    await act(async () => { document.body.dispatchEvent(escape); });
+    expect(escape.defaultPrevented).toBe(true);
+    // Closed, not just hidden: the target coming back shows nothing.
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: true });
+    expect(document.querySelector('[data-comment-popover]')).toBeNull();
+    // A second Escape is not taken by the closed draft.
+    const next = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    await act(async () => { document.body.dispatchEvent(next); });
+    expect(next.defaultPrevented).toBe(false);
+    // The draft text is kept: pinning the same element again restores it.
+    await postSelection({ ...selectionMessage, pinpoint: true });
+    expect(document.querySelector<HTMLTextAreaElement>('[data-comment-popover] textarea')?.value)
+      .toBe('Draft kept for later');
+    await typeComment(''); // leave no draft for the next test
+  });
+
+  test('the bridge closing the draft while the composer is hidden closes the composer', async () => {
+    const { postSelection } = await mountViewer({ mode: 'selection', onAdd: () => {} });
+    await postSelection({ ...selectionMessage, pinpoint: true });
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: false });
+    // Escape inside the page: the bridge's ladder closes its pin.
+    await postSelection({ type: 'plannotator-bridge-selection-clear' });
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: true });
+    expect(document.querySelector('[data-comment-popover]')).toBeNull();
+  });
+
+  test('a composer shown again does not take focus from where the person is', async () => {
+    const { postSelection } = await mountViewer({ mode: 'selection', onAdd: () => {} });
+    await postSelection({ ...selectionMessage, pinpoint: true });
+    await settle();
+    expect(document.activeElement?.tagName).toBe('TEXTAREA');
+    await typeComment('Still here');
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: false });
+    // The person works in the page meanwhile.
+    const iframe = document.querySelector<HTMLIFrameElement>('iframe')!;
+    iframe.focus();
+    expect(document.activeElement).toBe(iframe);
+    await postSelection({ type: 'plannotator-bridge-pin-visibility', visible: true });
+    await settle();
+    const textarea = document.querySelector<HTMLTextAreaElement>('[data-comment-popover] textarea');
+    expect(textarea?.value).toBe('Still here');
+    expect(document.activeElement).toBe(iframe);
+    // It takes focus when the person goes to it.
+    textarea!.focus();
+    expect(document.activeElement).toBe(textarea);
+    await typeComment(''); // leave no draft for the next test
+  });
+
   test('a plain drag selection still opens the markup toolbar', async () => {
     const { postSelection } = await mountViewer({ mode: 'selection', onAdd: () => {} });
     await postSelection({ ...selectionMessage, anchor: undefined });
     expect(document.querySelector('.annotation-toolbar')).not.toBeNull();
     expect(document.querySelector('[data-comment-popover]')).toBeNull();
   });
+
 
   test('the HTML selection toolbar is comment-only plus the restored thumbs-up: no Delete, no label picker', async () => {
     // The restricted restore: exactly ONE label affordance (the hardcoded
@@ -1487,6 +1613,8 @@ describe.if(hasDom)('Interact/Annotate mode on static (srcdoc) surfaces', () => 
     onAnnotateModeExit?: () => void;
     onAnnotateModeToggle?: () => void;
     onStep?: (dir: 1 | -1) => void;
+    stepInInteract?: boolean;
+    onPageEscape?: () => void;
   } = {}) {
     if (!htmlViewerModule) throw new Error('DOM test environment is not registered');
     const HtmlViewer = htmlViewerModule.HtmlViewer;
@@ -1508,6 +1636,8 @@ describe.if(hasDom)('Interact/Annotate mode on static (srcdoc) surfaces', () => 
           onAnnotateModeExit={options.onAnnotateModeExit}
           onAnnotateModeToggle={options.onAnnotateModeToggle}
           onStep={options.onStep}
+          stepInInteract={options.stepInInteract}
+          onPageEscape={options.onPageEscape}
         />,
       );
     });
@@ -1589,7 +1719,7 @@ describe.if(hasDom)('Interact/Annotate mode on static (srcdoc) surfaces', () => 
     expect(toggles).toBe(1);
   });
 
-  test('a bridge step message (a plain ] or [ in the page) reaches the host only while armed, with the frame focused, at most once per 150 ms', async () => {
+  test('a bridge step message (a plain ] or [ in the page) reaches the host while armed (in Interact only with stepInInteract), with the frame focused, at most once per 150 ms', async () => {
     // The Inbox steps through a thread's attachments on it. The page can post
     // the message itself, so a page posting in a loop without the person's
     // focus must not move anything, and a loop with focus is throttled.
@@ -1615,13 +1745,48 @@ describe.if(hasDom)('Interact/Annotate mode on static (srcdoc) surfaces', () => 
     await post({ type: 'plannotator-bridge-step', dir: -1 });
     expect(armed).toEqual([1, -1]);
 
-    // In Interact the page owns its keys: nothing reaches the host.
+    // In Interact the page owns its keys: nothing reaches a host that did not opt in.
     const interact: number[] = [];
     const second = await mountModeViewer({ annotateModeActive: false, onStep: (dir) => interact.push(dir) });
-    const frames = document.querySelectorAll<HTMLIFrameElement>('iframe');
+    let frames = document.querySelectorAll<HTMLIFrameElement>('iframe');
     await act(async () => { frames[frames.length - 1]!.focus(); });
     await second.post({ type: 'plannotator-bridge-step', dir: 1 });
     expect(interact).toEqual([]);
+
+    // A host with stepInInteract takes it in Interact (the bridge offers only a key the page did not use), focused only.
+    const opted: number[] = [];
+    const third = await mountModeViewer({ annotateModeActive: false, stepInInteract: true, onStep: (dir) => opted.push(dir) });
+    await third.post({ type: 'plannotator-bridge-step', dir: 1 });
+    expect(opted).toEqual([]);
+    frames = document.querySelectorAll<HTMLIFrameElement>('iframe');
+    await act(async () => { frames[frames.length - 1]!.focus(); });
+    await third.post({ type: 'plannotator-bridge-step', dir: -1 });
+    expect(opted).toEqual([-1]);
+  });
+
+  test('a bridge page-escape (an Escape the page did not use, in Interact) reaches the host only in Interact, with the frame focused, at most once per 150 ms', async () => {
+    // The Inbox leaves full screen on it. The page can post it itself, so it
+    // is honored only for a key the person pressed in the frame, never in
+    // Annotate (whose Escape is annotate-exit), and a loop is throttled.
+    const seen: string[] = [];
+    const { post } = await mountModeViewer({ annotateModeActive: false, onPageEscape: () => seen.push('escape') });
+    const iframe = document.querySelector<HTMLIFrameElement>('iframe')!;
+    await post({ type: 'plannotator-bridge-page-escape' });
+    expect(seen).toEqual([]);
+    await act(async () => { iframe.focus(); });
+    await post({ type: 'plannotator-bridge-page-escape' });
+    await post({ type: 'plannotator-bridge-page-escape' });
+    expect(seen).toEqual(['escape']);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, htmlViewerModule!.STEP_MESSAGE_MIN_INTERVAL_MS + 20)); });
+    await post({ type: 'plannotator-bridge-page-escape' });
+    expect(seen).toEqual(['escape', 'escape']);
+
+    const armed: string[] = [];
+    const second = await mountModeViewer({ annotateModeActive: true, onPageEscape: () => armed.push('escape') });
+    const frames = document.querySelectorAll<HTMLIFrameElement>('iframe');
+    await act(async () => { frames[frames.length - 1]!.focus(); });
+    await second.post({ type: 'plannotator-bridge-page-escape' });
+    expect(armed).toEqual([]);
   });
 });
 

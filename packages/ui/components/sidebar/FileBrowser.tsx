@@ -10,6 +10,7 @@ import { Search, X } from "lucide-react";
 import type { VaultNode } from "../../types";
 import type { DirState } from "../../hooks/useFileBrowser";
 import { CountBadge } from "./CountBadge";
+import { HostTitle } from "../HostTitle";
 import { ObsidianIconRaw } from "../icons/ObsidianIcons";
 import type { WorkspaceFileChange, WorkspaceStatusPayload } from "@plannotator/core/workspace-status-types";
 import { normalizeBrowserPath } from "@plannotator/core/browser-paths";
@@ -282,7 +283,9 @@ const TreeNode: React.FC<{
           <svg className="w-3 h-3 flex-shrink-0 text-muted-foreground/60" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
           </svg>
-          <span className="truncate">{node.name}</span>
+          <HostTitle title={node.name} cut>
+            <span className="truncate">{node.name}</span>
+          </HostTitle>
           <div className="ml-auto flex flex-shrink-0 items-center gap-1.5 text-[10px]">
             {(aggregateChange.additions > 0 || aggregateChange.deletions > 0) && (
               <>
@@ -360,7 +363,9 @@ const TreeNode: React.FC<{
       <svg className="w-3 h-3 flex-shrink-0 opacity-40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
       </svg>
-      <span className={`truncate flex-1 min-w-0 ${isDeleted ? "line-through" : ""}`}>{displayName}</span>
+      <HostTitle title={node.name} cut>
+        <span className={`truncate flex-1 min-w-0 ${isDeleted ? "line-through" : ""}`}>{displayName}</span>
+      </HostTitle>
       <div className="ml-auto flex flex-shrink-0 items-center gap-1.5 text-[10px]">
         {isActive && selectionPending && (
           <span className="text-primary">Opening…</span>
@@ -455,9 +460,18 @@ const DirSection: React.FC<{
           selectionPending={selectionPending}
         />
       ))}
+      {dir.truncated && <FileLimitNote limit={dir.fileLimit} />}
     </div>
   );
 };
+
+/** The folder holds more supported files than the server lists; say so once, quietly, at the foot of its tree. */
+export const FileLimitNote: React.FC<{ limit?: number }> = ({ limit }) => (
+  <div data-file-limit-note className="px-2 pt-2 pb-1 text-[10px] leading-snug text-muted-foreground">
+    {limit ? `Showing the first ${limit.toLocaleString("en-US")} files.` : "Showing some of the files."}{" "}
+    Raise <code className="font-mono">PLANNOTATOR_FILE_BROWSER_MAX_FILES</code> to see more.
+  </div>
+);
 
 export const FileBrowser: React.FC<FileBrowserProps> = ({
   dirs,

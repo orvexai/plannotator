@@ -52,6 +52,7 @@ import {
   type PlannotatorToolInput,
 } from "@plannotator/shared/plannotator-tool";
 import type { CliLaunch } from "./cli-bridge";
+import { directFetchInit } from "@plannotator/shared/loopback-proxy";
 
 export type LaunchKind = "plan" | "annotate" | "review" | "last";
 
@@ -549,12 +550,12 @@ async function hostRequest(
   if (!launch.port) return null;
   const doFetch = deps.fetch ?? ((url: string, options: RequestInit) => fetch(url, options));
   try {
-    const response = await doFetch(`http://127.0.0.1:${launch.port}${pathname}`, {
+    const response = await doFetch(`http://127.0.0.1:${launch.port}${pathname}`, directFetchInit({
       ...init,
       // No Origin header: the server refuses browser requests here.
       headers: { ...(init.headers as Record<string, string> | undefined), authorization: `Bearer ${launch.token ?? ""}` },
       signal: AbortSignal.timeout(HOST_REQUEST_TIMEOUT_MS),
-    });
+    }));
     return { status: response.status, text: await response.text() };
   } catch {
     return null;
@@ -637,7 +638,8 @@ async function closeLaunch(launch: TrackedLaunch, deps: PlannotatorToolDeps): Pr
     case "older": {
       // Proven an older Plannotator on the port of our own live child: stop
       // that child. A decision such a CLI is still publishing (it waits 1.5 s
-      // after the reviewer decides) is lost; see "Version skew" in AGENTS.md.
+      // after the reviewer decides) is lost; see "Version skew" in
+      // docs/agent-guides/claude-code-mod.md.
       if (launch.terminate?.()) {
         launch.closedByAgent = true;
         return { id, subject, closed: true, unsent: null };

@@ -37,6 +37,21 @@
  * `PLANNOTATOR_TOOL_BUNDLE_UNAVAILABLE_TEXT`. Replying to a single comment is
  * not part of the contract yet: it comes back with the comment loop.
  *
+ * Gate: `gate: true` means the agent waits for the reviewer's sign-off, so a
+ * host delivers a bare Approve as a message too (annotate adds an Approve
+ * button; review always has one, and its gate is never passed to the CLI).
+ * Without it a host may only log a bare Approve (the Claude Code mod does).
+ *
+ * Tailnet (#2166): `tailscale: true` on annotate, review and last serves the
+ * page over the user's tailnet (the CLI's `--tailscale`), with "Ask this
+ * session" kept for the Tailscale login that owns the machine. Only a host
+ * that can publish it accepts the field: it registers
+ * `PLANNOTATOR_TOOL_TAILSCALE_INPUT_SCHEMA` / `_DESCRIPTION` and parses with
+ * `{ tailscale: true }` (the Claude Code mod). Every other host keeps the
+ * plain schema and description, byte for byte, and its parser refuses the
+ * field as unknown, exactly as before. A host whose CLI is too old answers
+ * `PLANNOTATOR_TOOL_TAILSCALE_UNAVAILABLE_TEXT`.
+ *
  * Targets: every decision heading and opened text also names the review's
  * FULL target (`plannotatorTargetLines`: the absolute path, URL, bundle files,
  * reviewed directory or PR URL) as the server that shows the review resolved
@@ -68,6 +83,12 @@ export interface PlannotatorToolInput {
   target?: string | string[]
   gate?: boolean
   options?: { base?: string; markdown?: boolean }
+  /**
+   * annotate, review, last: serve the page over the user's tailnet (the CLI's
+   * `--tailscale`). Only from a host that parses with `{ tailscale: true }`.
+   */
+  tailscale?: boolean
+  cloudflareAccess?: boolean
   /** close: a session id (`pn-` + 6 hex, as the results name it) or "all". */
   session?: string
 }
@@ -75,7 +96,7 @@ export interface PlannotatorToolInput {
 export const PLANNOTATOR_TOOL_DESCRIPTION = [
   'Open Plannotator, the browser review UI, for the user, and return at once. Also lists and closes the reviews opened in this conversation (by this tool or the user\'s /plannotator-* commands).',
   '- action "annotate": annotate a file (markdown, text, config, HTML), a folder, or a URL; `target` is required. Pass a list as `target` to review several files together, in the order you want them read. `gate: true` adds an Approve button for an explicit sign-off. `options.markdown: true` converts HTML or a URL to markdown first.',
-  '- action "review": review code changes; `target` is an optional repository directory or a GitHub/GitLab/Bitbucket pull request URL (default: the current repository). `options.base` sets the compare branch or ref (git only).',
+  '- action "review": review code changes; `target` is an optional repository directory or a GitHub/GitLab/Bitbucket/Forgejo pull request URL (default: the current repository). `options.base` sets the compare branch or ref (git only). `gate: true` when you wait for the sign-off: a bare Approve reaches you too.',
   '- action "last": annotate your own last assistant message; no target.',
   '- action "list": the reviews opened in this conversation that are still open, one line each: session id, what it shows, url, age, state, and how many comments the reviewer has not sent yet.',
   '- action "close": close a review opened in this conversation that is no longer needed; `session` is its id (pn-...) or "all". Nothing is sent to you, and the reviewer\'s unsent comments stay saved as a draft. Plan reviews are not closed this way: they end with the reviewer\'s decision.',
@@ -99,7 +120,7 @@ export const PLANNOTATOR_TOOL_INPUT_SCHEMA = {
     },
     gate: {
       type: 'boolean',
-      description: 'annotate only: show an Approve button so the reviewer can sign off explicitly.',
+      description: 'annotate: add an Approve button for an explicit sign-off. review: deliver a bare Approve too.',
     },
     options: {
       type: 'object',
@@ -117,6 +138,70 @@ export const PLANNOTATOR_TOOL_INPUT_SCHEMA = {
   required: ['action'],
   additionalProperties: false,
 } as const
+
+/** The description line a host that publishes over the tailnet adds (see `PLANNOTATOR_TOOL_TAILSCALE_DESCRIPTION`). */
+export const PLANNOTATOR_TOOL_TAILSCALE_LINE =
+  '- `tailscale: true` (annotate, review, last): serve the page over the user\'s tailnet (HTTPS, never public) for their phone or another device; "Ask this session" works there for this computer\'s owner. Only when the user asks for that.'
+
+/**
+ * The description for a host that accepts `tailscale` (the Claude Code mod):
+ * the plain description with the tailscale line after the action lines.
+ */
+export const PLANNOTATOR_TOOL_TAILSCALE_DESCRIPTION = (() => {
+  const lines = PLANNOTATOR_TOOL_DESCRIPTION.split('\n')
+  const lastAction = lines.findIndex((line) => line.startsWith('- action "close"'))
+  return [...lines.slice(0, lastAction + 1), PLANNOTATOR_TOOL_TAILSCALE_LINE, ...lines.slice(lastAction + 1)].join('\n')
+})()
+
+/** The input schema for a host that accepts `tailscale`: the plain schema plus that one property. */
+export const PLANNOTATOR_TOOL_TAILSCALE_INPUT_SCHEMA = {
+  ...PLANNOTATOR_TOOL_INPUT_SCHEMA,
+  properties: {
+    ...PLANNOTATOR_TOOL_INPUT_SCHEMA.properties,
+    tailscale: {
+      type: 'boolean',
+      description: 'annotate, review, last: serve the page over the user\'s tailnet (HTTPS, never public), to open on another device. "Ask this session" works there for the computer owner\'s Tailscale login.',
+    },
+    cloudflareAccess: {
+      type: 'boolean',
+      description: 'annotate, review, last: open the page at the user\'s own Cloudflare Access address instead, to open on another device, for their e-mail only. Only when they ask for it and have run `plannotator inbox cloudflare-access setup`. Not together with tailscale.',
+    },
+  },
+} as const
+
+/** What a host's parser accepts beyond the plain contract. */
+export interface PlannotatorToolParseOptions {
+  /** Accept `tailscale` (the host can publish over the tailnet). Default false: the field is unknown. */
+  tailscale?: boolean
+}
+
+/**
+ * What a host answers a `tailscale` call with when its Plannotator CLI cannot
+ * serve it: a CLI without `--tailscale`, or one from before "Ask this session"
+ * was kept over the tailnet (its ready line carries no `tailnet` field). The
+ * review is not left open.
+ */
+export const PLANNOTATOR_TOOL_TAILSCALE_UNAVAILABLE_TEXT =
+  'Plannotator did not open: the installed Plannotator is too old to open a review over the tailnet from this tool. Ask the user to update Plannotator (`plannotator update`), or open it without `tailscale` for now.'
+
+export const PLANNOTATOR_TOOL_CLOUDFLARE_ACCESS_UNAVAILABLE_TEXT =
+  'Plannotator did not open: the installed Plannotator is too old to open a review through Cloudflare Access from this tool. Ask the user to update Plannotator (`plannotator update`), or open it without `cloudflareAccess` for now.'
+
+/**
+ * Whether a CLI's startup error for a `tailscale` call is an OLDER CLI's
+ * refusal of the flag itself (it read `--tailscale` as a file, an unknown
+ * option, or a flag for another subcommand), never a current CLI's publish
+ * failure: those all start with `--tailscale:` (Tailscale not running, signed
+ * out, the port already routed) and are the reason to show as it is.
+ */
+export function isOlderCliTailscaleRefusal(errorText: string): boolean {
+  if (errorText.includes('--tailscale:')) return false
+  return (
+    /File not found: [^\n]*--(?:tailscale|cloudflare-access)/.test(errorText) ||
+    errorText.includes('--tailscale is only supported with') ||
+    /(?:unknown|unrecognized|unexpected) (?:option|flag|argument)[^\n]*--(?:tailscale|cloudflare-access)/i.test(errorText)
+  )
+}
 
 /** Longest target or base accepted; a real path or URL is far shorter. */
 export const PLANNOTATOR_TOOL_MAX_TEXT = 4096
@@ -167,30 +252,63 @@ export function isPlannotatorToolOpenAction(action: PlannotatorToolAction): acti
 }
 
 /**
- * Validates a tool call strictly: unknown keys, wrong types, and a field the
- * action does not take are errors (a `false` the action ignores is allowed,
- * since models often fill defaults). The error text is for the model.
+ * An optional field a model sent empty: `null`, `""`, `[]` or `{}`. A
+ * provider that makes every property required (GitHub Copilot's Responses
+ * models with a strict schema, #2292) fills each field it means to omit this
+ * way, so the parser reads it as absent. A required field stays required:
+ * `annotate` with `target: ""` still needs a target, `close` with
+ * `session: ""` still needs a session.
  */
-export function parsePlannotatorToolInput(value: unknown): PlannotatorToolParse {
+function isEmptyOptional(value: unknown): boolean {
+  if (value === null || value === '') return true
+  if (Array.isArray(value)) return value.length === 0
+  return isRecord(value) && Object.keys(value).length === 0
+}
+
+/** The record without its empty optional members (see `isEmptyOptional`). */
+function withoutEmptyOptionals(value: Record<string, unknown>): Record<string, unknown> {
+  const kept: Record<string, unknown> = {}
+  for (const [key, member] of Object.entries(value)) {
+    if (!isEmptyOptional(member)) kept[key] = member
+  }
+  return kept
+}
+
+/**
+ * Validates a tool call strictly: unknown keys, wrong types, and a field the
+ * action does not take are errors. A `false` the action ignores is allowed,
+ * since models often fill defaults, and an empty optional field (`null`, `""`,
+ * `[]`, `{}`, also inside `options`) is read as absent. The error text is for
+ * the model.
+ */
+export function parsePlannotatorToolInput(value: unknown, parseOptions: PlannotatorToolParseOptions = {}): PlannotatorToolParse {
   const fail = (error: string): PlannotatorToolParse => ({ ok: false, error: `Invalid plannotator call: ${error}.` })
   if (!isRecord(value)) return fail('the input must be an object')
   for (const key of Object.keys(value)) {
-    if (!TOOL_KEYS.includes(key)) return fail(`unknown field "${key}"`)
+    if (!TOOL_KEYS.includes(key) && !((key === 'tailscale' || key === 'cloudflareAccess') && parseOptions.tailscale === true)) return fail(`unknown field "${key}"`)
   }
   const action = value.action
   if (typeof action !== 'string' || !ACTIONS.includes(action as PlannotatorToolAction)) {
     return fail('action must be "annotate", "review", "last", "list" or "close"')
   }
+  const fields = withoutEmptyOptionals(value)
+  if (isRecord(fields.options)) {
+    for (const key of Object.keys(fields.options)) {
+      if (!OPTION_KEYS.includes(key)) return fail(`unknown option "${key}"`)
+    }
+    const options = withoutEmptyOptionals(fields.options)
+    if (isEmptyOptional(options)) delete fields.options
+    else fields.options = options
+  }
   const input: PlannotatorToolInput = { action: action as PlannotatorToolAction }
   const opens = isPlannotatorToolOpenAction(input.action)
 
-  if (value.target !== undefined) {
+  if (fields.target !== undefined) {
     if (!opens || action === 'last') return fail(`action "${action}" takes no target`)
-    if (Array.isArray(value.target)) {
+    if (Array.isArray(fields.target)) {
       if (action !== 'annotate') return fail('a list of targets is for action "annotate" only')
-      if (value.target.length === 0) return fail('target must not be an empty list')
       const targets: string[] = []
-      for (const [index, item] of value.target.entries()) {
+      for (const [index, item] of fields.target.entries()) {
         const problem = checkWord(`target[${index}]`, item)
         if (problem) return fail(problem)
         const trimmed = (item as string).trim()
@@ -198,26 +316,36 @@ export function parsePlannotatorToolInput(value: unknown): PlannotatorToolParse 
       }
       input.target = targets.length === 1 ? targets[0] : targets
     } else {
-      const problem = checkWord('target', value.target)
+      const problem = checkWord('target', fields.target)
       if (problem) return fail(problem)
-      input.target = (value.target as string).trim()
+      input.target = (fields.target as string).trim()
     }
   } else if (action === 'annotate') {
     return fail('action "annotate" needs a target (a file, folder or URL)')
   }
 
-  if (value.gate !== undefined) {
-    if (typeof value.gate !== 'boolean') return fail('gate must be true or false')
-    if (value.gate && action !== 'annotate') return fail('gate is for action "annotate" only')
-    if (value.gate) input.gate = true
+  if (fields.gate !== undefined) {
+    if (typeof fields.gate !== 'boolean') return fail('gate must be true or false')
+    if (fields.gate && action !== 'annotate' && action !== 'review') return fail('gate is for actions "annotate" and "review" only')
+    if (fields.gate) input.gate = true
   }
 
-  if (value.options !== undefined) {
-    const options = value.options
+  if (fields.tailscale !== undefined) {
+    if (typeof fields.tailscale !== 'boolean') return fail('tailscale must be true or false')
+    if (fields.tailscale && !opens) return fail('tailscale is for actions "annotate", "review" and "last" only')
+    if (fields.tailscale) input.tailscale = true
+  }
+
+  if (fields.cloudflareAccess !== undefined) {
+    if (typeof fields.cloudflareAccess !== 'boolean') return fail('cloudflareAccess must be true or false')
+    if (fields.cloudflareAccess && !opens) return fail('cloudflareAccess is for actions "annotate", "review" and "last" only')
+    if (fields.cloudflareAccess && input.tailscale) return fail('use tailscale or cloudflareAccess, not both')
+    if (fields.cloudflareAccess) input.cloudflareAccess = true
+  }
+
+  if (fields.options !== undefined) {
+    const options = fields.options
     if (!isRecord(options)) return fail('options must be an object')
-    for (const key of Object.keys(options)) {
-      if (!OPTION_KEYS.includes(key)) return fail(`unknown option "${key}"`)
-    }
     const parsed: NonNullable<PlannotatorToolInput['options']> = {}
     if (options.base !== undefined) {
       if (action !== 'review') return fail('options.base is for action "review" only')
@@ -234,13 +362,13 @@ export function parsePlannotatorToolInput(value: unknown): PlannotatorToolParse 
     if (Object.keys(parsed).length > 0) input.options = parsed
   }
 
-  if (value.session !== undefined) {
+  if (fields.session !== undefined) {
     if (action !== 'close') return fail('session is for action "close" only')
-    if (typeof value.session !== 'string') return fail('session must be a string')
-    if (action === 'close' && value.session.trim().toLowerCase() === 'all') {
+    if (typeof fields.session !== 'string') return fail('session must be a string')
+    if (action === 'close' && fields.session.trim().toLowerCase() === 'all') {
       input.session = 'all'
     } else {
-      const id = normalizePlannotatorSessionId(value.session)
+      const id = normalizePlannotatorSessionId(fields.session)
       if (!id) return fail('session must be a session id such as "pn-3f2a9c" or "all"')
       input.session = id
     }
@@ -261,8 +389,8 @@ export function plannotatorToolTargets(input: PlannotatorToolInput): string[] {
  * The arguments the matching slash command would carry (`/plannotator-annotate
  * <these>`), one argument per element, never re-split. A list of annotate
  * targets passes a bare word as `./word`, so the CLI reads every entry as a
- * path. `last` has none, and neither do the actions that open nothing (list,
- * close).
+ * path. `last` has none but `--tailscale`, and the actions that open nothing
+ * (list, close) have none. `tailscale` becomes `--tailscale`.
  */
 export function plannotatorToolArgs(input: PlannotatorToolInput): string[] {
   switch (input.action) {
@@ -276,13 +404,21 @@ export function plannotatorToolArgs(input: PlannotatorToolInput): string[] {
           : plannotatorToolTargets(input)),
         ...(input.gate ? ['--gate'] : []),
         ...(input.options?.markdown ? ['--markdown'] : []),
+        ...(input.tailscale ? ['--tailscale'] : []),
+        ...(input.cloudflareAccess ? ['--cloudflare-access'] : []),
       ]
     case 'review':
+      // A review's `gate` is the host's alone (deliver a bare approval as a
+      // message), never passed on: the review page always has Approve, and a
+      // CLI older than `review --gate` refuses the flag.
       return [
         ...(input.options?.base ? ['--base', input.options.base] : []),
+        ...(input.tailscale ? ['--tailscale'] : []),
+        ...(input.cloudflareAccess ? ['--cloudflare-access'] : []),
         ...plannotatorToolTargets(input),
       ]
     case 'last':
+      return input.tailscale ? ['--tailscale'] : input.cloudflareAccess ? ['--cloudflare-access'] : []
     case 'list':
     case 'close':
       return []
@@ -314,9 +450,25 @@ export function plannotatorTargetLines(target: PlannotatorTarget | undefined): s
 }
 
 /**
+ * How a session served over the tailnet answers Ask AI: `ask` true when
+ * "Ask this session" answers there for the machine owner's Tailscale login.
+ */
+export interface PlannotatorTailnetOpen {
+  ask: boolean
+}
+
+/** The line the opened text adds for a session served over the tailnet. */
+export function plannotatorTailnetOpenedLine(tailnet: PlannotatorTailnetOpen): string {
+  return tailnet.ask
+    ? 'It is served over the user\'s tailnet (HTTPS, never public): they open the URL on their phone or another device. "Ask this session" answers there only for the Tailscale login that owns this computer.'
+    : 'It is served over the user\'s tailnet (HTTPS, never public): they open the URL on their phone or another device. "Ask this session" is not available on the other device for this review.'
+}
+
+/**
  * The tool's result once the session is open (`url`) or still starting (no
  * url). `sessionId` leads it when given; `target` (the full path or URL the
- * server opened, when known) follows it.
+ * server opened, when known) follows it. `tailnet` adds the line for a page
+ * served over the user's tailnet.
  */
 export function plannotatorToolOpenedText(
   subject: string,
@@ -324,6 +476,7 @@ export function plannotatorToolOpenedText(
   gate: boolean,
   sessionId?: string,
   target?: PlannotatorTarget,
+  tailnet?: PlannotatorTailnetOpen,
 ): string {
   const where = url ? `Opened ${subject} in Plannotator: ${url}` : `Plannotator is starting for ${subject}; it opens in the browser when ready.`
   const outcome = gate
@@ -334,6 +487,7 @@ export function plannotatorToolOpenedText(
     ...(sessionId ? [`Session: ${sessionId}`] : []),
     ...(targetLines ? [targetLines] : []),
     where,
+    ...(tailnet ? [plannotatorTailnetOpenedLine(tailnet)] : []),
     'The reviewer is looking at it now. End your turn now and wait: their decision arrives later as a message in this conversation that starts with "Plannotator:".',
     outcome,
     'Do not poll, reopen it, or run the plannotator CLI for this session.',
@@ -342,7 +496,7 @@ export function plannotatorToolOpenedText(
 
 /**
  * The outcome a decision heading names for a code review the reviewer posted
- * straight to the PR platform (GitHub, GitLab, Bitbucket): the same words on
+ * straight to the PR platform (GitHub, GitLab, Bitbucket, Forgejo): the same words on
  * every host that delivers it as a message.
  */
 export const PLANNOTATOR_OUTCOME_REVIEW_POSTED = 'Review posted'
@@ -751,18 +905,24 @@ const COMMAND_ACTIONS: Record<string, PlannotatorToolAction> = {
  * represents: annotate `<target>` (or several targets that all read as file
  * paths, `looksLikeFilePath`, which become `target: [...]`, a review of
  * several files) plus `--gate` and `--markdown`; review `[target]` plus
- * `--base <ref>`; last with no arguments. `--json` is accepted and dropped
- * (the decision arrives as a message, not on stdout). The result passes
- * `parsePlannotatorToolInput`.
+ * `--base <ref>` and `--gate`; last with no arguments. `--json` is accepted
+ * and dropped (the decision arrives as a message, not on stdout). With
+ * `{ tailscale: true }` (a host that publishes over the tailnet) `--tailscale`
+ * on annotate, review and last becomes `tailscale: true`. The result passes
+ * `parsePlannotatorToolInput` with the same options.
  *
  * Everything else is null and runs as written: other subcommands, any other
- * flag (`--require-approval`, `--result-file`, `--hook`, `--tailscale`,
- * `--static`, `--app`, `--no-jina`, `--help`, ...), a repeated flag, several
+ * flag (`--require-approval`, `--result-file`, `--hook`, `--tailscale` for a
+ * host without that option, `--static`, `--app`, `--no-jina`, `--help`, ...),
+ * a repeated flag, several
  * targets that are not all file paths (or for review), an environment prefix,
  * and any shell syntax (`cd x && ...`,
  * pipes, redirects, substitutions), so scripted strict gates keep the CLI.
  */
-export function plannotatorCommandToToolInput(command: string): PlannotatorToolInput | null {
+export function plannotatorCommandToToolInput(
+  command: string,
+  parseOptions: PlannotatorToolParseOptions = {},
+): PlannotatorToolInput | null {
   const words = simpleShellCommandWords(command)
   if (!words || words.length < 2) return null
   const program = words[0] as string
@@ -785,8 +945,10 @@ export function plannotatorCommandToToolInput(command: string): PlannotatorToolI
     if (seen.has(word)) return null
     seen.add(word)
     if (word === '--json') continue
-    if (word === '--gate' && action === 'annotate') call.gate = true
+    if (word === '--gate' && (action === 'annotate' || action === 'review')) call.gate = true
     else if (word === '--markdown' && action === 'annotate') options.markdown = true
+    else if (word === '--tailscale' && parseOptions.tailscale === true) call.tailscale = true
+    else if (word === '--cloudflare-access' && parseOptions.tailscale === true) call.cloudflareAccess = true
     else if (word === '--base' && action === 'review') {
       const value = rest[index + 1]
       if (value === undefined || value.startsWith('-')) return null
@@ -803,6 +965,6 @@ export function plannotatorCommandToToolInput(command: string): PlannotatorToolI
     call.target = targets
   } else if (targets.length === 1) call.target = targets[0]
   if (Object.keys(options).length > 0) call.options = options
-  const parsed = parsePlannotatorToolInput(call)
+  const parsed = parsePlannotatorToolInput(call, parseOptions)
   return parsed.ok ? parsed.input : null
 }

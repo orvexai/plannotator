@@ -33,8 +33,11 @@ import {
 	parseChecklist,
 	renderCompletedChecklist,
 } from "./generated/checklist.ts";
-import { loadConfig, resolveAgentTool, resolveUseJina } from "./generated/config.ts";
+import { loadConfig, resolveAgentTool, resolveAutoReload, resolveUseJina } from "./generated/config.ts";
+import { setupAutoReload } from "./auto-reload.ts";
 import { detectPiHost, setPiHost } from "./pi-host.ts";
+import { warnRuntimeTlsOnce } from "./runtime-tls.ts";
+import { importFresh, isPlannotatorUpdatedError, launchFailureText } from "./package-version.ts";
 import { readImprovementHook } from "./generated/improvement-hooks.ts";
 import { composeImproveContext } from "./generated/pfm-reminder.ts";
 import {
@@ -65,6 +68,7 @@ import {
 	notifyCurrentPiSession,
 	type PiSessionIdentity,
 	registerCurrentPiSession,
+	resolveIdleDeliveryOptions,
 	sendUserMessageToCurrentPiSession,
 	withCurrentPiSessionFallbackHeader,
 } from "./current-pi-session.ts";
@@ -78,11 +82,22 @@ import {
 	type Phase,
 	stripPlanningOnlyTools,
 } from "./tool-scope.ts";
-import { getServerPorts, isRemoteSession, isUrlHostOverridden } from "./server/network.ts";
+import { getServerPorts, isRemoteSession, isSshDetectedRemote } from "./server/network.ts";
+import { sessionOpenedMessage } from "./session-opened.ts";
+import {
+	claimSessionEventBus,
+	openSessionEvent,
+	releaseSessionEventBus,
+	sessionEndOf,
+	sessionEndOfError,
+	type PlannotatorSessionAction,
+	type SessionEventHandle,
+} from "./session-events.ts";
+import { checklistWindow } from "./checklist-window.ts";
 import { isBrowserSessionStoppedError } from "./browser-session-error.ts";
 import { classifyAnnotateOutcome } from "./annotate-outcome.ts";
 import { classifyReviewOutcome } from "./review-outcome.ts";
-import { createPiSessionBridgeHub } from "./pi-session-bridge.ts";
+import { createPiSessionBridgeHub, PI_INBOX_BRIEFING_CUSTOM_TYPE } from "./pi-session-bridge.ts";
 import { setupPiInbox } from "./inbox.ts";
 import type { BrowserDecisionSession, PlanReviewBrowserSession, PlanReviewDecision } from "./plannotator-browser.ts";
 import type { AnnotateBundleFile } from "./generated/annotate-bundle.ts";
@@ -121,7 +136,7 @@ let promptsModulePromise: Promise<PlannotatorPromptsModule> | undefined;
 
 function loadPlannotatorPrompts(): Promise<PlannotatorPromptsModule> {
 	if (!promptsModulePromise) {
-		promptsModulePromise = import("./generated/prompts.ts").catch((error: unknown) => {
+		promptsModulePromise = importFresh(() => import("./generated/prompts.ts")).catch((error: unknown) => {
 			promptsModulePromise = undefined;
 			throw error;
 		});
@@ -129,15 +144,27 @@ function loadPlannotatorPrompts(): Promise<PlannotatorPromptsModule> {
 	return promptsModulePromise;
 }
 
+/**
+ * Load the prompts a decision is written with while the review is open, not
+ * when the decision arrives: an update that lands while the reviewer works
+ * would otherwise stop that lazy import (importFresh, #2085) and the
+ * feedback would never reach the session (5 of 5 times on a real Pi 0.84.4,
+ * `pi update --extensions` under an open annotate review). A failed preload
+ * is dropped: the decision tries again, as before.
+ */
+function preloadDecisionPrompts(): void {
+	void loadPlannotatorPrompts().catch(() => {});
+}
+
 async function loadAnnotateCommandModules() {
-	const [annotateArgs, annotateTarget, annotateBundle, atReference, resolveFile, referenceCommon] = await Promise.all([
+	const [annotateArgs, annotateTarget, annotateBundle, atReference, resolveFile, referenceCommon] = await importFresh(() => Promise.all([
 		import("./generated/annotate-args.ts"),
 		import("./generated/annotate-target.ts"),
 		import("./generated/annotate-bundle.ts"),
 		import("./generated/at-reference.ts"),
 		import("./generated/resolve-file.ts"),
 		import("./generated/reference-common.ts"),
-	]);
+	]));
 	return {
 		parseAnnotateArgs: annotateArgs.parseAnnotateArgs,
 		annotateInputNamesExistingTarget: annotateTarget.annotateInputNamesExistingTarget,
@@ -223,20 +250,6 @@ function safeNotify(
 	}
 }
 
-/**
- * Foreground "session opened" notice. For a remote session the auto-opened
- * browser is unreachable, so the URL must ride in THIS in-turn message — the
- * after-turn notify inside openBrowserForServer fires too late to render.
- */
-function sessionOpenedMessage(label: string, url: string): string {
-	if (!isRemoteSession()) return `${label}. You can keep chatting while it runs.`;
-	// With an advertised-URL host override the link is directly reachable
-	// (e.g. over a tailnet), so the port-forwarding advice would be wrong.
-	return isUrlHostOverridden()
-		? `${label} — open ${url} on your device. You can keep chatting while it runs.`
-		: `${label} — open ${url} on your local machine (forward the port if needed). You can keep chatting while it runs.`;
-}
-
 function reportBackgroundError(ctx: ExtensionContext, message: string, err: unknown, origin?: PiSessionIdentity): void {
 	const detail = getStartupErrorMessage(err);
 	console.error(`${message}: ${detail}`);
@@ -247,7 +260,7 @@ function reportBackgroundError(ctx: ExtensionContext, message: string, err: unkn
 		safeNotify(ctx, "A Plannotator browser session was closed.", "info", origin);
 		return;
 	}
-	safeNotify(ctx, `${message}: ${detail}`, "error", origin);
+	safeNotify(ctx, launchFailureText(message, err), "error", origin);
 }
 
 function excerptText(text: string, maxChars = 1000): string {
@@ -308,15 +321,24 @@ function trySendUserMessageToDifferentCurrentSession(
 
 function sendUserMessageWithCurrentSessionFallback(
 	pi: ExtensionAPI,
+	ctx: ExtensionContext,
 	content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
 	options: Parameters<ExtensionAPI["sendUserMessage"]>[1],
 	errorMessage: string,
 	origin: PiSessionIdentity,
+	/** The opener's `sessionAlive` latch: false once its `session_shutdown` ran. */
+	openerAlive: () => boolean,
 ): void {
-	if (trySendUserMessageToDifferentCurrentSession(content, options, errorMessage, origin)) return;
-
+	// A known-dead opener (/new, /resume: its session_shutdown ran, or its ctx
+	// throws) goes straight to the current session. A host whose replaced `pi`
+	// never throws would otherwise take the feedback into the dead session.
+	if (!openerAlive() || !isCtxAlive(ctx)) {
+		if (trySendUserMessageToDifferentCurrentSession(content, options, errorMessage, origin)) return;
+	}
+	// OMP subagents share the current-session slot while the opener is still live.
+	// Only redirect feedback if the opener can no longer accept it.
 	try {
-		pi.sendUserMessage(content, options);
+		pi.sendUserMessage(content, resolveIdleDeliveryOptions(ctx, options));
 		return;
 	} catch (err) {
 		if (trySendUserMessageToDifferentCurrentSession(content, options, errorMessage, origin)) return;
@@ -352,6 +374,8 @@ interface PendingPlanReview {
 	settled: boolean;
 	/** Its entry in the open-review registry (the `plannotator` tool's list). */
 	tracked?: PiOpenReview;
+	/** Its `plannotator:session-opened` / `session-closed` pair. */
+	events?: SessionEventHandle;
 }
 
 /**
@@ -361,6 +385,14 @@ interface PendingPlanReview {
  * older Pi ignores the key and activates every registered tool.
  */
 const NOT_ACTIVE_ON_REGISTRATION = { defaultActive: false } as const;
+
+/** The `plannotator:session-*` action for each kind of open review. */
+const SESSION_EVENT_ACTIONS: Record<PiReviewKind, PlannotatorSessionAction> = {
+	plan: "plan-review",
+	review: "code-review",
+	annotate: "annotate",
+	last: "annotate-last",
+};
 
 /** Host seams for tests. Production passes nothing. */
 export interface PlannotatorExtensionDeps {
@@ -419,9 +451,11 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 	// last, plan review). Listeners register once here; each command binds a bridge to its ctx.
 	const sessionBridgeHub = createPiSessionBridgeHub(pi);
 	// Off in remote mode: anyone who can reach the session URL could otherwise
-	// type into this agent session (same reasoning as the agent terminal).
+	// type into this agent session (same reasoning as the agent terminal). A
+	// remote session only SSH turned on keeps it, answered only for its own
+	// tunnel (the AI runtime's peer endpoints serve every other address).
 	const sessionBridgeFor = (ctx: ExtensionContext, origin: PiSessionIdentity) =>
-		isRemoteSession() ? undefined : sessionBridgeHub.createBridge(ctx, origin);
+		isRemoteSession() && !isSshDetectedRemote() ? undefined : sessionBridgeHub.createBridge(ctx, origin);
 	/**
 	 * The open reviews (tool, slash commands, plan review), each with a `pn-`
 	 * session id and the Pi session that opened it: what the `plannotator`
@@ -479,6 +513,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 	let sessionAlive = true;
 	/** The plan review waiting on the reviewer, if any (see PendingPlanReview). */
 	let pendingPlanReview: PendingPlanReview | null = null;
+	let planSessionGeneration = 0;
 	/** Resolved once per execution phase; undefined means widget-only. */
 	let todoProvider: TodoProvider | undefined;
 	/** Latch: no provider found, or one sync failed. Cleared on return to idle. */
@@ -486,6 +521,9 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionAlive = true;
+		// This instance's bus gets the session events of reviews whose opener
+		// was replaced (/reload, /resume): see session-events.ts.
+		claimSessionEventBus(pi);
 		currentPiSession.update(ctx);
 		settleAgentToolActivation(ctx);
 	});
@@ -516,12 +554,15 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 	});
 
 	pi.on("session_shutdown", () => {
-		sessionAlive = false;
-		currentPiSession.clear();
 		// A plan decision belongs to the session that is planning: unlike review
 		// and annotate feedback it is not re-targeted to a replacement session,
-		// so an open plan review closes with its session.
+		// so an open plan review closes with its session. First, while this
+		// instance is still live, so its session-closed event goes out on this
+		// session's bus.
 		stopPendingPlanReview();
+		sessionAlive = false;
+		releaseSessionEventBus(pi);
+		currentPiSession.clear();
 		// Browser sessions deliberately outlive in-process session replacement so
 		// a tab opened before /new can still deliver feedback to the replacement
 		// session (withCurrentPiSessionFallbackHeader). On real process teardown
@@ -565,7 +606,10 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 
 	function updateWidget(ctx: ExtensionContext): void {
 		if (phase === "executing" && checklistItems.length > 0) {
-			const lines = checklistItems.map((item) => {
+			// Pi draws at most 10 lines of a widget (#1412): show the 10 items
+			// around the next open one, so what the agent works on stays in view.
+			// UI only: setWidget never reaches the conversation or the prompt.
+			const lines = checklistWindow(checklistItems).map((item) => {
 				if (item.completed) {
 					return (
 						ctx.ui.theme.fg("success", "☑ ") +
@@ -800,6 +844,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 		pendingPlanReview = null;
 		review.settled = true;
 		if (review.tracked) openReviews.remove(review.tracked);
+		review.events?.close({ outcome: "closed", closedBy: "stopped" });
 		try {
 			// The open tab learns it was closed (draft kept) instead of offering
 			// a decision nothing could deliver.
@@ -916,6 +961,21 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 		}
 	}
 
+	/**
+	 * Announce a review on the event bus (`plannotator:session-opened`; #1589).
+	 * The bus only: nothing reaches the conversation, so the request prefix is
+	 * unchanged. The handle emits `plannotator:session-closed` once.
+	 */
+	function announceSessionOpened(review: PiOpenReview): SessionEventHandle {
+		return openSessionEvent(pi, () => sessionAlive, {
+			id: review.id,
+			action: SESSION_EVENT_ACTIONS[review.kind],
+			url: review.url,
+			openedAt: review.startedAt,
+			...(review.owner ? { piSessionId: review.owner } : {}),
+		});
+	}
+
 	/** A decision message for the agent: the heading naming subject, id and outcome, then the prompt. */
 	function withDecisionHeading(review: PiOpenReview, outcome: string, body: string): string {
 		return `${plannotatorDecisionHeading(review.subject, review.id, outcome, review.target)}\n\n${body}`;
@@ -936,10 +996,13 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 		deliver: (result: T, review: PiOpenReview) => Promise<void>,
 	): PiOpenReview {
 		const review = openReviews.add({ kind, ...names, url: session.url, owner: ownerOf(ctx), hostControl: session.hostControl });
+		preloadDecisionPrompts();
+		const events = announceSessionOpened(review);
 		void session
 			.waitForDecision()
 			.then(async (result) => {
 				openReviews.remove(review);
+				events.close(sessionEndOf(result));
 				try {
 					if (result.closedBy === "agent") {
 						safeNotify(ctx, agentClosedNotice(review, result.unsentAnnotations), "info", origin);
@@ -952,6 +1015,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 			})
 			.catch((err) => {
 				openReviews.remove(review);
+				events.close(sessionEndOfError(isBrowserSessionStoppedError(err)));
 				reportBackgroundError(ctx, errors.session, err, origin);
 			});
 		return review;
@@ -966,7 +1030,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 		const origin = getPiSessionIdentity(ctx);
 
 		try {
-			const { formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory } = await import("./generated/review-args.ts");
+			const { formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory } = await importFresh(() => import("./generated/review-args.ts"));
 			const reviewArgs = parseReviewArgs(args);
 			// Argument-shape failures refuse to start a session (same contract
 			// as the CLI's exit 1), surfaced through Pi's notifier.
@@ -995,6 +1059,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				// `--no-git-remote-check` (#1553): session-only, and only ever a
 				// disable — undefined leaves the env var / config deciding.
 				gitRemoteCheck: reviewArgs.gitRemoteCheck,
+				announcedInTurn: true,
 			});
 			ctx.ui.notify(sessionOpenedMessage("Code review opened", session.url), "info");
 			const subject = reviewArgs.patchFile
@@ -1029,10 +1094,12 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 					const label = result.feedback ? `Approved with notes${commentCountSuffix(result.annotations)}` : "Approved";
 					sendUserMessageWithCurrentSessionFallback(
 						pi,
+						ctx,
 						withDecisionHeading(tracked, label, composeReviewApprovedMessage("pi", result.feedback, loadConfig())),
 						{ deliverAs: "followUp" },
 						errors.send,
 						origin,
+						() => sessionAlive,
 					);
 					return;
 				}
@@ -1053,15 +1120,17 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 					: `Changes requested${commentCountSuffix(result.annotations)}`;
 				sendUserMessageWithCurrentSessionFallback(
 					pi,
+					ctx,
 					withDecisionHeading(tracked, label, reviewFeedback),
 					{ deliverAs: "followUp" },
 					errors.send,
 					origin,
+					() => sessionAlive,
 				);
 			});
 			return { ok: true, review };
 		} catch (err) {
-			return { ok: false, error: `Failed to start code review UI: ${getStartupErrorMessage(err)}` };
+			return { ok: false, error: launchFailureText("Failed to start code review UI", err) };
 		}
 	}
 
@@ -1083,6 +1152,16 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 	}
 
 	async function launchAnnotate(ctx: ExtensionContext, request: AnnotateRequest, options: LaunchOptions = {}): Promise<LaunchResult> {
+		try {
+			return await launchAnnotateUnchecked(ctx, request, options);
+		} catch (err) {
+			// The package changed under the running host: a lazy import refused (#2085).
+			if (isPlannotatorUpdatedError(err)) return { ok: false, error: err.message };
+			throw err;
+		}
+	}
+
+	async function launchAnnotateUnchecked(ctx: ExtensionContext, request: AnnotateRequest, options: LaunchOptions): Promise<LaunchResult> {
 		const {
 			FILE_BROWSER_EXCLUDED,
 			hasMarkdownFiles,
@@ -1196,7 +1275,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 		// file or folder target silently swallowing it would hide the
 		// flag's typo'd use (same contract as the Bun CLI).
 		if (!isUrl && appFlag) {
-			const { LIVE_APP_REQUIRES_URL_MESSAGE } = await import("./generated/live-probe.ts");
+			const { LIVE_APP_REQUIRES_URL_MESSAGE } = await importFresh(() => import("./generated/live-probe.ts"));
 			return { ok: false, error: LIVE_APP_REQUIRES_URL_MESSAGE };
 		}
 
@@ -1215,10 +1294,12 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				LIVE_APP_REQUIRES_HTTP_MESSAGE,
 				LIVE_APP_REQUIRES_LOOPBACK_MESSAGE,
 				buildForceAppFailureMessage,
+				buildLivePlannotatorFallbackNotice,
 				buildLiveProbeFallbackNotice,
 				classifyLiveAppCandidate,
 				probeLiveAppTarget,
-			} = await import("./generated/live-probe.ts");
+			} = await importFresh(() => import("./generated/live-probe.ts"));
+			const { listPlannotatorServerPorts } = await importFresh(() => import("./generated/plannotator-ports.ts"));
 			const { parsed: parsedUrl, loopback } = classifyLiveAppCandidate(filePath);
 
 			if (appFlag && !loopback) {
@@ -1230,7 +1311,11 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 			}
 
 			if (loopback && parsedUrl?.protocol === "http:" && !staticFlag) {
-				const probe = await probeLiveAppTarget(filePath, parsedUrl);
+				// Never a Plannotator server: the live proxy would give the
+				// proxied page same-origin writes on it (see live-proxy-core).
+				const probe = await probeLiveAppTarget(filePath, parsedUrl, fetch, {
+					plannotatorPorts: listPlannotatorServerPorts(),
+				});
 				if (probe.liveEligible) {
 					// Remote hard-off (layer 1 of 2; the server throw in
 					// serverAnnotate.ts backstops it): a live proxy relays
@@ -1241,9 +1326,10 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 					}
 					liveTargetUrl = filePath;
 					mode = "annotate-app";
-					ctx.ui.notify(`Live app: ${filePath}`, "info");
 				} else if (appFlag) {
 					return { ok: false, error: buildForceAppFailureMessage(filePath, probe) };
+				} else if (probe.plannotator) {
+					ctx.ui.notify(buildLivePlannotatorFallbackNotice(filePath), "info");
 				} else if (probe.probeError !== null) {
 					// A dev server still starting up probes as unreachable;
 					// say so instead of silently downgrading to static.
@@ -1259,11 +1345,12 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				const useJina = resolveUseJina(noJina, loadConfig());
 				ctx.ui.notify(`Fetching: ${filePath}${useJina ? " (via Jina Reader)" : " (via fetch+Turndown)"}...`, "info");
 				try {
-					const { isConvertedSource, urlToMarkdown } = await import("./generated/url-to-markdown.ts");
+					const { isConvertedSource, urlToMarkdown } = await importFresh(() => import("./generated/url-to-markdown.ts"));
 					const result = await urlToMarkdown(filePath, { useJina });
 					markdown = result.markdown;
 					sourceConverted = isConvertedSource(result.source);
 				} catch (err) {
+					if (isPlannotatorUpdatedError(err)) return { ok: false, error: err.message };
 					return { ok: false, error: `Failed to fetch URL: ${err instanceof Error ? err.message : String(err)}` };
 				}
 				absolutePath = filePath;
@@ -1304,7 +1391,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 					rawHtml = html;
 					markdown = "";
 				} else {
-					const { htmlToMarkdown } = await import("./generated/html-to-markdown.ts");
+					const { htmlToMarkdown } = await importFresh(() => import("./generated/html-to-markdown.ts"));
 					markdown = htmlToMarkdown(html);
 					sourceConverted = true;
 				}
@@ -1342,6 +1429,9 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				liveTargetUrl,
 				sessionBridgeFor(ctx, origin),
 				bundleFiles,
+				true,
+				// Returns at once: tab loss must not dismiss the review.
+				false,
 			);
 			ctx.ui.notify(sessionOpenedMessage("Annotation opened", session.url), "info");
 			const errors = {
@@ -1364,10 +1454,12 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 							const { getAnnotateApprovedPrompt } = await loadPlannotatorPrompts();
 							sendUserMessageWithCurrentSessionFallback(
 								pi,
+								ctx,
 								withDecisionHeading(tracked, "Approved", getAnnotateApprovedPrompt("pi", loadConfig())),
 								{ deliverAs: "followUp" },
 								errors.send,
 								origin,
+								() => sessionAlive,
 							);
 						}
 						safeNotify(ctx, "Annotation approved.", "info", origin);
@@ -1397,10 +1489,12 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				const label = `${outcome.promptKind === "approved-with-notes" ? "Approved with notes" : "Feedback"}${commentCountSuffix(result.annotations)}`;
 				sendUserMessageWithCurrentSessionFallback(
 					pi,
+					ctx,
 					withDecisionHeading(tracked, label, prompt),
 					{ deliverAs: "followUp" },
 					errors.send,
 					origin,
+					() => sessionAlive,
 				);
 				if (outcome.notification === "approved") {
 					safeNotify(ctx, "Annotation approved.", "info", origin);
@@ -1408,7 +1502,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 			});
 			return { ok: true, review };
 		} catch (err) {
-			return { ok: false, error: `Failed to start annotation UI: ${getStartupErrorMessage(err)}` };
+			return { ok: false, error: launchFailureText("Failed to start annotation UI", err) };
 		}
 	}
 
@@ -1443,6 +1537,9 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				gate,
 				pickerMessages,
 				sessionBridgeFor(ctx, origin),
+				true,
+				// Returns at once: tab loss must not dismiss the review.
+				false,
 			);
 			ctx.ui.notify(sessionOpenedMessage("Last-message annotation opened", session.url), "info");
 			const errors = {
@@ -1462,10 +1559,12 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 							const { getAnnotateApprovedPrompt } = await loadPlannotatorPrompts();
 							sendUserMessageWithCurrentSessionFallback(
 								pi,
+								ctx,
 								withDecisionHeading(tracked, "Approved", getAnnotateApprovedPrompt("pi", loadConfig())),
 								{ deliverAs: "followUp" },
 								errors.send,
 								origin,
+								() => sessionAlive,
 							);
 						}
 						safeNotify(ctx, "Message approved.", "info", origin);
@@ -1496,10 +1595,12 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				const label = `${outcome.promptKind === "approved-with-notes" ? "Approved with notes" : "Feedback"}${commentCountSuffix(result.annotations)}`;
 				sendUserMessageWithCurrentSessionFallback(
 					pi,
+					ctx,
 					withDecisionHeading(tracked, label, prompt),
 					{ deliverAs: "followUp" },
 					errors.send,
 					origin,
+					() => sessionAlive,
 				);
 				if (outcome.notification === "approved") {
 					safeNotify(ctx, "Message approved.", "info", origin);
@@ -1507,7 +1608,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 			});
 			return { ok: true, review };
 		} catch (err) {
-			return { ok: false, error: `Failed to start annotation UI: ${getStartupErrorMessage(err)}` };
+			return { ok: false, error: launchFailureText("Failed to start annotation UI", err) };
 		}
 	}
 
@@ -1522,26 +1623,76 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 	pi.registerCommand("plannotator-annotate", {
 		description: "Open a file, several files, a URL or a folder in the annotation UI",
 		handler: async (args, ctx) => {
-			const { parseAnnotateArgs } = await import("./generated/annotate-args.ts");
-			// Split known annotate flags from the path. --json is silently
-			// accepted (Pi writes back via sendUserMessage, not stdout).
-			// `rawFilePath` keeps any leading `@` for the literal-@ fallback
-			// (scoped-package-style names). liveFlags: Pi supports live app
-			// sessions, so --app / --static are recognized here.
-			const parsed = parseAnnotateArgs(args ?? "", { liveFlags: true });
-			const launched = await launchAnnotate(ctx, parsed);
-			if (!launched.ok) ctx.ui.notify(launched.error, "error");
+			try {
+				const { parseAnnotateArgs } = await importFresh(() => import("./generated/annotate-args.ts"));
+				// Split known annotate flags from the path. --json is silently
+				// accepted (Pi writes back via sendUserMessage, not stdout).
+				// `rawFilePath` keeps any leading `@` for the literal-@ fallback
+				// (scoped-package-style names). liveFlags: Pi supports live app
+				// sessions, so --app / --static are recognized here.
+				const parsed = parseAnnotateArgs(args ?? "", { liveFlags: true });
+				const launched = await launchAnnotate(ctx, parsed);
+				if (!launched.ok) ctx.ui.notify(launched.error, "error");
+			} catch (err) {
+				if (!isPlannotatorUpdatedError(err)) throw err;
+				ctx.ui.notify(err.message, "error");
+			}
 		},
 	});
 
 	pi.registerCommand("plannotator-last", {
 		description: "Annotate the last assistant message",
 		handler: async (args, ctx) => {
-			// Support --gate on /plannotator-last for the Stop-hook review gate.
-			const { parseAnnotateArgs } = await import("./generated/annotate-args.ts");
-			const { gate } = parseAnnotateArgs(args ?? "");
-			const launched = await launchLastMessage(ctx, gate);
-			if (!launched.ok) ctx.ui.notify(launched.error, "error");
+			try {
+				// Support --gate on /plannotator-last for the Stop-hook review gate.
+				const { parseAnnotateArgs } = await importFresh(() => import("./generated/annotate-args.ts"));
+				const { gate } = parseAnnotateArgs(args ?? "");
+				const launched = await launchLastMessage(ctx, gate);
+				if (!launched.ok) ctx.ui.notify(launched.error, "error");
+			} catch (err) {
+				if (!isPlannotatorUpdatedError(err)) throw err;
+				ctx.ui.notify(err.message, "error");
+			}
+		},
+	});
+
+	// The person closed the Inbox's tab, or asks where it is: open it again
+	// (`plannotator inbox --open` starts a stopped one detached, so the session
+	// never waits on it) and show its address. The Inbox is the CLI's, never
+	// this extension's: Pi is its client. Opened, the model also gets the
+	// Inbox briefing (INBOX_COMMAND_BRIEFING) as a hidden message with the
+	// next prompt (`nextTurn`, no turn of its own): people type the command
+	// to teach their agent the Inbox. One copy waits at a time: the command
+	// run twice before the next prompt queues it once. Pi hands every pending
+	// `nextTurn` message to that prompt, and its agent loop emits
+	// `message_start` for each: that is when the copy was delivered. (Not a
+	// `before_agent_start` handler: that event's results are the phase
+	// framing's, and an extra handler there only adds an empty result.)
+	let inboxBriefingQueued = false;
+	pi.on("message_start", (event: { message?: { role?: string; customType?: string } }) => {
+		if (event?.message?.role === "custom" && event.message.customType === PI_INBOX_BRIEFING_CUSTOM_TYPE) inboxBriefingQueued = false;
+	});
+	pi.registerCommand("plannotator-inbox", {
+		description: "Open the Plannotator Inbox in the browser, show its address, and brief the agent on it",
+		handler: async (_args, ctx) => {
+			try {
+				const [{ inboxOpenedText, openInboxInBrowser }, { getPlannotatorDataDir }, { inboxCommandBriefing }] = await importFresh(() =>
+					Promise.all([import("./generated/inbox/agent-link.ts"), import("./generated/data-dir.ts"), import("./generated/inbox/connection.ts")]),
+				);
+				const opened = await openInboxInBrowser({ dataDir: getPlannotatorDataDir() });
+				if ("url" in opened) {
+					ctx.ui.notify(inboxOpenedText(opened.url), "info");
+					if (inboxBriefingQueued) return;
+					inboxBriefingQueued = true;
+					pi.sendMessage(
+						{ customType: PI_INBOX_BRIEFING_CUSTOM_TYPE, content: inboxCommandBriefing(), display: false },
+						{ deliverAs: "nextTurn" },
+					);
+				} else ctx.ui.notify(opened.error, "error");
+			} catch (err) {
+				if (!isPlannotatorUpdatedError(err)) throw err;
+				ctx.ui.notify(err.message, "error");
+			}
 		},
 	});
 
@@ -1633,7 +1784,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 			// A list of files is ONE review of all of them (a bundle), in order.
 			const targets = Array.isArray(call.target) ? call.target : undefined;
 			const target = targets ? targets[0]! : (call.target as string);
-			const { stripAtPrefix } = await import("./generated/at-reference.ts");
+			const { stripAtPrefix } = await importFresh(() => import("./generated/at-reference.ts"));
 			launched = await launchAnnotate(
 				ctx,
 				{
@@ -1917,14 +2068,16 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 
 			currentPiSession.update(ctx);
 			const origin = getPiSessionIdentity(ctx);
+			const openingGeneration = planSessionGeneration;
 			let session: PlanReviewBrowserSession;
 			try {
 				session = await startPlanReview(ctx, planContent, undefined, {
 					sessionBridge: sessionBridgeFor(ctx, origin),
 					planRevisions: true,
+					announcedInTurn: true,
 				});
 			} catch (err) {
-				const message = `Failed to start plan review UI: ${getStartupErrorMessage(err)}`;
+				const message = launchFailureText("Failed to start plan review UI", err);
 				ctx.ui.notify(message, "error");
 				return {
 					content: [{ type: "text", text: message }],
@@ -1935,7 +2088,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 			// Planning ended while this review was starting (an earlier review's
 			// approval settling during the await, or plan mode turned off): this
 			// review would be an orphan whose decision nobody delivers.
-			if (phase !== "planning") {
+			if (phase !== "planning" || openingGeneration !== planSessionGeneration) {
 				try {
 					// A tab that already loaded learns the review closed.
 					session.closeKeepingDraft?.();
@@ -1963,6 +2116,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 			// A previous review that is somehow still tracked loses to the new one.
 			if (pendingPlanReview && pendingPlanReview !== review) stopPendingPlanReview();
 			pendingPlanReview = review;
+			preloadDecisionPrompts();
 			// The history version the server saved this plan as: pushing the SAME
 			// text is a no-op that reports it (updatePlan's unchanged branch).
 			let planVersion: number | undefined;
@@ -1979,12 +2133,14 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				owner: ownerOf(ctx),
 				hostControl: session.hostControl,
 			});
+			review.events = announceSessionOpened(review.tracked);
 			persistState();
 
 			void session
 				.waitForDecision()
 				.then(async (result) => {
 					if (review.tracked) openReviews.remove(review.tracked);
+					review.events?.close(sessionEndOf(result));
 					if (review.settled) return;
 					review.settled = true;
 					if (pendingPlanReview === review) pendingPlanReview = null;
@@ -1993,6 +2149,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 				.catch((err: unknown) => {
 					if (review.tracked) openReviews.remove(review.tracked);
 					const wasSettled = review.settled;
+					review.events?.close(sessionEndOfError(wasSettled || isBrowserSessionStoppedError(err)));
 					review.settled = true;
 					if (pendingPlanReview === review) pendingPlanReview = null;
 					// Stopped on purpose (plan mode left, session replaced): silent.
@@ -2035,7 +2192,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 
 		const send = (text: string) => {
 			try {
-				pi.sendUserMessage(text, { deliverAs: "followUp" });
+				pi.sendUserMessage(text, resolveIdleDeliveryOptions(ctx, { deliverAs: "followUp" }));
 			} catch (err) {
 				reportBackgroundError(ctx, "Plannotator could not deliver the plan decision", err);
 			}
@@ -2518,7 +2675,7 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 		persistState();
 	}
 
-	pi.on("session_start", async (_event, ctx) => {
+	function loadSessionConfig(ctx: ExtensionContext): void {
 		// Project trust gate (#1291). Capability absent = fail closed: the
 		// project-local config is skipped and the honest capability warning
 		// fires (see PROJECT_TRUST_CAPABILITY_WARNING). A host that provides
@@ -2539,6 +2696,13 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 		for (const warning of loadedConfig.warnings) {
 			ctx.ui.notify(`Plannotator config: ${warning}`, "warning");
 		}
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		loadSessionConfig(ctx);
+		// A runtime without the Oct 2026 TLS fixes: one line per Pi start. It
+		// replaces the package's engines floor, which kept updates from installing (#902).
+		warnRuntimeTlsOnce((message) => ctx.ui.notify(message, "warning"));
 
 		// Check --plan flag
 		if (pi.getFlag("plan") === true) {
@@ -2546,6 +2710,21 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 		}
 
 		await resyncPhaseFromSession(ctx, { phaseWhenUnrecorded: phase, warnOnPlanning: true });
+	});
+
+	// Oh My Pi reuses the extension when replacing the active session. The
+	// new branch owns its own phase; an open decision belongs to its opener.
+	if (piHost === "oh-my-pi") pi.on("session_switch" as "session_start", async (_event, ctx) => {
+		planSessionGeneration++;
+		stopPendingPlanReview();
+		lastSubmittedPath = null;
+		approvedPlanContent = null;
+		checklistItems = [];
+		justApprovedPlan = false;
+		todoProvider = undefined;
+		todoProviderDisabled = false;
+		loadSessionConfig(ctx);
+		await resyncPhaseFromSession(ctx, { phaseWhenUnrecorded: "idle", warnOnPlanning: true });
 	});
 
 	// Compaction summarizes conversation history and can swallow the delivered
@@ -2573,9 +2752,34 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 		});
 	});
 
-	// The Plannotator Inbox (`plannotator_inbox` and the reply wake, inbox.ts):
-	// only where the inbox tool switch allows it for Pi and an Inbox was found.
-	// Pi awaits the extension factory, so the tool list is read (bounded) before
-	// the session's first request; otherwise this returns nothing.
-	return setupPiInbox(pi, { isAskActive: () => sessionBridgeHub.hasActiveAsk });
+	// Pi reloads itself, when nothing can be lost, to load an updated Plannotator
+	// (auto-reload.ts); off, an older Pi and Oh My Pi get the note once per version.
+	const autoReload = setupAutoReload(pi, {
+		host: piHost,
+		enabled: resolveAutoReload(loadConfig(), process.env),
+		plannotatorBusy: () => {
+			if (pendingPlanReview) return "a plan review";
+			if (openReviews.openAll().length > 0) return "an open review";
+			if (sessionBridgeHub.hasActiveAsk) return "an Ask question";
+			return null;
+		},
+		piVersion: async () => {
+			try {
+				const sdk = (await import("@earendil-works/pi-coding-agent")) as { VERSION?: unknown };
+				return typeof sdk.VERSION === "string" ? sdk.VERSION : null;
+			} catch {
+				return null;
+			}
+		},
+	});
+	// The Plannotator Inbox (inbox.ts): where an Inbox was found, the session
+	// claim (which session this Pi runs, the tool on or off); and the
+	// `plannotator_inbox` tool and the reply wake only where the inbox tool
+	// switch allows it for Pi. Pi awaits the extension factory, so the tool list
+	// is read (bounded) before the session's first request; otherwise this
+	// returns nothing.
+	return setupPiInbox(pi, {
+		isAskActive: () => sessionBridgeHub.hasActiveAsk,
+		claimUpdateNotice: (version) => autoReload.claimNotice(version),
+	});
 }

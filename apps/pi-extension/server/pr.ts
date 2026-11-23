@@ -4,6 +4,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { refRunnerKill } from "../generated/ref-cards.ts";
+import { loadConfig, resolveForgejoToken } from "../generated/config.ts";
 
 import {
 	type PRMetadata,
@@ -25,6 +27,7 @@ import {
 	fetchPR as fetchPRCore,
 	fetchPRFileContent as fetchPRFileContentCore,
 	fetchPRFileBytes as fetchPRFileBytesCore,
+	fetchPRTree as fetchPRTreeCore,
 	fetchPRViewedFiles as fetchPRViewedFilesCore,
 	fetchPRStack as fetchPRStackCore,
 	fetchPRList as fetchPRListCore,
@@ -33,10 +36,27 @@ import {
 	submitPRReview as submitPRReviewCore,
 } from "../generated/pr-provider.ts";
 
-const prRuntime: PRRuntime = {
-	async runCommand(cmd, args) {
+const nodeCommandRuntime: PRRuntime = {
+	async runCommand(cmd, args, options) {
+		const signal = options?.signal;
+		// With a signal, its own process group (POSIX), so an abort also ends what the command started.
+		const group = !!signal && process.platform !== "win32";
 		return new Promise((resolve, reject) => {
-			const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+			// options.env is added to (never replacing) the environment: another gh account's token (#2157).
+			const proc = spawn(cmd, args, {
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+				...(options?.env ? { env: { ...process.env, ...options.env } } : {}),
+				...(group ? { detached: true } : {}),
+			});
+			const stop = () =>
+				refRunnerKill((sig) => {
+					if (group && proc.pid) process.kill(-proc.pid, sig);
+					else proc.kill(sig);
+				});
+			if (signal?.aborted) stop();
+			else signal?.addEventListener("abort", stop, { once: true });
+			const done = () => signal?.removeEventListener("abort", stop);
 			let stdout = "";
 			let stderr = "";
 			proc.stdout?.on("data", (chunk: Buffer) => {
@@ -45,15 +65,23 @@ const prRuntime: PRRuntime = {
 			proc.stderr?.on("data", (chunk: Buffer) => {
 				stderr += chunk.toString();
 			});
-			proc.on("error", reject);
+			proc.on("error", (error) => {
+				done();
+				reject(error);
+			});
 			proc.on("close", (exitCode) => {
+				done();
 				resolve({ stdout, stderr, exitCode: exitCode ?? 1 });
 			});
 		});
 	},
-	async runCommandWithInput(cmd, args, input) {
+	async runCommandWithInput(cmd, args, input, options) {
 		return new Promise((resolve, reject) => {
-			const proc = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+			const proc = spawn(cmd, args, {
+				stdio: ["pipe", "pipe", "pipe"],
+				windowsHide: true,
+				...(options?.env ? { env: { ...process.env, ...options.env } } : {}),
+			});
 			let stdout = "";
 			let stderr = "";
 			proc.stdout?.on("data", (chunk: Buffer) => {
@@ -71,6 +99,31 @@ const prRuntime: PRRuntime = {
 		});
 	},
 };
+
+// Tests replace the command runner (setPRCommandRuntimeForTests) so no test
+// ever runs the real `gh` / `glab`: the review server calls these at startup
+// in PR mode (the platform user, viewed files, PR context).
+let testRuntime: PRRuntime | null = null;
+
+const prRuntime: PRRuntime = {
+	runCommand: (cmd, args, options) => (testRuntime ?? nodeCommandRuntime).runCommand(cmd, args, options),
+	runCommandWithInput: (cmd, args, input, options) => {
+		const active = testRuntime ?? nodeCommandRuntime;
+		if (!active.runCommandWithInput) return Promise.reject(new Error(`${cmd}: this runtime takes no input`));
+		return active.runCommandWithInput(cmd, args, input, options);
+	},
+	// The Forgejo token configured for exactly this origin; artifact fetches send it to that origin only.
+	forgejoToken: (origin) => resolveForgejoToken(loadConfig(), origin),
+};
+
+/**
+ * Tests only: run every PR platform command through `fake` instead of a real
+ * process (null puts the real runner back). Set it inside a test and restore
+ * it in afterEach: bun runs every test file in one process.
+ */
+export function setPRCommandRuntimeForTests(fake: PRRuntime | null): void {
+	testRuntime = fake;
+}
 
 /** The Node command runner, exported for non-PR CLI consumers (commit avatars). */
 export const prCommandRuntime: PRRuntime = prRuntime;
@@ -95,6 +148,10 @@ export function fetchPRFileContent(ref: PRRef, sha: string, filePath: string) {
 }
 export function fetchPRFileBytes(ref: PRRef, sha: string, filePath: string, maxBytes: number) {
 	return fetchPRFileBytesCore(prRuntime, ref, sha, filePath, maxBytes);
+}
+/** Every file of one commit from the platform tree API (All files without a checkout). */
+export function fetchPRTree(ref: PRRef, sha: string) {
+	return fetchPRTreeCore(prRuntime, ref, sha);
 }
 /** Submit a review through the Pi Node.js command runtime. */
 export function submitPRReview(

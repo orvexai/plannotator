@@ -67,6 +67,116 @@ describe('TurnTracker claims only its own prompt', () => {
   })
 })
 
+// The failures these guard (/clear or a resume moves the process to another session while a question's
+// prompt still waits in the engine, which can't withdraw it): a question Stopped while queued, or carried
+// through two switches, ran as a live turn nobody owned; and a carried prompt the engine never ran aborted
+// the same words asked again, leaving the tracker busy for good.
+describe('TurnTracker: question prompts carried to the next session', () => {
+  const OUR_TURN = 'The plannotator plugin sent a message:\nwhy?'
+
+  test('a question Stopped while still queued is carried, and its turn is aborted in the next session', () => {
+    const before = new TurnTracker()
+    before.beginAsk('a1', 'why?', sink())
+    expect(before.cancelAsk('a1')).toBeNull()
+    const after = new TurnTracker()
+    after.dropQueued(before.queuedPrompts())
+    expect(after.onTurnStart('t1', OUR_TURN)).toBe('t1')
+  })
+
+  test('a second switch before the turn starts still carries it', () => {
+    const a = new TurnTracker()
+    a.beginAsk('a1', 'why?', sink())
+    const b = new TurnTracker()
+    b.dropQueued(a.queuedPrompts())
+    const c = new TurnTracker()
+    c.dropQueued(b.queuedPrompts())
+    expect(c.onTurnStart('t1', OUR_TURN)).toBe('t1')
+  })
+
+  test('a carried prompt whose submit failed is forgotten: the same words asked again are answered', async () => {
+    const before = new TurnTracker()
+    before.beginAsk('a1', 'why?', sink())
+    let reject!: (error: Error) => void
+    const submit = new Promise((_resolve, fail) => (reject = fail))
+    submit.catch(() => undefined) // the bridge's own catch
+    before.followSubmit('a1', submit)
+    const after = new TurnTracker()
+    after.dropQueued(before.queuedPrompts())
+    reject(new Error('discarded'))
+    await Bun.sleep(0)
+
+    const s = sink()
+    expect(after.beginAsk('a2', 'why?', s)).toBe(true)
+    expect(after.onTurnStart('t2', OUR_TURN)).toBeNull()
+    after.onTurnComplete('t2', 'because', false)
+    expect(s.answers).toEqual(['because'])
+    expect(after.busy).toBe(false)
+  })
+
+  test('a carried prompt the engine took is forgotten once a turn ended after it', async () => {
+    const before = new TurnTracker()
+    before.beginAsk('a1', 'why?', sink())
+    let taken!: () => void
+    before.followSubmit('a1', new Promise<void>((resolve) => (taken = resolve)))
+    const after = new TurnTracker()
+    after.dropQueued(before.queuedPrompts())
+    taken()
+    await Bun.sleep(0)
+    // Its turn would have started before this one ended.
+    after.onTurnStart('t1', 'something else')
+    after.onTurnComplete('t1', 'ok', false)
+
+    const s = sink()
+    after.beginAsk('a2', 'why?', s)
+    expect(after.onTurnStart('t2', OUR_TURN)).toBeNull()
+    after.onTurnComplete('t2', 'because', false)
+    expect(s.answers).toEqual(['because'])
+  })
+
+  // The engine may resolve the submit (idle, prompt taken) before the hook for the turn it waited behind completes.
+  test('a prompt taken before the turn it waited behind completes is still aborted when its turn starts', async () => {
+    // Stopped while queued, in the same session.
+    const turns = new TurnTracker()
+    turns.onTurnStart('person', 'My own work.')
+    turns.beginAsk('a1', 'why?', sink())
+    let taken!: () => void
+    turns.followSubmit('a1', new Promise<void>((resolve) => (taken = resolve)))
+    expect(turns.cancelAsk('a1')).toBeNull()
+    taken()
+    await Bun.sleep(0)
+    turns.onTurnComplete('person', 'Done.', false)
+    expect(turns.onTurnStart('t2', OUR_TURN)).toBe('t2')
+
+    // Carried by a /clear queued in the person's turn: the new session's tracker hears that turn complete, never start.
+    const before = new TurnTracker()
+    before.onTurnStart('person-2', 'My own work.')
+    before.beginAsk('a2', 'why?', sink())
+    let takenToo!: () => void
+    before.followSubmit('a2', new Promise<void>((resolve) => (takenToo = resolve)))
+    const after = new TurnTracker()
+    after.dropQueued(before.queuedPrompts())
+    takenToo()
+    await Bun.sleep(0)
+    after.onTurnComplete('person-2', 'Done.', false)
+    expect(after.onTurnStart('t3', OUR_TURN)).toBe('t3')
+  })
+
+  test('a prompt still waiting is dropped before the same words asked again claim their own turn', () => {
+    const before = new TurnTracker()
+    before.beginAsk('a1', 'why?', sink())
+    const after = new TurnTracker()
+    after.dropQueued(before.queuedPrompts())
+    const s = sink()
+    after.beginAsk('a2', 'why?', s)
+    // The engine runs them in order: the carried one first.
+    expect(after.onTurnStart('t1', OUR_TURN)).toBe('t1')
+    after.onTurnComplete('t1', '', true)
+    expect(after.onTurnStart('t2', OUR_TURN)).toBeNull()
+    after.onTurnComplete('t2', 'because', false)
+    expect(s.answers).toEqual(['because'])
+  })
+})
+
 // #1748 put the reviewer's draft list between the surface line and the
 // question. The failure this guards: the mod no longer recognizing its own
 // question turn, so the answer never streams back to Plannotator. The turn is
@@ -292,4 +402,78 @@ test('the mod sends the same take-over notes the provider would', () => {
   expect(TAKEN_OVER_TEXT).toBe(SESSION_ASK_TAKEN_OVER_TEXT)
   expect(TAKEN_OVER_BY_PERSON_TEXT).toBe(SESSION_ASK_TAKEN_OVER_BY_PERSON_TEXT)
   expect(TAKEN_OVER_INTERRUPT_TEXT).toBe(SESSION_ASK_TAKEN_OVER_INTERRUPT_TEXT)
+})
+
+// The failure these guard: another plugin (one that delivers its own messages
+// as turns, e.g. a connector) submits a prompt; its turn was then read as
+// steerable (a Send now reply went into it, and that plugin streamed the
+// agent's answer to OUR reply as the answer to its message) or abortable.
+describe("TurnTracker knows another plugin's turns", () => {
+  test("a turn another plugin's prompt started is that plugin's until it ends", () => {
+    const turns = new TurnTracker()
+    turns.onPromptEntered({ text: 'Review PR 12.', fromUs: false, originKind: 'plugin' })
+    expect(turns.onTurnStart('plugin-turn', 'The workspaces plugin sent a message: Review PR 12.')).toBeNull()
+    expect(turns.isOtherPluginTurn('plugin-turn')).toBe(true)
+    turns.onTurnComplete('plugin-turn', 'Done.', false)
+    expect(turns.isOtherPluginTurn('plugin-turn')).toBe(false)
+  })
+
+  test("the person's turns, engine-started turns and our own turns are not another plugin's", () => {
+    const turns = new TurnTracker()
+    turns.onPromptEntered({ text: 'fix the parser', fromUs: false, originKind: 'composer' })
+    turns.onTurnStart('person', 'fix the parser')
+    expect(turns.isOtherPluginTurn('person')).toBe(false)
+    turns.onTurnComplete('person', 'Done.', false)
+    turns.onPromptEntered({ text: 'Task finished.', fromUs: false, originKind: 'task-notification' })
+    turns.onTurnStart('note', 'Task finished.')
+    expect(turns.isOtherPluginTurn('note')).toBe(false)
+    turns.onTurnComplete('note', 'Ok.', false)
+    // Our own prompt (the engine never shows it to our hook; even if it did, fromUs drops it).
+    turns.onPromptEntered({ text: 'Plannotator Inbox: x', fromUs: true, originKind: 'plugin' })
+    turns.onTurnStart('ours', 'The plannotator plugin sent a message: Plannotator Inbox: x')
+    expect(turns.isOtherPluginTurn('ours')).toBe(false)
+    turns.onTurnComplete('ours', 'Ok.', false)
+    // A turn nothing attributes (no prompt.submit seen) stays as today.
+    turns.onTurnStart('unknown', 'The workspaces plugin sent a message: hello')
+    expect(turns.isOtherPluginTurn('unknown')).toBe(false)
+  })
+
+  test("another plugin's prompt delivered into a running turn makes it that plugin's too; our Ask question is still claimed", () => {
+    const turns = new TurnTracker()
+    turns.onTurnStart('person', 'refactor')
+    turns.onPromptEntered({ text: 'Also look at PR 12.', fromUs: false, originKind: 'plugin', turnId: 'person' })
+    expect(turns.isOtherPluginTurn('person')).toBe(true)
+    turns.onTurnComplete('person', 'Done.', false)
+    const s = sink()
+    turns.beginAsk('a1', 'why?', s)
+    turns.onTurnStart('ask', 'The plannotator plugin sent a message:\nwhy?')
+    expect(turns.ownsTurn('ask')).toBe(true)
+    expect(turns.isOtherPluginTurn('ask')).toBe(false)
+  })
+})
+
+// The failure this guards: the reviewer cancelled our Ask question after another plugin's prompt was
+// folded into its turn, and the cancel aborted the turn, cutting off that plugin's answer.
+describe("cancelling our question never aborts a turn another plugin's prompt joined", () => {
+  test('alone, a cancel aborts the question\'s own turn (as before)', () => {
+    const turns = new TurnTracker()
+    const s = sink()
+    turns.beginAsk('a1', 'why?', s)
+    turns.onTurnStart('ask', 'The plannotator plugin sent a message:\nwhy?')
+    expect(turns.cancelAsk('a1')).toBe('ask')
+  })
+
+  test("joined by another plugin's prompt, a cancel closes the question and returns no turn to abort", () => {
+    const turns = new TurnTracker()
+    const s = sink()
+    turns.beginAsk('a1', 'why?', s)
+    turns.onTurnStart('ask', 'The plannotator plugin sent a message:\nwhy?')
+    turns.onPromptEntered({ text: 'Review PR 12.', fromUs: false, originKind: 'plugin', turnId: 'ask' })
+    expect(turns.cancelAsk('a1')).toBeNull()
+    expect(s.errors).toEqual(['aborted'])
+    expect(turns.isActiveAsk('a1')).toBe(false)
+    // Nothing more streams to Plannotator from that turn.
+    turns.onText('ask', 'the other plugin\'s answer')
+    expect(s.deltas).toEqual([])
+  })
 })
