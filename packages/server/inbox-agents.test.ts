@@ -5,12 +5,13 @@
  * touched, what a later run does, and what uninstall removes.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { loadConfig } from "@plannotator/shared/config";
 import { createFakeAgents, type FakeAgents } from "../../tests/helpers/fake-agents";
 import {
   agentHomeAllowed,
+  clinePluginInstalled,
   codexHome,
   geminiDir,
   connectInboxAgents,
@@ -42,6 +43,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   process.env.PLANNOTATOR_DATA_DIR = savedDataDir;
+  // Throws (failing the test) when a fake CLI was still running; it is killed first.
   fake.remove();
 });
 
@@ -60,6 +62,12 @@ function connect(extra: Record<string, string> = {}, options: { agentTimeoutMs?:
 }
 
 const adds = () => fake.calls().filter((call) => call.args[1] === "add");
+
+/** Every fake CLI the test started has ended (a SIGKILL in flight gets a moment). */
+async function expectNoFakeRunning(): Promise<void> {
+  for (let waited = 0; waited < 1000 && fake.live().length > 0; waited += 25) await Bun.sleep(25);
+  expect(fake.live()).toEqual([]);
+}
 
 describe("what is found", () => {
   test("nothing installed: nothing is run or written, and nothing is said", async () => {
@@ -158,13 +166,73 @@ describe("agents with their own `mcp add`", () => {
     const report = await connect({ FAKE_AGENT_HANG: "amp" }, { agentTimeoutMs: 1500 });
     expect(report.added).toEqual(["codex"]);
     expect(report.failed.map((f) => [f.agent, f.reason])).toEqual([["amp", "amp mcp add did not finish within 1.5 s"]]);
+    // Stopped means killed: the hung CLI is not running any more.
+    await expectNoFakeRunning();
   });
 
-  test("the whole step's limit: agents still going are left for the next run", async () => {
+  test("a hanging `--version` is stopped too, and the agent is left to connect by hand", async () => {
+    fake.install("amp");
+    // The probe's own limit is 5 s.
+    const report = await connect({ FAKE_AGENT_HANG_VERSION: "amp" });
+    expect(report.manual).toEqual(["amp"]);
+    await expectNoFakeRunning();
+  }, 15_000);
+
+  test("the whole step's limit: agents still going are left for the next run, and their CLIs are killed", async () => {
     fake.install("amp");
     const report = await connect({ FAKE_AGENT_HANG: "amp" }, { agentTimeoutMs: 5000, totalTimeoutMs: 300 });
     expect(report.unfinished).toEqual(["amp"]);
     expect(readInboxAgents(dataDir).agents.amp).toBeUndefined();
+    // Not left running until its own 5 s limit (or forever, once this process exits first).
+    await expectNoFakeRunning();
+  });
+
+  test("the caller going away (the Inbox stops) kills the CLIs still running and writes nothing", async () => {
+    fake.install("amp");
+    const stop = new AbortController();
+    const running = connectInboxAgents({
+      dataDir,
+      selfCommand: SELF,
+      environment: environment({ FAKE_AGENT_HANG: "amp" }),
+      agentTimeoutMs: 20_000,
+      totalTimeoutMs: 20_000,
+      signal: stop.signal,
+    });
+    const started = Date.now();
+    // Wait for the hanging `mcp add`, not merely any fake: the `--version` probe
+    // that runs first is a fake process too, and it exits before `mcp add` starts.
+    while (fake.calls().length === 0 && Date.now() - started < 5000) await Bun.sleep(25);
+    expect(fake.live().map((p) => [p.name, p.args[0]])).toEqual([["amp", "mcp"]]);
+    stop.abort();
+    const report = await running;
+    expect(report.unfinished).toEqual(["amp"]);
+    expect(existsSync(join(dataDir, "inbox", "agents.json"))).toBe(false);
+    await expectNoFakeRunning();
+  });
+
+  test("a hung CLI does not outlive this process: the exit handler kills it", async () => {
+    // A child process runs a connect whose CLI hangs past the child's own exit.
+    fake.install("amp");
+    const script = join(fake.root, "exit-early.ts");
+    writeFileSync(
+      script,
+      `import { connectInboxAgents, createAgentEnvironmentFor } from ${JSON.stringify(join(import.meta.dir, "inbox-agents.ts"))};
+const env = JSON.parse(process.env.FAKE_ENV_JSON);
+void connectInboxAgents({ dataDir: process.env.DATA, selfCommand: ["/x"], environment: createAgentEnvironmentFor({ platform: process.platform, homeDir: env.HOME, env }), agentTimeoutMs: 60000, totalTimeoutMs: 60000 });
+const started = Date.now();
+// Exit once the hanging \`mcp add\` has started (it records its call first).
+const wait = () => { if (require("fs").readFileSync(env.FAKE_AGENT_LOG, "utf8").length > 0 || Date.now() - started > 5000) process.exit(0); else setTimeout(wait, 25); };
+wait();
+`,
+    );
+    const child = Bun.spawnSync([process.execPath, script], {
+      env: { ...process.env, DATA: dataDir, FAKE_ENV_JSON: JSON.stringify({ ...fake.env, FAKE_AGENT_HANG: "amp" }) },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(child.exitCode).toBe(0);
+    expect(fake.calls().map((call) => call.name)).toEqual(["amp"]);
+    await expectNoFakeRunning();
   });
 });
 
@@ -186,6 +254,17 @@ describe("agents connected by one key in a plain-JSON file", () => {
     });
   });
 
+  test("Antigravity: its one MCP file, there and empty as the products leave it, gets the key", async () => {
+    mkdirSync(join(fake.home, ".gemini", "antigravity-cli"), { recursive: true });
+    const file = join(fake.home, ".gemini", "config", "mcp_config.json");
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, "");
+    const report = await connect();
+    expect(report.added).toEqual(["antigravity"]);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ mcpServers: { "plannotator-inbox": { command: SELF[0], args: ["inbox", "mcp"] } } });
+    expect((await connect()).already).toContain("antigravity");
+  });
+
   test("a write that changes nothing is skipped (the file is not touched)", () => {
     const file = join(fake.home, "mcp.json");
     expect(writeJsonEntry(file, ["mcpServers"], { command: "/p/plannotator", args: ["inbox", "mcp"] })).toEqual({ ok: true, changed: true });
@@ -193,6 +272,22 @@ describe("agents connected by one key in a plain-JSON file", () => {
     Bun.sleepSync(20);
     expect(writeJsonEntry(file, ["mcpServers"], { command: "/p/plannotator", args: ["inbox", "mcp"] })).toEqual({ ok: true, changed: false });
     expect(statSync(file).mtimeMs).toBe(mtime);
+  });
+
+  test("a write is atomic: a new file renamed over the old one (never rewritten in place), the file's mode kept, no temp file left", () => {
+    // An agent reading its file mid-write sees the old text or the new, never half; shared by every JSON file Plannotator edits.
+    const dir = join(fake.home, "atomic");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "mcp.json");
+    writeFileSync(file, '{\n  "mcpServers": {}\n}\n', { mode: 0o640 });
+    chmodSync(file, 0o640);
+    for (const value of [{ command: "/p/plannotator", args: ["inbox", "mcp"] }, undefined]) {
+      const inode = statSync(file).ino;
+      expect(writeJsonEntry(file, ["mcpServers"], value, [["/p/plannotator", "inbox", "mcp"]])).toMatchObject({ ok: true, changed: true });
+      expect(statSync(file).ino).not.toBe(inode);
+      expect(statSync(file).mode & 0o777).toBe(0o640);
+      expect(readdirSync(dir)).toEqual(["mcp.json"]);
+    }
   });
 
   test("a file that is not plain JSON is refused and left as it was", async () => {
@@ -272,6 +367,180 @@ describe("Pi and OpenCode with Plannotator's extension or plugin: the tool switc
     fake.install("opencode");
     const report = await connect();
     expect(report.manual).toEqual(["opencode"]);
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("DeepSeek Harness with Plannotator's plugin in a profile: inboxTool on for it, and dsh is never run", async () => {
+    fake.install("dsh");
+    mkdirSync(join(fake.home, ".dsh", "profiles", "web"), { recursive: true });
+    writeFileSync(join(fake.home, ".dsh", "profiles", "web", "package.json"), JSON.stringify({ dependencies: { "@plannotator/dsh": "^0.28.0" } }));
+    const report = await connect();
+    expect(report.added).toEqual(["dsh"]);
+    expect(loadConfig().inboxTool).toEqual({ dsh: true });
+    // Plannotator never starts dsh: the fake on PATH logs every run.
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("turning on another agent's tool keeps the DeepSeek Harness switch and any host this version does not know", async () => {
+    mkdirSync(join(fake.home, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(fake.home, ".pi", "agent", "settings.json"), JSON.stringify({ packages: ["npm:@plannotator/pi-extension"] }));
+    writeFileSync(join(dataDir, "config.json"), JSON.stringify({ inboxTool: { dsh: false, "next-host": true } }));
+    expect((await connect()).added).toEqual(["pi"]);
+    // A host this version does not know (a newer Plannotator's) is kept too.
+    expect(loadConfig().inboxTool as Record<string, boolean>).toEqual({ dsh: false, "next-host": true, pi: true });
+  });
+
+  test("a `dsh` on PATH alone (Debian's distributed shell) is not DeepSeek Harness, and is never run", async () => {
+    fake.install("dsh");
+    const report = await connect();
+    expect(report.manual).not.toContain("dsh");
+    expect(report.added).not.toContain("dsh");
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("DeepSeek Harness: DSH_HOME is where the profiles are", async () => {
+    const dshHome = join(fake.root, "elsewhere-dsh");
+    mkdirSync(join(dshHome, "profiles", "desktop"), { recursive: true });
+    writeFileSync(join(dshHome, "profiles", "desktop", "package.json"), JSON.stringify({ devDependencies: { "@plannotator/dsh": "link:/src/apps/dsh-plugin" } }));
+    expect((await connect()).added).toEqual([]);
+    expect((await connect({ DSH_HOME: dshHome })).added).toEqual(["dsh"]);
+  });
+
+  test("DeepSeek Harness without the plugin is left to a person, never MCP, and dsh is never run", async () => {
+    fake.install("dsh");
+    mkdirSync(join(fake.home, ".dsh", "profiles", "web"), { recursive: true });
+    writeFileSync(join(fake.home, ".dsh", "profiles", "web", "package.json"), JSON.stringify({ dependencies: { "@deepseek-ai/dsh-bundle-web-app": "1.0.0" } }));
+    const report = await connect();
+    expect(report.manual).toEqual(["dsh"]);
+    expect(report.added).toEqual([]);
+    expect(loadConfig().inboxTool).toBeUndefined();
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("Hermes Agent with Plannotator's plugin: its tool on, and Hermes's own config set lets the plugin wake its sessions, once", async () => {
+    fake.install("hermes");
+    const plugin = join(fake.home, ".hermes", "plugins", "plannotator");
+    mkdirSync(plugin, { recursive: true });
+    writeFileSync(join(plugin, "plugin.yaml"), readFileSync(join(import.meta.dir, "..", "..", "apps", "hermes-plugin", "plugin.yaml")));
+    const report = await connect();
+    expect(report.added).toEqual(["hermes"]);
+    expect(loadConfig().inboxTool).toEqual({ hermes: true });
+    expect(fake.calls()).toEqual([{ name: "hermes", args: ["config", "set", "plugins.entries.plannotator.allow_gateway_injection", "true"] }]);
+    expect((await connect()).added).toEqual([]);
+    expect(fake.calls()).toHaveLength(1);
+  });
+
+  test("Hermes Agent's wake switch: turned on by the run says which setting and how to undo it; already on, hermes is not run and nothing is said", async () => {
+    fake.install("hermes");
+    const plugin = join(fake.home, ".hermes", "plugins", "plannotator");
+    mkdirSync(plugin, { recursive: true });
+    writeFileSync(join(plugin, "plugin.yaml"), readFileSync(join(import.meta.dir, "..", "..", "apps", "hermes-plugin", "plugin.yaml")));
+    writeFileSync(join(fake.home, ".hermes", "config.yaml"), "plugins:\n  entries:\n    plannotator:\n      allow_gateway_injection: true\n");
+    const already = await connect();
+    expect(already.added).toEqual(["hermes"]);
+    expect(fake.calls()).toEqual([]);
+    expect(formatConnectReport(already).join("\n")).not.toContain("allow_gateway_injection");
+
+    rmSync(join(dataDir, "inbox", "agents.json"), { force: true });
+    writeFileSync(join(fake.home, ".hermes", "config.yaml"), "plugins:\n  entries: {}\n");
+    const changed = await connect();
+    expect(fake.calls()).toHaveLength(1);
+    expect(formatConnectReport(changed)).toContain(
+      "Plannotator turned on Hermes Agent's plugins.entries.plannotator.allow_gateway_injection, so your replies can start a turn in the session that asked. To turn it off: hermes config set plugins.entries.plannotator.allow_gateway_injection false",
+    );
+  });
+
+  test("Hermes Agent without the plugin is left to the person with the one-line install, and hermes is never run", async () => {
+    fake.install("hermes");
+    mkdirSync(join(fake.home, ".hermes"), { recursive: true });
+    const report = await connect();
+    expect(report.manual).toEqual(["hermes"]);
+    expect(report.manual_why).toEqual([{ agent: "hermes", why: "add Plannotator's Hermes Agent plugin (hermes plugins install backnotprop/plannotator/apps/hermes-plugin --enable)" }]);
+    expect(loadConfig().inboxTool).toBeUndefined();
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("Hermes Agent: a refused config set is reported and tried again on the next run", async () => {
+    fake.install("hermes");
+    const plugin = join(fake.home, ".hermes", "plugins", "plannotator");
+    mkdirSync(plugin, { recursive: true });
+    writeFileSync(join(plugin, "plugin.yaml"), readFileSync(join(import.meta.dir, "..", "..", "apps", "hermes-plugin", "plugin.yaml")));
+    const failed = await connect({ FAKE_AGENT_FAIL: "hermes" });
+    expect(failed.failed.map((entry) => entry.agent)).toEqual(["hermes"]);
+    expect(failed.failed[0]!.reason).toContain("hermes config set plugins.entries.plannotator.allow_gateway_injection true exited with code 3");
+    expect((await connect()).already).toEqual(["hermes"]);
+    expect(fake.calls()).toHaveLength(2);
+  });
+
+  test("Cline with Plannotator's plugin installed from npm: inboxTool on for it, and cline is never run", async () => {
+    fake.install("cline");
+    const pkg = join(fake.home, ".cline", "plugins", "_installed", "npm", "plannotator-cline-1a2b3c", "package", "node_modules", "@plannotator", "cline");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@plannotator/cline", version: "0.28.51" }));
+    const report = await connect();
+    expect(report.added).toEqual(["cline"]);
+    expect(report.manual).toEqual([]);
+    expect(loadConfig().inboxTool).toEqual({ cline: true });
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("Cline: a plugin installed from a local folder is found under CLINE_DIR, even with no cline on PATH (the VS Code extension)", async () => {
+    const clineDir = join(fake.root, "elsewhere-cline");
+    const pkg = join(clineDir, "plugins", "_installed", "local", "cline-plugin-9f8e7d", "package");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@plannotator/cline", version: "0.28.51" }));
+    expect((await connect()).added).toEqual([]);
+    expect((await connect({ CLINE_DIR: clineDir })).added).toEqual(["cline"]);
+  });
+
+  test("Cline: the plugin as a plain file in ~/.cline/plugins (a built index.js copied there) is found", async () => {
+    mkdirSync(join(fake.home, ".cline", "plugins"), { recursive: true });
+    writeFileSync(join(fake.home, ".cline", "plugins", "weather.js"), "export default { name: 'weather' };\n");
+    expect((await connect()).added).toEqual([]);
+    writeFileSync(join(fake.home, ".cline", "plugins", "plannotator.js"), 'const pkg = { name: "@plannotator/cline" };\nexport default { name: "plannotator" };\n');
+    expect((await connect()).added).toEqual(["cline"]);
+  });
+
+  test("Cline: a workspace-scope install (<folder>/.cline/plugins) is found for the folder the Inbox runs in, read only", () => {
+    const e = createAgentEnvironmentFor({ platform: process.platform, homeDir: fake.home, env: {} });
+    const workspace = join(fake.root, "ledger");
+    const pkg = join(workspace, ".cline", "plugins", "_installed", "npm", "plannotator-cline-4d5e6f", "package", "node_modules", "@plannotator", "cline");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@plannotator/cline", version: "0.28.51" }));
+    expect(clinePluginInstalled(e, join(fake.root, "other"))).toBe(false);
+    expect(clinePluginInstalled(e, workspace)).toBe(true);
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("Cline with someone else's plugin only is still left to the person", async () => {
+    fake.install("cline");
+    const pkg = join(fake.home, ".cline", "plugins", "_installed", "npm", "weather-1a2b3c", "package", "node_modules", "weather");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "weather" }));
+    const report = await connect();
+    expect(report.manual).toEqual(["cline"]);
+    expect(loadConfig().inboxTool).toBeUndefined();
+  });
+
+  test("OpenClaw with Plannotator's plugin from npm: inboxTool on for it, and openclaw is never run", async () => {
+    fake.install("openclaw");
+    const pkg = join(fake.home, ".openclaw", "npm", "projects", "plannotator-openclaw-3f2a", "node_modules", "@plannotator", "openclaw");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@plannotator/openclaw", version: "0.28.61" }));
+    const report = await connect();
+    expect(report.added).toEqual(["openclaw"]);
+    expect(report.manual).toEqual([]);
+    expect(loadConfig().inboxTool).toEqual({ openclaw: true });
+    expect(fake.calls()).toEqual([]);
+  });
+
+  test("OpenClaw without the plugin is left to the person; a ClawHub install under OPENCLAW_STATE_DIR is found", async () => {
+    const state = join(fake.root, "claw-state");
+    mkdirSync(join(state, "extensions", "plannotator"), { recursive: true });
+    expect((await connect({ OPENCLAW_STATE_DIR: state })).manual).toEqual(["openclaw"]);
+    expect(loadConfig().inboxTool).toBeUndefined();
+    writeFileSync(join(state, "extensions", "plannotator", "package.json"), JSON.stringify({ name: "@plannotator/openclaw", version: "0.28.61" }));
+    expect((await connect({ OPENCLAW_STATE_DIR: state })).added).toEqual(["openclaw"]);
     expect(fake.calls()).toEqual([]);
   });
 
@@ -413,6 +682,8 @@ describe("a CLI is asked what it is before it is handed an mcp add", () => {
     const report = await connect({ FAKE_AGENT_GRANDCHILD: "codex" }, { agentTimeoutMs: 8000 });
     expect(report.added).toEqual(["codex"]);
     expect(Date.now() - started).toBeLessThan(6000);
+    // A CLI that exited by itself keeps the daemon it started (unchanged); this test ends it.
+    expect(fake.stopAll().map((p) => p.args)).toEqual([["--fake-grandchild"]]);
   });
 });
 

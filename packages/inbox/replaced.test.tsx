@@ -5,7 +5,7 @@
  * guard stops a Send that would drop a pick the agent replaced while the
  * person was answering (once per replacement, and on the server's 422).
  *
- * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from the test.yml DOM list.
+ * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from tests/dom-test-list.txt.
  */
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { act } from 'react';
@@ -65,7 +65,6 @@ function questionsOf(messageId: string, body: string): InboxQuestion[] {
     choices: q.parsed.choices,
     recommendation: null,
     suggested_text: null,
-    decision_on_answer: false,
     stopped: q.stopped,
     holds_up: q.holds_up,
     asked_by_agent_id: 'ses_a',
@@ -77,10 +76,7 @@ function questionsOf(messageId: string, body: string): InboxQuestion[] {
     picked_by: null,
     picked_at: null,
     sent_reply_id: null,
-    decision_id: null,
     message_id: messageId,
-    decision_recording: false,
-    decision_draft: null,
     superseded_by: null,
   }));
 }
@@ -138,7 +134,7 @@ beforeEach(() => {
   if (!hasDom) return;
   savedFetch = globalThis.fetch;
   posted = [];
-  replyAnswer = () => Response.json({ reply: {}, questions: [], replayed: false, decisions_refused: [] });
+  replyAnswer = () => Response.json({ reply: {}, questions: [], replayed: false });
   picksAnswer = () => Response.json({ questions: [] });
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
@@ -178,8 +174,6 @@ function pane(thread: InboxThread, onChanged: () => Promise<void> = async () => 
         onQuestions={() => {}}
         onChanged={onChanged}
         onClose={() => {}}
-        decisions={[]}
-        onOpenDecisionPage={() => {}}
         file={null}
         onOpenFile={() => {}}
         onOpenGuide={() => {}}
@@ -200,7 +194,8 @@ async function render(thread: InboxThread, onChanged?: () => Promise<void>) {
 }
 
 function button(el: HTMLElement, text: string): HTMLButtonElement {
-  const found = [...el.querySelectorAll('button')].find((b) => b.textContent?.trim() === text);
+  // A jump link is an inline element with the button role (ReplacedQuestion's JumpLink).
+  const found = [...el.querySelectorAll('button, [role="button"]')].find((b) => b.textContent?.trim() === text);
   if (!found) throw new Error(`no button "${text}" in ${[...el.querySelectorAll('button')].map((b) => b.textContent?.trim()).join(' | ')}`);
   return found as HTMLButtonElement;
 }
@@ -257,11 +252,21 @@ test.skipIf(!hasDom)('no replacement: "No longer applies", and the row links to 
   expect(document.activeElement?.getAttribute('data-message-article')).toBe(M2);
 });
 
+/** The person's words in the reply box (the box opens empty: the picks are listed beside the words, never written in). */
+function typeWords(text: HTMLTextAreaElement, words: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
+  act(() => {
+    setter.call(text, words);
+    text.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+
 test.skipIf(!hasDom)('the stale guard: a pick replaced while the person writes stops Send once, says why, and Esc keeps editing', async () => {
   const el = await render(before());
-  act(() => button(el, 'Edit the reply').click());
-  const text = el.querySelector('textarea') as HTMLTextAreaElement;
+  act(() => button(el, 'Edit draft').click());
+  const text = el.querySelector('textarea:not([data-question-other])') as HTMLTextAreaElement;
   // The person types; then the agent replaces question 1.
+  typeWords(text, 'Leaning this way for now.');
   act(() => root!.render(pane(after('replace'))));
   await settle();
   expect(el.querySelector('[data-replaced-notice]')?.textContent).toContain("replaced question 1 at");
@@ -284,26 +289,25 @@ test.skipIf(!hasDom)('the stale guard: a pick replaced while the person writes s
   act(() => guard.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
   await settle();
   expect(el.querySelector('[data-stale-guard]')).toBeNull();
-  expect((el.querySelector('textarea') as HTMLTextAreaElement).value).toBe(text.value);
+  expect((el.querySelector('textarea:not([data-question-other])') as HTMLTextAreaElement).value).toBe(text.value);
   expect(document.activeElement?.textContent).toBe('Send');
 
   // Once per replacement: Send now goes, with the words only (no pick).
-  // The Send also skips the questions left open, each on the reply to its own
-  // message, and the words ride the last reply.
+  // The Send leaves the questions open (Keep open by default, approval
+  // "inbox-explicit-skip"): one reply, the words.
   act(() => button(el, 'Send').click());
   await settle();
   const replies = posted.filter((p) => p.path.endsWith('/reply'));
-  expect(replies.length).toBeGreaterThan(0);
-  for (const reply of replies) {
-    expect((reply.body as { questions: unknown[] }).questions).toEqual([]);
-    expect((reply.body as { skip_unanswered?: boolean }).skip_unanswered).toBe(true);
-  }
-  expect((replies.at(-1)!.body as { words: string }).words).toBe(text.value.trim());
+  expect(replies).toHaveLength(1);
+  expect((replies[0]!.body as { questions: unknown[] }).questions).toEqual([]);
+  expect((replies[0]!.body as { skip?: unknown }).skip).toBeUndefined();
+  expect((replies[0]!.body as { words: string }).words).toBe(text.value.trim());
 });
 
 test.skipIf(!hasDom)('Answer the new question keeps the draft and goes to the new card', async () => {
   const el = await render(before());
-  act(() => button(el, 'Edit the reply').click());
+  act(() => button(el, 'Edit draft').click());
+  typeWords(el.querySelector('textarea:not([data-question-other])') as HTMLTextAreaElement, 'Leaning this way for now.');
   act(() => root!.render(pane(after('replace'))));
   await settle();
   act(() => button(el, 'Send').click());
@@ -314,7 +318,7 @@ test.skipIf(!hasDom)('Answer the new question keeps the draft and goes to the ne
   const thread = after('replace');
   expect(el.querySelector('[data-stale-guard]')).toBeNull();
   expect(document.activeElement).toBe(card(el, M2, thread.messages[1]!.questions![0]!.key));
-  expect((el.querySelector('textarea') as HTMLTextAreaElement).value).not.toBe('');
+  expect((el.querySelector('textarea:not([data-question-other])') as HTMLTextAreaElement).value).not.toBe('');
   expect(posted.filter((p) => p.path.endsWith('/reply'))).toEqual([]);
 });
 

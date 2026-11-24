@@ -8,7 +8,8 @@
  * switch allows it for Pi (`PLANNOTATOR_INBOX_TOOL` / `inboxTool`, off by
  * default here: Pi sends every tool's full definition with each request) AND
  * `inbox/inbox.json` exists (the person ran the Inbox once). Otherwise nothing
- * is registered, nothing listens, nothing polls, and nothing is said.
+ * is registered, nothing polls, and nothing is said; only the session claim
+ * (`claimPiSessions`) is kept wherever `inbox/inbox.json` exists.
  *
  * The tool is registered at load with the actions the Inbox's `/mcp` offers
  * (discovery bounded at 2 s; the factory awaits it), inactive on registration
@@ -20,8 +21,12 @@
  * queued messages, no "Ask this session" question running, and the last run
  * settled: `agent_settled` where Pi has it, idle alone on older Pi), goes in
  * with `pi.sendUserMessage(text, { deliverAs: "followUp" })` (a follow-up
- * never steers into a run that started in the same instant), and counts as
- * delivered when Pi starts that user message. Nothing here ever aborts a
+ * never steers into a run that started in the same instant; Oh My Pi, idle,
+ * gets no `deliverAs`: see `resolveIdleDeliveryOptions`), and counts as
+ * delivered when Pi starts that user message. Send now (the person pressed
+ * it in the Inbox; the command's `now`) goes in at once instead: as a
+ * `deliverAs: "steer"` while a run is going, which Pi reads after the run's
+ * current tool calls, else as the follow-up. Nothing here ever aborts a
  * run, so a prompt typed into the wake's turn takes it over, the rule of
  * `pi-session-bridge.ts`'s run protection, and the reply is never sent again.
  * Listeners are registered once, at load (`pi.on` has no unsubscribe before 1.0).
@@ -33,8 +38,9 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
-import { loadConfig, resolveInboxReminder, resolveInboxTool } from "./generated/config.ts";
+import { randomUUID } from "node:crypto";
+import { closeSync, existsSync, openSync, readSync } from "node:fs";
+import { loadConfig, resolveInboxReminder, resolveInboxReminderText, resolveInboxTool } from "./generated/config.ts";
 import { getPlannotatorDataDir } from "./generated/data-dir.ts";
 import {
 	discoverInboxTools,
@@ -42,8 +48,24 @@ import {
 	inboxRegistryFileOf,
 	InboxWake,
 } from "./generated/inbox/agent-link.ts";
-import { INBOX_REMINDER_TEXT, inboxAgentTool, type InboxReplyCommand } from "./generated/inbox/connection.ts";
-import { isCtxAlive } from "./current-pi-session.ts";
+import { inboxAgentTool, type InboxReplyCommand } from "./generated/inbox/connection.ts";
+import { isInboxTurnedOn } from "./generated/inbox/turned-on.ts";
+import { releasePiSessionClaim, writePiSessionClaim } from "./generated/inbox/pi-session-claim.ts";
+import { isCtxAlive, resolveIdleDeliveryOptions } from "./current-pi-session.ts";
+import { loadedPackageVersion, packageUpdatedMessage, readPackageVersion } from "./package-version.ts";
+import { detectPiHost } from "./pi-host.ts";
+
+/** How long a read of package.json on disk is reused: every poll asks. */
+const ON_DISK_FRESH_MS = 2_000;
+let onDiskCache: { at: number; value: string | null } | null = null;
+
+/** The extension's version on disk now (null: unreadable or gone), read at most once per 2 s. */
+function readOnDiskVersion(): string | null {
+	if (onDiskCache && Date.now() - onDiskCache.at < ON_DISK_FRESH_MS) return onDiskCache.value;
+	const value = readPackageVersion();
+	onDiskCache = { at: Date.now(), value };
+	return value;
+}
 import { PI_INBOX_REMINDER_CUSTOM_TYPE } from "./pi-session-bridge.ts";
 
 /**
@@ -65,9 +87,86 @@ type InboxPi = Pick<ExtensionAPI, "registerTool" | "sendUserMessage" | "getActiv
 	on(event: string, handler: (event: any, ctx?: any) => unknown): unknown;
 };
 
+/** OMP keeps the extension instance and emits a switch when it replaces the session. */
+function onInboxSessionChange(pi: InboxPi, update: (event: unknown, ctx: ExtensionContext) => void): void {
+	pi.on("session_start", update);
+	if (detectPiHost(pi) === "oh-my-pi") pi.on("session_switch", update);
+}
+
 export interface PiInboxOptions {
 	/** An "Ask this session" question is running (the session bridge hub). */
 	isAskActive: () => boolean;
+	/**
+	 * Whether the "Plannotator was updated" note may be shown for `version` now
+	 * (auto-reload.ts: once per version, and never while Pi will reload by itself).
+	 */
+	claimUpdateNotice?: (version: string) => boolean;
+}
+
+/**
+ * The Inbox poll's "Plannotator was updated … Type /reload" note for the session, or null to stay quiet:
+ * the files on disk are a version this process did not load and the session was not told about yet,
+ * and `claim` (auto-reload.ts claimNotice) allows it. It does not while Pi will reload by itself, so
+ * the note never shows right before the reload; and each version is announced once per process.
+ */
+export function inboxUpdateNotice(
+	loaded: string | null,
+	onDisk: string | null,
+	alreadyTold: string | null,
+	claim: ((version: string) => boolean) | undefined,
+	host: "pi" | "oh-my-pi",
+): string | null {
+	if (!loaded || !onDisk || onDisk === loaded || onDisk === alreadyTold) return null;
+	if (claim && !claim(onDisk)) return null;
+	return packageUpdatedMessage(loaded, onDisk, host);
+}
+
+/**
+ * The editor without `text` (Pi joins restored queued messages and the draft
+ * with a blank line): the joint closes up, the person's own words stay.
+ */
+export function editorWithout(editor: string, text: string): string | null {
+	const at = text ? editor.indexOf(text) : -1;
+	if (at < 0) return null;
+	let before = editor.slice(0, at);
+	let after = editor.slice(at + text.length);
+	if (before.endsWith("\n\n")) before = before.slice(0, -2);
+	if (after.startsWith("\n\n")) after = after.slice(2);
+	return before && after ? `${before}\n\n${after}` : before + after;
+}
+
+/** Takes `text` out of the session's editor, where Pi puts queued messages when a run is aborted. Best effort. */
+function takeOutOfEditor(current: ExtensionContext, text: string): void {
+	try {
+		const ui = current.ui as { getEditorText?: () => string; setEditorText?: (text: string) => void };
+		const editor = ui.getEditorText?.();
+		if (typeof editor !== "string") return;
+		const rest = editorWithout(editor, text);
+		if (rest !== null) ui.setEditorText?.(rest);
+	} catch {
+		// No editor (a session without UI): nothing was moved there.
+	}
+}
+
+/**
+ * Blocking UI prompts up in a Pi session's terminal now (`ui_prompt_start` / `ui_prompt_end`, Pi 0.84+): while any
+ * is, the Inbox hears "asking a question in its terminal" (INBOX_BLOCKED_FIELD; the kind only, never the prompt's
+ * title). Pi itself asks no permission, so every prompt is a question. Cleared when the run settles or the session goes.
+ */
+export class PiTerminalPrompts {
+	private open = 0;
+	up(): void {
+		this.open += 1;
+	}
+	down(): void {
+		this.open = Math.max(0, this.open - 1);
+	}
+	clear(): void {
+		this.open = 0;
+	}
+	blocked(): "question" | null {
+		return this.open > 0 ? "question" : null;
+	}
 }
 
 /**
@@ -75,12 +174,17 @@ export interface PiInboxOptions {
  * Inbox connection applies to this Pi; undefined (and nothing done) otherwise.
  */
 export function setupPiInbox(pi: InboxPi, options: PiInboxOptions): Promise<void> | undefined {
-	const config = loadConfig();
-	if (!resolveInboxTool(config, process.env, "pi")) return undefined;
 	const dataDir = getPlannotatorDataDir();
 	if (!existsSync(inboxRegistryFileOf(dataDir))) return undefined;
-	// Decided with the tool, once per extension instance (each session, /reload).
-	const reminder = resolveInboxReminder(config, process.env, "pi");
+	// With the Inbox tool on or off: the Inbox must never start a second Pi on a session this one runs.
+	claimPiSessions(pi, dataDir);
+	const config = loadConfig();
+	// Only once the person turned the Inbox on here (turned-on.ts).
+	if (!resolveInboxTool(config, process.env, "pi") || !isInboxTurnedOn(dataDir)) return undefined;
+	// Decided with the tool, once per extension instance (each session, /reload):
+	// the line (the person's own from config.json prompts.inbox, else
+	// INBOX_REMINDER_TEXT), or null when the reminder is off.
+	const reminder = resolveInboxReminder(config, process.env, "pi") ? resolveInboxReminderText(config, "pi") : null;
 	return discoverInboxTools(dataDir).then((tools) => {
 		if (!tools) return;
 		registerPiInbox(
@@ -89,6 +193,36 @@ export function setupPiInbox(pi: InboxPi, options: PiInboxOptions): Promise<void
 			{ ...options, reminder },
 		);
 	});
+}
+
+/**
+ * This process says which session it runs (`inbox/pi-sessions/`, pi-session-claim.ts): Pi sets
+ * `process.title = "pi"`, so the Inbox's process list never shows its `--session-id`. Claimed as a session
+ * starts, released as it ends (`/new`, `/resume`, `/reload`, exit); a claim left by a killed Pi is stale once
+ * its pid is gone.
+ */
+function claimPiSessions(pi: InboxPi, dataDir: string): void {
+	const owner = randomUUID();
+	// `pi --mode rpc`, or Pi's `pi-rpc` entry (its title; it passes the mode to main, not on argv).
+	const at = process.argv.indexOf("--mode");
+	const rpc = (at >= 0 && process.argv[at + 1] === "rpc") || /-rpc$/.test(process.title);
+	let claimed: string | null = null;
+	const release = () => {
+		if (claimed) releasePiSessionClaim(dataDir, claimed, process.pid, owner);
+		claimed = null;
+	};
+	onInboxSessionChange(pi, (_event, startCtx) => {
+		let session: string;
+		try {
+			session = startCtx.sessionManager.getSessionId();
+		} catch {
+			return;
+		}
+		if (claimed && claimed !== session) release();
+		claimed = session;
+		writePiSessionClaim(dataDir, { session, pid: process.pid, rpc, title: process.title, owner });
+	});
+	pi.on("session_shutdown", release);
 }
 
 type BranchEntry = { id?: string; type?: string; customType?: string; firstKeptEntryId?: string };
@@ -111,6 +245,16 @@ export function entriesCarryReminder(entries: readonly BranchEntry[]): boolean {
 	return entries.slice(from).some((entry) => entry?.type === "custom_message" && entry.customType === PI_INBOX_REMINDER_CUSTOM_TYPE);
 }
 
+/** The session's open Inbox threads for the reminder after a compaction, or null (no context, no Inbox, nothing open). */
+async function sessionThreadsOf(connection: InboxAgentConnection, current: ExtensionContext | null): Promise<string | null> {
+	if (!current || !isCtxAlive(current)) return null;
+	try {
+		return await connection.sessionThreads({ sessionId: current.sessionManager.getSessionId(), cwd: current.cwd });
+	} catch {
+		return null;
+	}
+}
+
 function branchHasReminder(ctx: ExtensionContext): boolean {
 	try {
 		return entriesCarryReminder(ctx.sessionManager.getBranch() as BranchEntry[]);
@@ -129,8 +273,100 @@ function userText(message: { content?: unknown } | undefined): string {
 		.join("");
 }
 
-function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options: PiInboxOptions & { reminder: boolean }): void {
+/**
+ * PLANNOTATOR_SESSION_PROJECT (apps/hook/server/inbox-mcp-shim.ts,
+ * `inboxSessionProjectFromEnv`): `pi:<session id>:<ctx.cwd>`, the folder this
+ * session's `plannotator_inbox` tool files under. Pi gives each bash call this
+ * process's environment plus PI_SESSION_ID, so a `cd sub && plannotator inbox
+ * call …` or `plannotator card …` lands in the tool's project too. Set before
+ * every bash call, so a new or resumed session's id is the one named. A stale
+ * ctx names nothing new.
+ */
+export function exportPiSessionProject(env: Record<string, string | undefined>, ctx: Pick<ExtensionContext, "cwd" | "sessionManager">): void {
+	try {
+		env.PLANNOTATOR_SESSION_PROJECT = `${PI_INBOX_HOST}:${ctx.sessionManager.getSessionId()}:${ctx.cwd}`;
+	} catch {
+		// A stale ctx: the last value stands, and it names its own session.
+	}
+}
+
+/** How far a handoff line is followed back: as many as the poll's `continues` takes (INBOX_CONTINUES_MAX). */
+const PI_HANDOFF_LINE_MAX = 8;
+/** A session header longer than this is not read (Pi's header is a few hundred bytes). */
+const PI_SESSION_HEADER_MAX_BYTES = 64 * 1024;
+
+/**
+ * The header (line 1) of a Pi session's .jsonl, or null when it cannot be read. Only the first line is read:
+ * the rest of a session file can be many megabytes. Exported for the tests.
+ */
+export function readPiSessionHeader(file: string): { id?: unknown; parentSession?: unknown } | null {
+	let fd: number | null = null;
+	try {
+		fd = openSync(file, "r");
+		const chunk = Buffer.alloc(4096);
+		const parts: Buffer[] = [];
+		let size = 0;
+		for (;;) {
+			const read = readSync(fd, chunk, 0, chunk.length, null);
+			if (read <= 0) break;
+			const end = chunk.subarray(0, read).indexOf(0x0a);
+			parts.push(Buffer.from(chunk.subarray(0, end >= 0 ? end : read)));
+			size += end >= 0 ? end : read;
+			if (end >= 0) break;
+			if (size > PI_SESSION_HEADER_MAX_BYTES) return null;
+		}
+		const first = Buffer.concat(parts).toString("utf8").trim();
+		if (!first) return null;
+		const value: unknown = JSON.parse(first);
+		return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as { id?: unknown; parentSession?: unknown }) : null;
+	} catch {
+		return null;
+	} finally {
+		if (fd !== null) {
+			try {
+				closeSync(fd);
+			} catch {}
+		}
+	}
+}
+
+/**
+ * The sessions a handed-off Pi session continues, nearest first (#3539): Pi's handoff starts the new
+ * session with `parentSession: <old session file>` in its header, and that file's header has the old id
+ * (and its own `parentSession` when the line goes further back). Sent as the poll's `continues`, so the
+ * Inbox hands this session what waits for an old id while that id does not poll; an old session that is
+ * running again keeps its own (packages/server/inbox-continuations.ts). Stops at an unreadable file, a
+ * header without an id, a session already seen, or PI_HANDOFF_LINE_MAX. Exported for the tests.
+ */
+export function piHandoffLine(sessionFile: string | null | undefined, currentSessionId: string): string[] {
+	const line: string[] = [];
+	const seen = new Set<string>([currentSessionId]);
+	let file = sessionFile;
+	while (file && line.length < PI_HANDOFF_LINE_MAX) {
+		const parent = readPiSessionHeader(file)?.parentSession;
+		if (typeof parent !== "string" || !parent) break;
+		const id = readPiSessionHeader(parent)?.id;
+		if (typeof id !== "string" || !id || seen.has(id)) break;
+		seen.add(id);
+		line.push(id);
+		file = parent;
+	}
+	return line;
+}
+
+/** The handoff line of the session `ctx` runs; none when Pi cannot say its file (an in-memory session). */
+function piHandoffLineOf(ctx: ExtensionContext, sessionId: string): string[] {
+	try {
+		return piHandoffLine(ctx.sessionManager.getSessionFile(), sessionId);
+	} catch {
+		return [];
+	}
+}
+
+/** Exported for the tests. */
+export function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options: PiInboxOptions & { reminder: string | null }): void {
 	const spec = inboxAgentTool(connection.tools);
+	const ohMyPi = detectPiHost(pi) === "oh-my-pi";
 	if (!spec) return;
 
 	pi.registerTool({
@@ -150,6 +386,10 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 
 	let ctx: ExtensionContext | null = null;
 	let wake: InboxWake | null = null;
+	/** The sessions this one continues (piHandoffLine), read as the session starts: the poll's `continues`. */
+	let continues: string[] = [];
+	/** The on-disk version the session was last told about (#2085's message, once per version). */
+	let notifiedOnDisk: string | null = null;
 	let activationSettled = false;
 	/** The tool is active in this instance's session (an interactive UI): only then is there a reminder to give. */
 	let toolActive = false;
@@ -158,6 +398,7 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 	/** Pi emits `agent_settled` (0.80.4+): a run counts as over only when it settled. */
 	let settleEvents = false;
 	let runOpen = false;
+	const prompts = new PiTerminalPrompts();
 	/** The wake waiting to show up as a user message in the session. */
 	let waiting: { id: string; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | null = null;
 
@@ -178,32 +419,45 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 		}
 	};
 
+	/** Put the wake text into the session and wait until Pi starts it as a user message. */
+	const send = (text: string, command: InboxReplyCommand, deliverAs: "followUp" | "steer") =>
+		new Promise<void>((resolve, reject) => {
+			const current = ctx;
+			const watchdog = () => {
+				if (waiting?.id !== command.id) return;
+				// Still busy (Pi preparing the run, or the person's run first): look again later.
+				if (current && isCtxAlive(current) && !idleNow(current)) {
+					waiting.timer = setTimeout(watchdog, DELIVERY_WATCHDOG_MS);
+					return;
+				}
+				// A steer that never started: the person pressed Esc during the run, and Pi moved its
+				// queued messages into the editor. Take ours back out, so the reply, which now waits for
+				// idle and arrives as a follow-up, is not also sent a second time from the editor.
+				if (deliverAs === "steer" && current && isCtxAlive(current)) takeOutOfEditor(current, text);
+				endWaiting(new Error("the message did not reach the session"));
+			};
+			waiting = { id: command.id, resolve, reject, timer: setTimeout(watchdog, DELIVERY_WATCHDOG_MS) };
+			try {
+				pi.sendUserMessage(text, resolveIdleDeliveryOptions(current ?? undefined, { deliverAs }));
+			} catch (error) {
+				endWaiting(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+
 	const target = {
+		blocked: () => prompts.blocked(),
+		// Never steer into this session's own "Ask this session" question (its answer streams to
+		// Plannotator; the Claude Code mod's rule): the reply waits for idle, and the poll stops offering Send now.
+		canSteer: () => !options.isAskActive(),
 		isBusy: () => {
 			const current = ctx;
 			if (!current || !isCtxAlive(current) || !idleNow(current)) return true;
 			if (options.isAskActive()) return true;
 			return settleEvents && runOpen;
 		},
-		deliver: (text: string, command: InboxReplyCommand) =>
-			new Promise<void>((resolve, reject) => {
-				const current = ctx;
-				const watchdog = () => {
-					if (waiting?.id !== command.id) return;
-					// Still busy (Pi preparing the run, or the person's run first): look again later.
-					if (current && isCtxAlive(current) && !idleNow(current)) {
-						waiting.timer = setTimeout(watchdog, DELIVERY_WATCHDOG_MS);
-						return;
-					}
-					endWaiting(new Error("the message did not reach the session"));
-				};
-				waiting = { id: command.id, resolve, reject, timer: setTimeout(watchdog, DELIVERY_WATCHDOG_MS) };
-				try {
-					pi.sendUserMessage(text, { deliverAs: "followUp" });
-				} catch (error) {
-					endWaiting(error instanceof Error ? error : new Error(String(error)));
-				}
-			}),
+		deliver: (text: string, command: InboxReplyCommand) => send(text, command, "followUp"),
+		// Send now while a run is going: a steer, which Pi puts into the run after its current tool calls.
+		steer: (text: string, command: InboxReplyCommand) => send(text, command, "steer"),
 		notify: (message: string) => {
 			try {
 				ctx?.ui.notify(message, "warning");
@@ -211,9 +465,56 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 				// The session is gone: the reply stays readable in the Inbox.
 			}
 		},
+		// What this process loaded and what is on disk now, and which host (owner approval "reload-hosts"):
+		// the Inbox says `/reload` (Oh My Pi `/restart`) when the package changed under the session, or
+		// the update and the reload when both are behind it. The first time the files on disk differ, the
+		// session hears it once, before a command fails (#2085).
+		plugin: () => {
+			const version = loadedPackageVersion();
+			if (!version) return null;
+			const onDisk = readOnDiskVersion();
+			const note = inboxUpdateNotice(version, onDisk, notifiedOnDisk, options.claimUpdateNotice, ohMyPi ? "oh-my-pi" : "pi");
+			if (note) {
+				notifiedOnDisk = onDisk;
+				try {
+					ctx?.ui.notify(note, "warning");
+				} catch {
+					// No UI: the Inbox still says it.
+				}
+			}
+			return { version, on_disk: onDisk, host: ohMyPi ? ("oh-my-pi" as const) : ("pi" as const) };
+		},
+		// A handed-off session (#3539): the sessions it continues, so their replies come here while they are gone.
+		continues: () => continues,
+		// The session's working folder, so the Inbox lists it under its project from its first poll.
+		projectPath: () => {
+			const current = ctx;
+			if (!current || !isCtxAlive(current)) return null;
+			try {
+				return current.cwd;
+			} catch {
+				return null;
+			}
+		},
+		// The session's name, only if someone named it. Asked on every poll, so a later name replaces it.
+		// "" says it has none; null says Pi cannot tell now (a stale ctx, a throw), and the last word stands.
+		label: () => {
+			const current = ctx;
+			if (!current || !isCtxAlive(current)) return null;
+			try {
+				return current.sessionManager.getSessionName() ?? "";
+			} catch {
+				return null;
+			}
+		},
 	};
 
-	pi.on("session_start", (_event, startCtx: ExtensionContext) => {
+	// Before each bash call: the session's project for the commands it runs (exportPiSessionProject).
+	pi.on("tool_call", (event: { toolName?: unknown } | undefined, callCtx: ExtensionContext) => {
+		if (event?.toolName === "bash") exportPiSessionProject(process.env, callCtx);
+	});
+
+	onInboxSessionChange(pi, (_event, startCtx) => {
 		ctx = startCtx;
 		if (!activationSettled) {
 			activationSettled = true;
@@ -228,7 +529,11 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 		if (wake && wake.sessionId !== sessionId) {
 			wake.dispose();
 			wake = null;
+			runOpen = false;
+			prompts.clear();
+			endWaiting(new Error("the session changed"));
 		}
+		continues = startCtx.hasUI ? piHandoffLineOf(startCtx, sessionId) : [];
 		if (!wake && startCtx.hasUI) {
 			wake = new InboxWake(connection, sessionId, target);
 			wake.start();
@@ -241,16 +546,30 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 	// moves no cached prefix. Not again after /reload or /resume (the branch
 	// already holds it); again after a compaction that summarized it away
 	// (which has invalidated the cache anyway, the plan framing's rule).
-	if (options.reminder) {
-		pi.on("before_agent_start", () => {
+	// After a compaction the same message also names the session's open Inbox
+	// threads (`sessionThreads`, bounded, never starting the Inbox), so the
+	// thread ids come from the Inbox, not from the summary: the Claude Code
+	// mod's compact hook, here.
+	const reminderText = options.reminder;
+	if (reminderText) {
+		/** A compaction summarized the reminder away: the next one carries the thread list too. */
+		let afterCompaction = false;
+		pi.on("before_agent_start", async (_event, agentCtx: ExtensionContext) => {
 			if (!toolActive || reminderDelivered) return undefined;
 			reminderDelivered = true;
+			let content = reminderText;
+			if (afterCompaction) {
+				afterCompaction = false;
+				const threads = await sessionThreadsOf(connection, agentCtx ?? ctx);
+				if (threads) content = `${reminderText}\n\n${threads}`;
+			}
 			return {
-				message: { customType: PI_INBOX_REMINDER_CUSTOM_TYPE, content: INBOX_REMINDER_TEXT, display: false },
+				message: { customType: PI_INBOX_REMINDER_CUSTOM_TYPE, content, display: false },
 			};
 		});
 		pi.on("session_compact", (_event, compactCtx: ExtensionContext) => {
 			reminderDelivered = compactCtx ? branchHasReminder(compactCtx) : false;
+			afterCompaction = !reminderDelivered;
 		});
 		pi.on("session_tree", (_event, treeCtx: ExtensionContext) => {
 			reminderDelivered = branchHasReminder(treeCtx);
@@ -261,6 +580,7 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 		wake?.dispose();
 		wake = null;
 		ctx = null;
+		prompts.clear();
 		endWaiting(new Error("the session ended"));
 	});
 
@@ -275,7 +595,11 @@ function registerPiInbox(pi: InboxPi, connection: InboxAgentConnection, options:
 	pi.on("agent_settled", () => {
 		settleEvents = true;
 		runOpen = false;
+		prompts.clear();
 	});
+	// A blocking prompt in the terminal (an extension's confirm, select, input or editor): only its being up is told.
+	pi.on("ui_prompt_start", () => prompts.up());
+	pi.on("ui_prompt_end", () => prompts.down());
 	pi.on("message_start", (event) => {
 		const message = event?.message as { role?: string; content?: unknown } | undefined;
 		if (message?.role !== "user" || !waiting) return;

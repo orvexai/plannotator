@@ -94,7 +94,7 @@ describe("exportReviewFeedback", () => {
       }],
     })]);
 
-    expect(result).toContain('## General');
+    expect(result).toContain('## Global comments');
     expect(result).toContain('`checkout()` → `if (authorized)` — `inferred step`');
   });
 
@@ -334,6 +334,16 @@ describe("exportReviewFeedback", () => {
     expect(highlighted).toBeGreaterThan(note);
   });
 
+  it("fences quoted code with more backticks than any run in it, so a ``` line in the code cannot end the quote", () => {
+    const result = exportReviewFeedback([
+      ann({ text: "Fix the example", selectedText: "Example:\n```\nnpm i\n```", originalCode: "a ```` b", suggestedCode: "no ticks" }),
+    ]);
+    expect(result).toContain("**Highlighted text:**\n````\nExample:\n```\nnpm i\n```\n````\n");
+    expect(result).toContain("**Replaces:**\n`````\na ```` b\n`````\n");
+    // Code without a backtick run keeps the three-backtick fence, byte for byte.
+    expect(result).toContain("**Suggested code:**\n```\nno ticks\n```\n");
+  });
+
   it("omits the Highlighted text block when there is no selectedText", () => {
     const result = exportReviewFeedback([ann()]);
     expect(result).not.toContain("**Highlighted text:**");
@@ -462,11 +472,11 @@ describe("exportReviewFeedback", () => {
     expect(result).not.toContain("Review scope: full-stack");
   });
 
-  it("general comments render under a General section, not a file/line group", () => {
+  it("general comments render under a Global comments section, not a file/line group", () => {
     const result = exportReviewFeedback([
       ann({ id: "g", scope: "general", filePath: "", lineStart: 0, lineEnd: 0, text: "the overall approach is off" }),
     ]);
-    expect(result).toContain("## General");
+    expect(result).toContain("## Global comments");
     expect(result).toContain("the overall approach is off");
     // No bogus line heading for a review-level comment.
     expect(result).not.toContain("Line 0");
@@ -478,8 +488,10 @@ describe("exportReviewFeedback", () => {
       ann({ id: "g", scope: "general", filePath: "", lineStart: 0, lineEnd: 0, text: "review-wide note" }),
     ]);
     expect(result).toContain("line issue");
-    expect(result).toContain("## General");
+    expect(result).toContain("## Global comments");
     expect(result).toContain("review-wide note");
+    // Global comments come before the per-file sections.
+    expect(result.indexOf("## Global comments")).toBeLessThan(result.indexOf("line issue"));
   });
 
   it("labels the header with short sha + subject for a commit diff", () => {

@@ -16,26 +16,61 @@ export interface CommandResult {
   exitCode: number;
 }
 
+/**
+ * Per-command options a runtime honors. `env` is ADDED to the process
+ * environment for that one child (never replacing it): the GitHub provider
+ * uses it to run `gh` as another signed-in account for one review
+ * (pr-github-account.ts). A runtime that ignores it runs as the active account.
+ */
+export interface CommandOptions {
+  env?: Record<string, string>;
+  /**
+   * When it aborts, the command and everything it started are ended (TERM, then KILL): a command given up on (a
+   * Bitbucket token command that never answered) does not keep running.
+   */
+  signal?: AbortSignal;
+}
+
+/**
+ * What a review startup's auth check learned. GitHub only today: when the
+ * active gh account cannot see the PR and another signed-in account can,
+ * `notice` says which account the review uses and `childEnv` carries its
+ * token for the review's own children. Never print `childEnv`.
+ */
+export interface PRAuthResult {
+  notice?: string;
+  childEnv?: Record<string, string>;
+}
+
 export interface PRRuntime {
   runCommand: (
     cmd: string,
     args: string[],
+    options?: CommandOptions,
   ) => Promise<CommandResult>;
   runCommandWithInput?: (
     cmd: string,
     args: string[],
     input: string,
+    options?: CommandOptions,
   ) => Promise<CommandResult>;
   /**
    * HTTP client for platforms reached over REST rather than a CLI
    * (Bitbucket Cloud). Defaults to the global `fetch`; tests inject one.
    */
   fetch?: typeof fetch;
+  /**
+   * The API token configured for one Forgejo origin (`https://host[:port]`), or
+   * null. Only the servers set it, from config.json and the environment:
+   * browser code never sees a token. A token is returned only for the exact
+   * origin it was configured for.
+   */
+  forgejoToken?: (origin: string) => string | null;
 }
 
 // --- Platform Types ---
 
-export type Platform = "github" | "gitlab" | "bitbucket";
+export type Platform = "github" | "gitlab" | "bitbucket" | "forgejo";
 
 /** GitHub PR reference */
 export interface GithubPRRef {
@@ -63,8 +98,20 @@ export interface BitbucketPRRef {
   number: number;
 }
 
+/** Forgejo PR reference (`{host}/{owner}/{repo}/pulls/{number}`) */
+export interface ForgejoPRRef {
+  platform: "forgejo";
+  /** As written in the URL; may include `:port`. */
+  host: string;
+  /** Omitted means https; only `http` is ever stored. */
+  scheme?: "http";
+  owner: string;
+  repo: string;
+  number: number;
+}
+
 /** Discriminated union — auto-detected from URL */
-export type PRRef = GithubPRRef | GitlabMRRef | BitbucketPRRef;
+export type PRRef = GithubPRRef | GitlabMRRef | BitbucketPRRef | ForgejoPRRef;
 
 /** GitHub PR metadata */
 export interface GithubPRMetadata {
@@ -135,8 +182,36 @@ export interface BitbucketPRMetadata {
   url: string;
 }
 
+/** Forgejo PR metadata */
+export interface ForgejoPRMetadata {
+  platform: "forgejo";
+  /** As written in the URL; may include `:port`. */
+  host: string;
+  /** Omitted means https; only `http` is ever stored. */
+  scheme?: "http";
+  owner: string;
+  repo: string;
+  number: number;
+  title: string;
+  author: string;
+  baseBranch: string;
+  headBranch: string;
+  /** Repository default branch, used to infer whether this PR targets another PR branch. */
+  defaultBranch?: string;
+  baseSha: string;
+  headSha: string;
+  /** Merge-base SHA — the common ancestor commit used to compute the PR diff. Differs from baseSha when the base branch has moved. */
+  mergeBaseSha?: string;
+  /**
+   * `owner/repo` of the source repository when the PR comes from a fork.
+   * Absent for same-repository PRs.
+   */
+  sourceRepo?: string;
+  url: string;
+}
+
 /** Discriminated union — downstream gets type narrowing for free */
-export type PRMetadata = GithubPRMetadata | GitlabMRMetadata | BitbucketPRMetadata;
+export type PRMetadata = GithubPRMetadata | GitlabMRMetadata | BitbucketPRMetadata | ForgejoPRMetadata;
 
 // --- PR Context Types (platform-agnostic) ---
 
@@ -190,6 +265,10 @@ export interface PRThreadComment {
   createdAt: string;
   url: string;
   diffHunk?: string;
+  /** The forge hides it (GitHub's minimized comment). */
+  isMinimized?: boolean;
+  /** Why, in the forge's words ("OFF_TOPIC", "outdated"), when it is hidden and says. */
+  minimizedReason?: string;
 }
 
 export interface PRReviewThread {
@@ -200,6 +279,8 @@ export interface PRReviewThread {
   line: number | null;
   startLine: number | null;
   diffSide: 'LEFT' | 'RIGHT' | null;
+  /** The side of `startLine` (GitHub), when the forge says: a range can start on a removed line and end on an added one. */
+  startDiffSide?: 'LEFT' | 'RIGHT' | null;
   comments: PRThreadComment[];
 }
 
@@ -214,8 +295,20 @@ export interface PRContext {
   comments: PRComment[];
   reviews: PRReview[];
   reviewThreads: PRReviewThread[];
+  /** The forge failed while `reviewThreads` was read: there may be more than this holds. */
+  threadsIncomplete?: boolean;
   checks: PRCheck[];
   linkedIssues: PRLinkedIssue[];
+  /** Who has been asked to review and has not yet, as far as the forge says. Absent when this read did not ask. */
+  requestedReviewers?: PRRequestedReviewer[];
+}
+
+export interface PRRequestedReviewer {
+  /** A person's or an app's login; a team as `org/team`. */
+  login: string;
+  avatarUrl?: string;
+  isBot?: boolean;
+  isTeam?: boolean;
 }
 
 export interface PRReviewFileComment {
@@ -228,10 +321,9 @@ export interface PRReviewFileComment {
 }
 
 /**
- * The review event a platform submission carries (#1611). GitHub maps these
- * to `APPROVE` / `COMMENT` / `REQUEST_CHANGES`. GitLab has no request-changes
- * review, so it posts `request_changes` exactly like `comment` (a note plus
- * discussions); only `approve` adds a mutation there.
+ * The review event a platform submission carries. GitHub maps these to
+ * `APPROVE` / `COMMENT` / `REQUEST_CHANGES`. GitLab posts a note plus
+ * discussions, then `approve` or `request_changes` sets the decision separately.
  */
 export type PRReviewAction = "approve" | "comment" | "request_changes";
 
@@ -242,7 +334,7 @@ export function parsePRReviewAction(value: unknown): PRReviewAction | null {
 
 /**
  * A comment on a whole file rather than a line (#1599). GitHub posts it as a
- * file-level review thread; GitLab has no equivalent and folds it into the body.
+ * file-level review thread, GitLab as a file discussion; Bitbucket folds it into the body.
  */
 export interface PRReviewFileLevelComment {
   path: string;
@@ -280,7 +372,7 @@ export interface PRReviewCommentFailure {
 export interface PRReviewRetry {
   /**
    * `approve` / `request_changes` when the decision mutation itself failed
-   * (GitLab approve, Bitbucket approve or request-changes); `comment` when only
+   * (GitLab or Bitbucket approve or request-changes); `comment` when only
    * inline comments (and possibly the unposted general comment) remain.
    */
   action: PRReviewAction;
@@ -292,6 +384,11 @@ export interface PRReviewRetry {
 /** A platform review for which every requested mutation completed. */
 export interface PRReviewSubmissionComplete {
   status: "complete";
+  /**
+   * What went when it is not what was asked: `comment` when a GitLab older
+   * than 18.9 has no request-changes, so the review stays a plain comment.
+   */
+  postedAs?: "comment";
 }
 
 /**
@@ -309,6 +406,8 @@ export interface PRReviewSubmissionPartial {
   /** Why the general comment failed (Bitbucket; `retry.body` then carries it). */
   reviewBodyError?: string;
   recoveryFile?: string;
+  /** As `PRReviewSubmissionComplete.postedAs`: the decision already went as a comment. */
+  postedAs?: "comment";
   retry: PRReviewRetry;
 }
 
@@ -373,13 +472,15 @@ export interface PRPlatformCapabilities {
   /** Prefix of the change number in labels: "#" or "!". */
   numberPrefix: "#" | "!";
   /**
-   * The platform records a real request-changes decision (#1611). GitHub:
-   * REQUEST_CHANGES review; Bitbucket: `POST /request-changes`. GitLab has
-   * none, so `request_changes` posts exactly like `comment` there.
+   * The platform records a real request-changes decision. GitHub:
+   * REQUEST_CHANGES review; GitLab: `mergeRequestRequestChanges`; Bitbucket:
+   * `POST /request-changes`.
    */
   requestChanges: boolean;
-  /** The platform refuses approve / request-changes from the PR author. */
+  /** The platform always refuses approve from the PR author (GitHub only). */
   selfReviewBlocked: boolean;
+  /** The platform refuses request-changes from the PR author (GitHub only). */
+  selfRequestChangesBlocked: boolean;
   /** File-scoped comments post as file-level threads (else folded into the body). */
   fileLevelComments: boolean;
   /** Per-file "viewed" state syncs to the platform. */
@@ -408,6 +509,7 @@ const PLATFORM_CAPABILITIES: Record<Platform, PRPlatformCapabilities> = {
     numberPrefix: "#",
     requestChanges: true,
     selfReviewBlocked: true,
+    selfRequestChangesBlocked: true,
     fileLevelComments: true,
     viewedSync: true,
     artifacts: true,
@@ -419,9 +521,13 @@ const PLATFORM_CAPABILITIES: Record<Platform, PRPlatformCapabilities> = {
     label: "GitLab",
     changeLabel: "MR",
     numberPrefix: "!",
-    requestChanges: false,
-    selfReviewBlocked: true,
-    fileLevelComments: false,
+    requestChanges: true,
+    // GitLab lets an author approve their own MR unless the project forbids
+    // it; then GitLab refuses and the review shows its answer. Nothing mutes.
+    selfReviewBlocked: false,
+    // An MR author may mark their own MR as needing changes.
+    selfRequestChangesBlocked: false,
+    fileLevelComments: true,
     viewedSync: false,
     artifacts: true,
     reviewBodyRequired: false,
@@ -436,6 +542,7 @@ const PLATFORM_CAPABILITIES: Record<Platform, PRPlatformCapabilities> = {
     // Bitbucket Cloud lets an author approve their own PR (the approval just
     // does not count toward merge checks), so nothing is muted.
     selfReviewBlocked: false,
+    selfRequestChangesBlocked: false,
     // Bitbucket supports file comments, but posting them one by one outside the
     // partial-retry contract is not worth the risk yet: they fold into the body.
     fileLevelComments: false,
@@ -444,6 +551,27 @@ const PLATFORM_CAPABILITIES: Record<Platform, PRPlatformCapabilities> = {
     // fetch path does not carry: no artifacts panel yet.
     artifacts: false,
     reviewBodyRequired: false,
+    agentCliAccess: false,
+    cli: null,
+  },
+  forgejo: {
+    label: "Forgejo",
+    changeLabel: "PR",
+    numberPrefix: "#",
+    // `event: "REQUEST_CHANGES"` on POST /pulls/{n}/reviews.
+    requestChanges: true,
+    // Forgejo answers 422 to approve and to request-changes on your own PR
+    // ("approve your own pull is not allowed" / "reject your own pull ...").
+    selfReviewBlocked: true,
+    selfRequestChangesBlocked: true,
+    // File-level comments fold into the body until the review post supports them.
+    fileLevelComments: false,
+    viewedSync: false,
+    // Attachments and raw files load from the instance's own origin, with the
+    // configured token when there is one (see pr-artifact-document.ts).
+    artifacts: true,
+    // REQUEST_CHANGES needs a body; COMMENT needs a body or an inline comment.
+    reviewBodyRequired: true,
     agentCliAccess: false,
     cli: null,
   },
@@ -479,11 +607,40 @@ export function getMRNumberLabel(m: PRRef | PRMetadata): string {
   return `${getPRPlatformCapabilities(m).numberPrefix}${getPRNumber(m)}`;
 }
 
+/** `scheme://host` of a Forgejo instance; the scheme is https unless the ref says http. */
+export function getForgejoOrigin(m: ForgejoPRRef | ForgejoPRMetadata): string {
+  return `${m.scheme ?? "https"}://${m.host}`;
+}
+
 /** "owner/repo", "group/project" or "workspace/repo" */
 export function getDisplayRepo(m: PRRef | PRMetadata): string {
-  if (m.platform === "github") return `${m.owner}/${m.repo}`;
+  if (m.platform === "github" || m.platform === "forgejo") return `${m.owner}/${m.repo}`;
   if (m.platform === "bitbucket") return `${m.workspace}/${m.repo}`;
   return m.projectPath;
+}
+
+/**
+ * A link to lines of a file at the PR's head commit, for comments the
+ * platform cannot take inline (lines outside the PR's diff): GitHub
+ * `blob/<sha>/<path>#L10-L11`, GitLab `-/blob/<sha>/<path>#L10-11`, Bitbucket
+ * `src/<sha>/<path>#lines-10:11`.
+ */
+export function prBlobPermalink(m: PRMetadata, path: string, lineStart: number, lineEnd: number): string {
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  const sha = encodeURIComponent(m.headSha);
+  const host = m.host.replace(/\/+$/, "");
+  const single = lineStart === lineEnd;
+  if (m.platform === "github") {
+    return `https://${host}/${m.owner}/${m.repo}/blob/${sha}/${encodedPath}#L${lineStart}${single ? "" : `-L${lineEnd}`}`;
+  }
+  if (m.platform === "gitlab") {
+    return `https://${host}/${m.projectPath}/-/blob/${sha}/${encodedPath}#L${lineStart}${single ? "" : `-${lineEnd}`}`;
+  }
+  if (m.platform === "forgejo") {
+    const origin = `${m.scheme ?? "https"}://${host}`;
+    return `${origin}/${m.owner}/${m.repo}/src/commit/${sha}/${encodedPath}#L${lineStart}${single ? "" : `-L${lineEnd}`}`;
+  }
+  return `https://${host}/${m.workspace}/${m.repo}/src/${sha}/${encodedPath}#lines-${lineStart}${single ? "" : `:${lineEnd}`}`;
 }
 
 /** Reconstruct a PRRef from metadata */
@@ -493,6 +650,16 @@ export function prRefFromMetadata(m: PRMetadata): PRRef {
   }
   if (m.platform === "bitbucket") {
     return { platform: "bitbucket", host: m.host, workspace: m.workspace, repo: m.repo, number: m.number };
+  }
+  if (m.platform === "forgejo") {
+    return {
+      platform: "forgejo",
+      host: m.host,
+      ...(m.scheme ? { scheme: m.scheme } : {}),
+      owner: m.owner,
+      repo: m.repo,
+      number: m.number,
+    };
   }
   return { platform: "gitlab", host: m.host, projectPath: m.projectPath, iid: m.iid };
 }
@@ -509,6 +676,13 @@ export function isSameProject(a: PRRef, b: PRRef): boolean {
     // Bitbucket workspace and repository slugs are case-insensitive.
     return a.host === b.host
       && a.workspace.toLowerCase() === b.workspace.toLowerCase()
+      && a.repo.toLowerCase() === b.repo.toLowerCase();
+  }
+  if (a.platform === "forgejo" && b.platform === "forgejo") {
+    // Host names and Forgejo owner/repo names are case-insensitive; http and https are different instances.
+    return a.host.toLowerCase() === b.host.toLowerCase()
+      && (a.scheme ?? "https") === (b.scheme ?? "https")
+      && a.owner.toLowerCase() === b.owner.toLowerCase()
       && a.repo.toLowerCase() === b.repo.toLowerCase();
   }
   return false;
@@ -533,6 +707,8 @@ export function getCliInstallUrl(ref: PRRef): string {
 export function getPRHeadFetchSpec(m: PRMetadata): { remote: string | null; ref: string } {
   if (m.platform === "github") return { remote: null, ref: `refs/pull/${m.number}/head` };
   if (m.platform === "gitlab") return { remote: null, ref: `refs/merge-requests/${m.iid}/head` };
+  // Forgejo publishes the head, forks included, as refs/pull/N/head on the base repository.
+  if (m.platform === "forgejo") return { remote: null, ref: `refs/pull/${m.number}/head` };
   if (m.headBranch.startsWith("-") || m.headBranch.includes("..")) {
     throw new Error(`Invalid source branch: ${m.headBranch}`);
   }
@@ -562,6 +738,13 @@ export function getPRCloneCommand(
       env: { GIT_TERMINAL_PROMPT: "0" },
     };
   }
+  if (m.platform === "forgejo") {
+    // Plain git, like Bitbucket: no CLI, and the API token never goes on a command line.
+    return {
+      argv: ["git", "clone", "--depth=1", "--no-checkout", "--", `${getForgejoOrigin(m)}/${m.owner}/${m.repo}.git`, dest],
+      env: { GIT_TERMINAL_PROMPT: "0" },
+    };
+  }
   const cli = m.platform === "github" ? "gh" : "glab";
   // gh/glab repo clone doesn't accept --hostname; set GH_HOST/GITLAB_HOST env instead
   const isDefaultHost = m.host === "github.com" || m.host === "gitlab.com";
@@ -579,6 +762,13 @@ export type PRFileBytesResult =
   | { kind: "ok"; bytes: Uint8Array; etag?: string }
   | { kind: "missing" }
   | { kind: "too-large"; size: number };
+
+/** Every file path of one commit from a platform tree API (All files without a checkout). */
+export interface PRTreeResult {
+  paths: string[];
+  /** The platform stopped listing before the end (GitHub's ~100k-entry cap). */
+  truncated: boolean;
+}
 
 /** Decode a platform API base64 payload (GitHub wraps it at 60 columns). */
 export function decodeBase64Bytes(value: string): Uint8Array {
@@ -605,6 +795,34 @@ export function encodeApiFilePath(filePath: string): string {
 
 // --- URL Parsing ---
 
+/** The public hosts of the other platforms: never a Forgejo instance. */
+const NOT_FORGEJO_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
+/** A Forgejo host as a URL may write it: a DNS name or IPv4 address, or a bracketed IPv6 literal, then an optional port. */
+const FORGEJO_HOST = /^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$/;
+/** A Forgejo owner or repository name. */
+const FORGEJO_NAME = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * True when `host` is one the API origin is built from exactly as written:
+ * only name characters (never a backslash, which a URL parser reads as `/`),
+ * no trailing dot, the same host after the URL parser reads it (so no
+ * shorthand IP form and no default port it would drop), and none of the other
+ * platforms' public hosts.
+ */
+function isForgejoHost(scheme: string, host: string): boolean {
+  if (!FORGEJO_HOST.test(host)) return false;
+  const name = host.toLowerCase().replace(/:\d+$/, "");
+  if (name.endsWith(".")) return false;
+  try {
+    if (new URL(`${scheme}://${host}`).host !== host.toLowerCase()) return false;
+  } catch {
+    return false;
+  }
+  return !NOT_FORGEJO_HOSTS.has(name.replace(/\.+$/, "").replace(/^www\./, ""));
+}
+
+const isForgejoName = (name: string) => FORGEJO_NAME.test(name) && name !== "." && name !== "..";
+
 /**
  * Parse a PR/MR URL into its components. Auto-detects platform.
  *
@@ -615,6 +833,7 @@ export function encodeApiFilePath(filePath: string): string {
  * - Self-hosted GitLab: https://gitlab.mycompany.com/group/project/-/merge_requests/42
  *
  * - Bitbucket Cloud: https://bitbucket.org/workspace/repo/pull-requests/7[/diff|/overview]
+ * - Forgejo / Gitea, any host but the three above: https://codeberg.org/owner/repo/pulls/5
  *
  * GitLab is checked first because `/-/merge_requests/` is unambiguous,
  * while `/pull/` could theoretically appear on any host. Bitbucket is matched
@@ -664,6 +883,28 @@ export function parsePRUrl(url: string): PRRef | null {
       repo: ghMatch[3],
       number: parseInt(ghMatch[4], 10),
     };
+  }
+
+  // Forgejo / Gitea: {scheme}://{host}[:{port}]/{owner}/{repo}/pulls/{number}[/...]
+  // `/pulls/` (plural) cannot collide with GitHub's `/pull/`. Read last, so
+  // every URL another platform reads parses exactly as it did before. The host
+  // and names are checked strictly (isForgejoHost, isForgejoName) because the
+  // API URL and a checkout folder are built from them: no credentials, no
+  // backslash, no `..`, and never github.com, gitlab.com or bitbucket.org,
+  // where such a path is no Forgejo PR and stays unparsed, as it always was.
+  const fjMatch = url.match(
+    /^(https?):\/\/([^/?#]+)\/([^/?#]+)\/([^/?#]+)\/pulls\/(\d+)(?:[/?#]|$)/,
+  );
+  if (fjMatch && isForgejoHost(fjMatch[1], fjMatch[2]) && isForgejoName(fjMatch[3]) && isForgejoName(fjMatch[4])) {
+    const ref: ForgejoPRRef = {
+      platform: "forgejo",
+      host: fjMatch[2],
+      owner: fjMatch[3],
+      repo: fjMatch[4],
+      number: parseInt(fjMatch[5], 10),
+    };
+    if (fjMatch[1] === "http") ref.scheme = "http";
+    return ref;
   }
 
   return null;

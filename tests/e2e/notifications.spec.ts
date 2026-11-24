@@ -13,10 +13,16 @@
  * otherwise reports as always focused), and the banner itself, which the test
  * reads as the recorded title, body and tag.
  *
+ * The rules (approval "inbox-notify-every-thread"): every new thread an agent
+ * starts notifies, the tab in front or not; a new question notifies unless it
+ * is in the thread open on screen; plain news in a thread never does.
+ *
  * Build the binary first (see inbox.spec.ts), then `bun run test:e2e:inbox`.
  * PNGs of the proved states land in .local/proof/notifications/.
  */
 
+import { NO_BROWSER } from '../helpers/no-browser';
+import { markTourDecided } from '../helpers/tour-decided';
 import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -39,6 +45,7 @@ declare global {
   interface Window {
     __notifications: { calls: Recorded[]; instances: Notification[]; prompts: string[] };
     __front: { visible: boolean; focused: boolean };
+    __reader?: Element | null;
   }
 }
 
@@ -97,7 +104,9 @@ function registry(): { pid: number; port: number; serverSession: string; url: st
 }
 
 function config(): { inboxNotifications?: Record<string, unknown> } {
-  return JSON.parse(readFileSync(join(world.dataDir, 'config.json'), 'utf8'));
+  // Not written yet: an expect.poll on it waits instead of failing on ENOENT.
+  const file = join(world.dataDir, 'config.json');
+  return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
 }
 
 function startInbox(): string {
@@ -168,6 +177,10 @@ async function setFront(visible: boolean, focused: boolean): Promise<void> {
 /** Every Inbox notification carries this one tag, so the browser shows one at a time. */
 const TAG = 'plannotator-inbox';
 let stoppedThread = '';
+/** The Pi agent whose thread is Stopped on you. */
+let piAgent: SimAgent;
+/** The thread Codex started in docs-site, on screen from the "in front" test on. */
+let codexThread = '';
 
 /** The page has read the list the agent's write produced: the held list shows it behind "N new" (or on screen). */
 async function pageSaw(threadId: string): Promise<void> {
@@ -199,6 +212,8 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   const dataDir = join(root, 'data');
   const home = join(root, 'home');
   mkdirSync(home);
+  // The first-run screen's notifications ask, not the tour's entry screen (inbox-tour.spec.ts proves that one).
+  markTourDecided(dataDir);
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'light' });
   await context.addInitScript(recordNotifications);
   const page = await context.newPage();
@@ -207,7 +222,19 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   world = {
     root,
     dataDir,
-    env: { PATH: process.env.PATH ?? '', HOME: home, PLANNOTATOR_DATA_DIR: dataDir },
+    env: {
+      PATH: process.env.PATH ?? '',
+      HOME: home,
+      PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9',
+      PLANNOTATOR_DATA_DIR: dataDir,
+      PLANNOTATOR_BROWSER: NO_BROWSER,
+      NO_BROWSER,
+      PLANNOTATOR_INBOX_CONNECT: '0',
+      PLANNOTATOR_UPDATE_CHECK: '0',
+      PLANNOTATOR_INBOX_NOTES: '0',
+      PLANNOTATOR_TEST_SANDBOX: '1',
+      NO_ANON_PING: '1',
+    },
     url: '',
     billing: scratchProject(join(root, 'src'), 'billing-svc'),
     docs: scratchProject(join(root, 'src'), 'docs-site'),
@@ -232,30 +259,67 @@ test.afterAll(async () => {
   }
 });
 
-test('the ask appears when the first thread arrives, never on first paint', async () => {
+test('the first-run screen asks before the first question; once the first thread arrives the ask is above the list, and stays until answered', async () => {
   const { page } = world;
   await page.goto(world.url);
   await expect(page.getByRole('heading', { name: 'No agent has written yet', exact: true })).toBeVisible();
   expect(await page.evaluate(() => Notification.permission)).toBe('default');
-  await page.waitForTimeout(500);
-  await expect(page.locator('[data-notification-ask]')).toHaveCount(0);
+  // The moment before the first question (the onboarding audit, finding 3): under Try it, in its own words.
+  const firstRun = page.locator('[data-first-run-ask] [data-notification-ask="ask"]');
+  await expect(firstRun).toBeVisible();
+  await expect(firstRun).toContainText('Get a desktop notice when the first question arrives.');
+  await expect(firstRun.getByRole('button', { name: 'Turn on' })).toBeVisible();
+  await expect(page.locator('[data-notification-ask]')).toHaveCount(1);
+  expect(await calls()).toEqual([]);
+  await shot('6.0-ask-first-run');
 
   const claude = await agent('Claude Code', 'claude-code');
   const sent = await claude.send({ project_path: world.billing, body: DEMO_MESSAGES.stopped });
   await expect(page.locator(`[data-thread-id="${sent.thread_id}"]`)).toBeVisible();
   const ask = page.locator('[data-notification-ask="ask"]');
   await expect(ask).toBeVisible();
-  await expect(ask).toContainText('Get a desktop notice when an agent stops on you.');
+  await expect(ask).toContainText('Get a desktop notice when an agent needs you.');
   await expect(ask.getByRole('button', { name: 'Turn on' })).toBeVisible();
   // Nothing was raised: the browser has not been asked.
   expect(await calls()).toEqual([]);
   await shot('6.1-ask');
 
-  // A reload paints the list without the ask: it comes back only when something new arrives.
+  // A reload keeps it: a missing permission fails silently, so the line stays until it is answered.
   await page.reload();
   await expect(page.locator(`[data-thread-id="${sent.thread_id}"]`)).toBeVisible();
-  await page.waitForTimeout(500);
-  await expect(page.locator('[data-notification-ask]')).toHaveCount(0);
+  await expect(page.locator('[data-notification-ask="ask"]')).toBeVisible();
+
+  // Beside an open thread the list is a 380 px column. The words keep the line's width and the buttons go on
+  // a row under them, never squeezing the words into a narrow column between the icon and the buttons.
+  await page.locator(`[data-thread-id="${sent.thread_id}"]`).click();
+  await expect(page.locator('.ib-listcol.ib-narrow')).toBeVisible();
+  const line = page.locator('[data-notification-ask="ask"]');
+  await expect(line).toBeVisible();
+  await expect.poll(async () => (await line.boundingBox())?.width ?? Infinity).toBeLessThan(420);
+  const [lineBox, textBox, actsBox] = await Promise.all([
+    line.boundingBox(),
+    line.locator('.ib-ask-text').boundingBox(),
+    line.locator('.ib-ask-acts').boundingBox(),
+  ]);
+  expect(lineBox!.width).toBeLessThan(420);
+  expect(textBox!.width).toBeGreaterThan(lineBox!.width * 0.7);
+  expect(actsBox!.y).toBeGreaterThanOrEqual(textBox!.y + textBox!.height);
+  await shot('6.1-ask-beside-thread');
+  await page.goto(world.url);
+});
+
+test('one origin: the Inbox opened at 127.0.0.1 lands on localhost, its #thread link kept', async () => {
+  const { page } = world;
+  const at = new URL(world.url);
+  const loopback = `http://127.0.0.1:${at.port}/#thread=msg_not_a_real_thread`;
+  await page.goto(loopback);
+  await expect.poll(() => new URL(page.url()).hostname).toBe('localhost');
+  expect(new URL(page.url()).port).toBe(at.port);
+  expect(new URL(page.url()).hash).toBe('#thread=msg_not_a_real_thread');
+  // The API at 127.0.0.1 answers where it is asked (agents and scripts use it).
+  const health = await page.request.get(`http://127.0.0.1:${at.port}/api/inbox/health`);
+  expect(health.status()).toBe(200);
+  await page.goto(world.url);
 });
 
 test('"Not now" is kept by the Inbox: it holds across a reload and a port change', async () => {
@@ -285,17 +349,29 @@ test('"Not now" is kept by the Inbox: it holds across a reload and a port change
   await expect(page.locator('[data-notification-ask]')).toHaveCount(0);
 });
 
-test('Settings turns them on; after a port change the line returns once as "moved", and Turn on asks the browser', async () => {
+test('Settings shows the status, a test and the reach; after a port change "moved" shows at once, and Allow asks the browser', async () => {
   const { page, context } = world;
   await context.grantPermissions(['notifications'], { origin: new URL(world.url).origin });
   await page.getByRole('button', { name: 'Settings' }).click();
   const block = page.locator('[data-settings-notifications]');
-  await expect(block).toContainText('Allowed in this browser');
+  // The status is read live: the grant above shows without a reload.
+  await expect(block).toContainText('On for this address');
+  // This tab is open and allowed: the server counts it.
+  await expect(block.locator('[data-notify-reach="yes"]')).toContainText('Yes, through this tab');
+  // The test notice: raised on its own tag, with the hint for a system that hides it.
+  const tested = (await calls()).length;
+  await block.getByRole('button', { name: 'Send a test notification' }).click();
+  await expect.poll(async () => (await calls()).length).toBe(tested + 1);
+  expect((await calls()).at(-1)).toMatchObject({ title: 'Plannotator Inbox: test notification', tag: 'plannotator-inbox-test' });
+  await expect(block.locator('[data-notify-test]')).toContainText("Didn't see it?");
   const main = block.getByRole('switch', { name: 'Desktop notifications' });
-  // On by default, and allowed by the browser: the one notifications switch reads on (the other is the question sound's).
+  // On by default, and allowed by the browser: the one notifications switch reads on.
   await expect(main).toHaveAttribute('aria-checked', 'true');
   await expect(block.getByRole('switch', { name: 'Desktop notifications' })).toHaveCount(1);
-  await expect(block.getByRole('switch')).toHaveCount(2);
+  // The card's other switches are named: the sound's and the Mark read warning's; no second notifications switch.
+  await expect(block.getByRole('switch', { name: 'Play a sound' })).toHaveCount(1);
+  await expect(block.getByRole('switch', { name: 'Warn before Mark read sets questions aside' })).toHaveCount(1);
+  await expect(block.getByRole('switch')).toHaveCount(3);
   await main.click();
   await expect(main).toHaveAttribute('aria-checked', 'false');
   await expect.poll(() => config().inboxNotifications?.enabled).toBe(false);
@@ -305,23 +381,48 @@ test('Settings turns them on; after a port change the line returns once as "move
   await page.locator('.ib-spage').evaluate((el) => el.scrollTo(0, el.scrollHeight));
   await shot('7.2-settings-notifications');
 
-  // The Inbox moves: this origin has no permission yet, so the line returns, worded for the move.
+  // The Inbox moves: this origin has no permission yet, so the line shows at once, worded for the move
+  // (no question has to arrive first: notifications are silently off until it is answered).
   const url = await moveInbox();
   await page.goto(url);
   expect(await page.evaluate(() => Notification.permission)).toBe('default');
+  const ask = page.locator('[data-notification-ask="moved"]');
+  await expect(ask).toContainText('Notifications are off at this address.');
+  await expect(ask).toContainText(new URL(url).host);
+  await shot('6.1-moved');
+  // Settings says the same, with Allow.
+  await page.getByRole('button', { name: 'Settings' }).click();
+  await expect(page.locator('[data-settings-notifications] [data-notify-status="not-allowed"]')).toBeVisible();
+  await expect(page.locator('[data-settings-notifications] [data-notify-reach="no"]')).toBeVisible();
+  await page.goto(url);
   const claude = world.agents[0]!;
   const sent = await claude.send({ project_path: world.billing, body: question('Keep the old retry window?') });
   await pageSaw(sent.thread_id);
-  const ask = page.locator('[data-notification-ask="moved"]');
-  await expect(ask).toContainText('The Inbox moved to a new address.');
-  await shot('6.1-moved');
+  await expect(ask).toBeVisible();
 
-  // Turn on raises the browser's own prompt; the context answers Allow for this origin.
-  await ask.getByRole('button', { name: 'Turn on' }).click();
+  // Allow raises the browser's own prompt; the context answers Allow for this origin.
+  await ask.getByRole('button', { name: 'Allow' }).click();
   await expect.poll(() => page.evaluate(() => window.__notifications.prompts)).toEqual([new URL(url).origin]);
   await context.grantPermissions(['notifications'], { origin: new URL(url).origin });
   await expect(page.locator('[data-notification-ask]')).toHaveCount(0);
   await expect.poll(() => config().inboxNotifications?.allowedOrigin).toBe(new URL(url).origin);
+});
+
+test('an Inbox restart forgets the windows; the open tab reconnects and reports its permission as it is now', async () => {
+  const { page } = world;
+  // This tab's stream was opened before Allow, so its URL still says permission=default.
+  const health = async () =>
+    ((await (await fetch(`${world.url}api/inbox/health`)).json()) as { notify_reach: { windows: number; allowed: number } }).notify_reach;
+  await expect.poll(async () => (await health()).allowed).toBe(1);
+  const before = registry();
+  await stopScratchInbox(world.dataDir);
+  const url = startInbox();
+  expect(new URL(url).port).toBe(String(before.port));
+  // EventSource retries every 2 s; on its hello the page reports again.
+  await expect.poll(async () => health(), { timeout: 20_000 }).toMatchObject({ windows: 1, allowed: 1 });
+  await page.getByRole('button', { name: 'Settings' }).click();
+  await expect(page.locator('[data-settings-notifications] [data-notify-reach="yes"]')).toBeVisible();
+  await page.goto(url);
 });
 
 test('with permission, a Stopped thread raises exactly one notification with the subject', async () => {
@@ -331,6 +432,7 @@ test('with permission, a Stopped thread raises exactly one notification with the
   await setFront(false, false);
   const before = (await calls()).length;
   const pi = await agent('Pi', 'pi');
+  piAgent = pi;
   // Two items in one message (a Stopped line and a Holds up line): one notification for the thread.
   const sent = await pi.send({ project_path: world.billing, body: DEMO_MESSAGES.stopped });
   await pageSaw(sent.thread_id);
@@ -349,7 +451,7 @@ test('with permission, a Stopped thread raises exactly one notification with the
 test('a second item in the same thread replaces the first, and the title follows the thread\'s section', async () => {
   const pi = world.agents.at(-1)!;
   const before = await calls();
-  const next = await pi.send({ project_path: world.billing, body: question('Also cap the retries at the worker?') });
+  const next = await pi.send({ project_path: world.billing, body: question('Also cap the retries at the worker?'), reply_to: stoppedThread });
   expect(next.thread_id).toBe(stoppedThread);
   await expect.poll(async () => (await calls()).length).toBe(before.length + 1);
   await world.page.waitForTimeout(400);
@@ -359,29 +461,229 @@ test('a second item in the same thread replaces the first, and the title follows
   ]);
 });
 
-test('a focused, visible Inbox raises nothing', async () => {
+test('in front: every new thread notifies, a question in the thread open on screen does not, one in another thread does', async () => {
   const { page } = world;
   await setFront(true, true);
   const before = (await calls()).length;
+  // A new thread that asks nothing notifies, the tab in front.
+  const amp = await agent('Amp', 'amp');
+  const news = await amp.send({ project_path: world.docs, body: 'Deployed the docs preview to staging. Nothing needed from you yet.' });
+  await expect.poll(async () => (await calls()).length).toBe(before + 1);
+  const first = (await calls()).at(-1)!;
+  expect(first.title.startsWith('docs-site: Amp')).toBe(true);
+  expect(first.title).not.toContain('waiting');
+  expect(first.tag).toBe(TAG);
+  // A second new thread within the burst window: one notice for both, on the one tag.
   const codex = await agent('Codex', 'codex');
   const sent = await codex.send({ project_path: world.docs, body: question('Ship the install page?', 'Stopped: the docs deploy waits on this.') });
-  await pageSaw(sent.thread_id);
-  expect((await calls()).length).toBe(before);
-  await expect(page.locator('[data-inbox-notice]')).toBeVisible();
-  await shot('6.3-focused-silent');
+  codexThread = sent.thread_id;
+  await expect.poll(async () => (await calls()).length).toBe(before + 2);
+  expect((await calls()).at(-1)).toMatchObject({ body: 'docs-site', tag: TAG });
+  expect((await calls()).at(-1)!.title.startsWith('2 ')).toBe(true);
+  await pageSaw(news.thread_id);
+  await shot('6.3-focused-new-thread');
+
+  // Open Codex's thread: a new question in it, on screen, raises nothing.
+  await page.evaluate((id) => {
+    location.hash = `thread=${id}`;
+  }, sent.thread_id);
+  await expect(page.locator('section.ib-pane')).toContainText('Ship the install page?');
+  const opened = (await calls()).length;
+  const again = await codex.send({ project_path: world.docs, body: question('And publish the changelog with it?'), reply_to: sent.message_id });
+  expect(again.thread_id).toBe(sent.thread_id);
+  await expect(page.locator('section.ib-pane')).toContainText('And publish the changelog with it?');
+  await page.waitForTimeout(600);
+  expect((await calls()).length).toBe(opened);
+
+  // Plain news in an existing thread never notifies.
+  await piAgent.send({ project_path: world.billing, body: 'Retried the 409 once more; same answer.', reply_to: stoppedThread });
+  await page.waitForTimeout(800);
+  expect((await calls()).length).toBe(opened);
+
+  // A question in another thread, with this one open: it notifies.
+  await piAgent.send({ project_path: world.billing, body: question('Should the worker give up after three tries?'), reply_to: stoppedThread });
+  await expect.poll(async () => (await calls()).length).toBe(opened + 1);
+  expect((await calls()).at(-1)!.tag).toBe(TAG);
 });
 
 test('a click on the notification focuses the tab and opens the thread', async () => {
   const { page } = world;
   await setFront(false, false);
   const codex = world.agents.at(-1)!;
-  const sent = await codex.send({ project_path: world.docs, body: question('Move the changelog under docs/?') });
+  const sent = await codex.send({ project_path: world.docs, body: question('Move the changelog under docs/?'), reply_to: codexThread });
+  expect(sent.thread_id).toBe(codexThread);
   await expect.poll(async () => (await calls()).at(-1)?.title).toBe('docs-site: Codex stopped on you');
   await page.evaluate(() => window.__notifications.instances.at(-1)!.dispatchEvent(new Event('click')));
   await expect(page).toHaveURL(new RegExp(`#thread=${sent.thread_id}$`));
-  // The thread this agent opened a moment ago (its session's thread), with the new question in it.
+  // The thread this agent opened a moment ago, with the new question in it.
   await expect(page.locator('section.ib-pane')).toContainText('Move the changelog under docs/?');
   await shot('6.2-click-opened-thread');
+});
+
+/** Every address the page's main frame goes through while `act` runs: what a desktop app wrapping the page is told (Electron's did-navigate-in-page). */
+async function addressesDuring(act: () => Promise<void>): Promise<string[]> {
+  const { page } = world;
+  const seen: string[] = [];
+  const onNavigated = (frame: { url(): string }) => {
+    if (frame === page.mainFrame()) seen.push(new URL(frame.url()).hash);
+  };
+  page.on('framenavigated', onNavigated);
+  await act();
+  // Past the last address and anything a late read might do with it.
+  await page.waitForTimeout(800);
+  page.off('framenavigated', onNavigated);
+  return seen;
+}
+
+const clickLast = () => world.page.evaluate(() => window.__notifications.instances.at(-1)!.dispatchEvent(new Event('click')));
+const hashNow = () => world.page.evaluate(() => location.hash);
+/** The thread's own scroller: the first element in the pane with more to scroll. */
+const scrollPane = (top?: number) =>
+  world.page.evaluate((to) => {
+    const scroller = [...document.querySelectorAll('section.ib-pane *')].find((el) => el.scrollHeight > el.clientHeight + 40 && /auto|scroll/.test(getComputedStyle(el).overflowY));
+    if (scroller && to !== undefined) scroller.scrollTop = to;
+    return scroller?.scrollTop ?? -1;
+  }, top);
+
+test('a click on a notice about the thread already showing changes the address and nothing else, each time', async () => {
+  const { page } = world;
+  const threadId = new URLSearchParams((await hashNow()).slice(1)).get('thread')!;
+  const pane = page.locator('section.ib-pane');
+  const codex = world.agents.at(-1)!;
+  await codex.send({ project_path: world.docs, body: `${Array.from({ length: 80 }, (_, i) => `Line ${i}.`).join('\n\n')}\n\nThe end of the long note.`, reply_to: codexThread });
+  await expect(pane).toContainText('The end of the long note.');
+  const before = (await calls()).length;
+  await codex.send({ project_path: world.docs, body: question('Keep the changelog headings as they are?'), reply_to: codexThread });
+  await expect.poll(async () => (await calls()).length).toBe(before + 1);
+  await expect(pane).toContainText('Keep the changelog headings as they are?');
+  await page.waitForTimeout(800);
+
+  // Half-typed words, a scroll position, this very reader on screen, and the entry as it stands.
+  await pane.locator('.ib-pfoot').getByRole('button', { name: 'Reply' }).click();
+  await pane.locator('.ib-rbox textarea').fill('half a thou');
+  // Past the draft's own save and what follows it (replyDraft.ts): only what the clicks do is counted below.
+  await page.waitForTimeout(1500);
+  expect(await scrollPane(300)).toBe(300);
+  const entry = await page.evaluate(() => {
+    window.__reader = document.querySelector('section.ib-pane');
+    return { length: history.length, state: history.state };
+  });
+  const threadReads: string[] = [];
+  const onRequest = (request: { method(): string; url(): string }) => {
+    if (request.method() === 'GET' && new URL(request.url()).pathname.includes(`/threads/${threadId}`)) threadReads.push(request.url());
+  };
+  page.on('request', onRequest);
+
+  const first = await addressesDuring(async () => void (await clickLast()));
+  const second = await addressesDuring(async () => void (await clickLast()));
+  page.off('request', onRequest);
+
+  // The sequence a desktop app relies on: the value, then the address as it was.
+  const exact = new RegExp(`^#thread=${threadId}&click=\\d+$`);
+  expect(first).toHaveLength(2);
+  expect(first[0]).toMatch(exact);
+  expect(first[1]).toBe(`#thread=${threadId}`);
+  expect(second[0]).toMatch(exact);
+  expect(second[1]).toBe(`#thread=${threadId}`);
+  expect(second[0]).not.toBe(first[0]);
+
+  expect(await hashNow()).toBe(`#thread=${threadId}`);
+  expect(await page.evaluate(() => ({ length: history.length, state: history.state }))).toEqual(entry);
+  expect(threadReads).toEqual([]);
+  expect(await page.evaluate(() => document.querySelector('section.ib-pane') === window.__reader)).toBe(true);
+  await expect(pane.locator('.ib-rbox textarea')).toHaveValue('half a thou');
+  expect(await scrollPane()).toBe(300);
+  await pane.locator('.ib-rbox textarea').fill('');
+});
+
+test('a click on the test notice, which routes nowhere, gives the same sign and stays on its page', async () => {
+  const { page } = world;
+  const back = await hashNow();
+  await setFront(true, true);
+  await page.evaluate(() => {
+    location.hash = '#settings/general';
+  });
+  const before = (await calls()).length;
+  await page.getByRole('button', { name: 'Send a test notification' }).click();
+  await expect.poll(async () => (await calls()).length).toBe(before + 1);
+  const steps = await addressesDuring(async () => void (await clickLast()));
+  expect(steps).toHaveLength(2);
+  expect(steps[0]).toMatch(/^#settings\/general&click=\d+$/);
+  expect(steps[1]).toBe('#settings/general');
+  await expect(page.getByRole('button', { name: 'Send a test notification' })).toBeVisible();
+  await page.evaluate((hash) => {
+    location.hash = hash;
+  }, back);
+  await setFront(false, false);
+});
+
+test('an address that kept its click= (the browser history suggests one) opens the same screen and drops it', async () => {
+  const { page } = world;
+  const thread = await hashNow();
+  await page.evaluate((hash) => {
+    location.hash = `${hash}&click=7`;
+  }, thread);
+  await expect.poll(hashNow).toBe(thread);
+  await expect(page.locator('section.ib-pane')).toBeVisible();
+  await page.evaluate(() => {
+    location.hash = '#settings/general&click=7';
+  });
+  await expect.poll(hashNow).toBe('#settings/general');
+  await expect(page.getByRole('button', { name: 'Send a test notification' })).toBeVisible();
+  await page.evaluate((hash) => {
+    location.hash = hash;
+  }, thread);
+  await expect(page.locator('section.ib-pane')).toBeVisible();
+});
+
+test("on a phone's width the click adds no entry: Back goes where it went before", async () => {
+  const { page } = world;
+  const open = await hashNow();
+  const threadId = new URLSearchParams(open.slice(1)).get('thread')!;
+  await setFront(true, true);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => {
+    location.hash = '';
+  });
+  await page.locator(`[data-thread-id="${threadId}"]`).first().click();
+  await expect.poll(hashNow).toBe(open);
+  await setFront(false, false);
+  const before = (await calls()).length;
+  await world.agents.at(-1)!.send({ project_path: world.docs, body: question('Sort the changelog by date?'), reply_to: codexThread });
+  await expect.poll(async () => (await calls()).length).toBe(before + 1);
+  const entry = await page.evaluate(() => ({ length: history.length, state: history.state }));
+  expect((entry.state as { ibFrom?: unknown } | null)?.ibFrom).toBe('');
+  const steps = await addressesDuring(async () => void (await clickLast()));
+  expect(steps).toHaveLength(2);
+  expect(steps[1]).toBe(open);
+  expect(await page.evaluate(() => ({ length: history.length, state: history.state }))).toEqual(entry);
+  await page.goBack();
+  await expect.poll(hashNow).toBe('');
+  await expect(page.locator('section.ib-pane')).toHaveCount(0);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await setFront(false, false);
+});
+
+test('a tab the browser froze in the background raises what arrived meanwhile as it wakes, once', async () => {
+  const { page, context } = world;
+  await setFront(true, true);
+  await setFront(false, false);
+  const before = (await calls()).length;
+  // Chrome's own freeze (Energy Saver, intensive background policies): nothing in the page runs.
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('Page.setWebLifecycleState', { state: 'frozen' });
+  const codex = world.agents.find((a) => a.name === 'Codex') ?? (await agent('Codex', 'codex'));
+  const sent = await codex.send({ project_path: world.billing, body: question('Archive the 2025 invoices?', 'Stopped: the cleanup waits on this.') });
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  await cdp.send('Page.setWebLifecycleState', { state: 'active' });
+  await expect.poll(async () => (await calls()).length).toBe(before + 1);
+  const woke = (await calls()).at(-1)!;
+  expect(woke.tag).toBe(TAG);
+  expect(woke.title).toContain('Codex');
+  await page.waitForTimeout(800);
+  expect((await calls()).length).toBe(before + 1);
+  await expect(page.locator(`[data-thread-id="${sent.thread_id}"], [data-inbox-notice]`).first()).toBeVisible();
+  await cdp.detach();
 });
 
 test('a burst becomes one notice, "3 waiting in 2 projects", and its click opens the list', async () => {
@@ -441,9 +743,26 @@ test('the Settings switch off raises nothing', async () => {
   // Back on, the next item in that thread notifies: the switch was the only thing holding it.
   await main.click();
   await expect(main).toHaveAttribute('aria-checked', 'true');
-  await codex.send({ project_path: world.billing, body: question('And keep the weekly one?') });
+  await codex.send({ project_path: world.billing, body: question('And keep the weekly one?'), reply_to: off.message_id });
   await expect.poll(async () => (await calls()).length).toBe(before + 1);
   expect((await calls()).at(-1)).toMatchObject({ title: 'billing-svc: Codex stopped on you', tag: TAG });
+});
+
+test('a fresh load of an address that kept its click= opens that screen and drops it', async () => {
+  // Its own tab, so this is a real load: a goto that only changes the hash of the page on screen stays in that document.
+  const fresh = await world.context.newPage();
+  fresh.on('pageerror', (error) => world.errors.push(error.message));
+  const loaded = async (hash: string, section: string) => {
+    await fresh.goto('about:blank');
+    await fresh.goto(`${world.url}${hash}&click=7`);
+    await expect(fresh.locator(`[data-settings-link="${section}"]`)).toHaveAttribute('aria-current', 'page');
+    await expect.poll(() => fresh.evaluate(() => location.hash)).toBe(hash);
+  };
+  await loaded('#settings/general', 'general');
+  await expect(fresh.getByRole('heading', { name: 'General', level: 1 })).toBeVisible();
+  // `#settings` alone is General on a desktop, so only another section shows the value was read past.
+  await loaded('#settings/about', 'about');
+  await fresh.close();
 });
 
 test('no page errors along the way', () => {

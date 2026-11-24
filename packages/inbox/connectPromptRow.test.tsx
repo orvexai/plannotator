@@ -1,13 +1,15 @@
 /**
- * The sidebar's "Copy connect prompt" row: a click puts the prompt naming
- * this computer's plannotator on the clipboard, the row reads "Copied" and
+ * The sidebar's "Copy connect prompt" pill: a click puts the prompt naming
+ * this computer's plannotator on the clipboard, the pill reads "Copied" and
  * goes back after 2 s, focus stays on it, and a polite live region says so.
  * A failed copy is never silent: the row reads "Couldn't copy" and the live
  * region says that too. What regresses: copying before the settings arrive
  * and never picking up the path, a "Copied" that sticks, a failure that looks
- * like nothing happened, or an announcement a screen reader never hears.
+ * like nothing happened, an announcement a screen reader never hears, a
+ * name that stops saying what the pill is for, or the agents' marks being
+ * read aloud or dropped while it says "Copied".
  *
- * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from the test.yml DOM list.
+ * DOM-gated: runs under DOM_TESTS=1 (happy-dom), from tests/dom-test-list.txt.
  */
 import { afterEach, expect, jest, test } from 'bun:test';
 import { act } from 'react';
@@ -15,9 +17,12 @@ import { createRoot, type Root } from 'react-dom/client';
 
 const hasDom = typeof document !== 'undefined';
 const { Sidebar, CONNECT_COPIED_MS, CONNECT_COPY_FAILED_MS } = (hasDom ? await import('./components/Sidebar') : {}) as typeof import('./components/Sidebar');
+const { PHONE_QUERY } = (hasDom ? await import('./phone') : {}) as typeof import('./phone');
 const { SidebarProvider } = (hasDom ? await import('./shell/sidebar') : {}) as typeof import('./shell/sidebar');
 
 const BIN = '/Users/ada/.local/bin/plannotator';
+/** The idle accessible name (visible "Copy prompt" plus screen-reader words): pinned on purpose, it is the button's purpose. */
+const IDLE_NAME = 'Copy prompt to connect an agent';
 
 let root: Root | null = null;
 const restorers: Array<() => void> = [];
@@ -39,7 +44,7 @@ afterEach(() => {
   while (restorers.length > 0) restorers.pop()!();
 });
 
-function render(mcpCommand: readonly string[] | null) {
+function render(mcpCommand: readonly string[] | null, foot: { updated?: string | null } = {}) {
   const host = document.createElement('div');
   host.className = 'pn-inbox';
   document.body.appendChild(host);
@@ -53,16 +58,14 @@ function render(mcpCommand: readonly string[] | null) {
             page="inbox"
             projectId={null}
             inboxCount={0}
-            decisionsCount={0}
             projects={[]}
             projectCounts={new Map()}
             update={null}
             restarting={false}
-            updated={null}
+            updated={foot.updated ?? null}
             onInbox={noop}
             onProject={noop}
             onSettings={noop}
-            onDecisions={noop}
             onUpdate={noop}
             onWhatsNew={noop}
             mcpCommand={command}
@@ -83,16 +86,26 @@ async function click(button: HTMLButtonElement) {
   });
 }
 
+/** The foot's rows in order: a sidebar item's wrapper (`.ib-side-item`, `display: contents`) is not a row of its own. */
+function footRows(foot: Element): Element[] {
+  return [...foot.children].flatMap((el) => (el.classList.contains('ib-side-item') ? [...el.children] : [el]));
+}
+
 test.skipIf(!hasDom)('a click copies the prompt naming this binary, says Copied, keeps focus, and goes back after 2 s', async () => {
   const written: string[] = [];
   override(navigator, 'clipboard', { writeText: async (text: string) => void written.push(text) });
   jest.useFakeTimers();
   const { host, row, live } = render([BIN, 'inbox', 'mcp']);
 
-  // The row sits just above Settings, in the foot.
+  // The pill sits above Settings, in the foot (nothing between them without an update).
   const foot = host.querySelector('.ib-side-foot')!;
-  const navs = [...foot.querySelectorAll('.ib-nav')];
-  expect(navs.map((b) => b.textContent)).toEqual(['Copy connect prompt', 'Settings']);
+  const rows = footRows(foot);
+  expect(rows.includes(row())).toBe(true);
+  expect(rows[rows.indexOf(row()) + 2]?.querySelector('.ib-nav')?.textContent).toBe('Settings');
+  // Its name starts with the visible words and says what they are for; the marks are not read.
+  expect(row().textContent).toBe(IDLE_NAME);
+  const marks = () => row().querySelector('[aria-hidden="true"]')!.children;
+  expect(marks()).toHaveLength(4);
   expect(live().getAttribute('aria-live')).toBe('polite');
   expect(live().textContent).toBe('');
 
@@ -101,13 +114,14 @@ test.skipIf(!hasDom)('a click copies the prompt naming this binary, says Copied,
   expect(written[0]).toContain(`\`${BIN} inbox --help\``);
   expect(row().textContent).toBe('Copied');
   expect(row().dataset.connectPrompt).toBe('copied');
+  expect(marks()).toHaveLength(4);
   expect(document.activeElement).toBe(row());
   expect(live().textContent).toBe('Connect prompt copied.');
 
   act(() => jest.advanceTimersByTime(CONNECT_COPIED_MS - 1));
   expect(row().textContent).toBe('Copied');
   act(() => jest.advanceTimersByTime(1));
-  expect(row().textContent).toBe('Copy connect prompt');
+  expect(row().textContent).toBe(IDLE_NAME);
   expect(document.activeElement).toBe(row());
 
   // A second copy is announced again: the live region's text changes.
@@ -115,6 +129,46 @@ test.skipIf(!hasDom)('a click copies the prompt naming this binary, says Copied,
   expect(written).toHaveLength(2);
   expect(live().textContent?.trim()).toBe('Connect prompt copied.');
   expect(live().textContent).not.toBe('Connect prompt copied.');
+});
+
+test.skipIf(!hasDom)("the pill sits above What's new, which sits above Settings", () => {
+  const { host, row } = render([BIN, 'inbox', 'mcp'], { updated: '0.28.19' });
+  const foot = host.querySelector<HTMLElement>('.ib-side-foot')!;
+  const order = footRows(foot)
+    .map((el) =>
+      el.matches('button[data-connect-prompt]') ? 'pill'
+      : el.matches('[data-whats-new-link]') ? 'whats-new'
+      : el.matches('.ib-setrow') ? 'settings'
+      : null,
+    )
+    .filter(Boolean);
+  expect(order).toEqual(['pill', 'whats-new', 'settings']);
+  expect(footRows(foot).includes(row())).toBe(true);
+});
+
+test.skipIf(!hasDom)('the pill is drawn on a desktop window and not in a phone sidebar', () => {
+  const phoneAt = (phone: boolean) =>
+    override(window, 'matchMedia', (query: string) => ({
+      matches: phone && query === PHONE_QUERY,
+      media: query,
+      onchange: null,
+      addEventListener() {},
+      removeEventListener() {},
+      addListener() {},
+      removeListener() {},
+      dispatchEvent: () => false,
+    }));
+  phoneAt(false);
+  const desktop = render([BIN, 'inbox', 'mcp']);
+  expect(desktop.row()).not.toBeNull();
+  act(() => root?.unmount());
+  document.body.innerHTML = '';
+
+  phoneAt(true);
+  const phone = render([BIN, 'inbox', 'mcp']);
+  expect(phone.host.querySelector('.ib-side-foot .ib-setrow')).not.toBeNull();
+  expect(phone.host.querySelector('[data-connect-prompt]')).toBeNull();
+  expect(phone.host.querySelector('[data-connect-prompt-live]')).toBeNull();
 });
 
 test.skipIf(!hasDom)('before the settings load it copies bare plannotator, and the path once they arrive', async () => {
@@ -141,5 +195,5 @@ test.skipIf(!hasDom)("a failed copy says Couldn't copy in the row and announces 
   expect(document.activeElement).toBe(row());
 
   act(() => jest.advanceTimersByTime(CONNECT_COPY_FAILED_MS));
-  expect(row().textContent).toBe('Copy connect prompt');
+  expect(row().textContent).toBe(IDLE_NAME);
 });

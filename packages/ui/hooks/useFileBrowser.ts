@@ -9,6 +9,7 @@
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { VaultNode } from "../types";
+import { basenameFromPath } from "@plannotator/core/source-save";
 import type { WorkspaceStatusPayload } from "@plannotator/core/workspace-status-types";
 
 export interface DirState {
@@ -22,6 +23,13 @@ export interface DirState {
   hasLoadedTree?: boolean;
   /** When true, fetches via /api/reference/obsidian/files and opens docs via /api/reference/obsidian/doc */
   isVault?: boolean;
+  /**
+   * The server left supported files out because the folder holds more than
+   * its cap (PLANNOTATOR_FILE_BROWSER_MAX_FILES). `fileLimit` is that cap.
+   * Absent from a backend that does not cap.
+   */
+  truncated?: boolean;
+  fileLimit?: number;
 }
 
 export interface UseFileBrowserReturn {
@@ -89,7 +97,7 @@ function remapWorkspaceStatusForDir(
  * tree from its own transport instead.
  */
 export interface FileTreeBackend {
-  /** Load a directory tree. Resolves to the same shape the /api/reference/files endpoint returns: a Response whose JSON is { tree, workspaceStatus?, error? }. */
+  /** Load a directory tree. Resolves to the same shape the /api/reference/files endpoint returns: a Response whose JSON is { tree, workspaceStatus?, truncated?, fileLimit?, error? }. */
   loadTree(dirPath: string): Promise<Response>;
   /** Load an Obsidian vault tree. Resolves to a Response whose JSON is { tree, error? }. */
   loadVaultTree(vaultPath: string): Promise<Response>;
@@ -193,7 +201,7 @@ export function useFileBrowser(): UseFileBrowserReturn {
   }, []);
 
   const fetchTree = useCallback(async (dirPath: string, options: { quiet?: boolean } = {}) => {
-    const name = dirPath.split("/").pop() || dirPath;
+    const name = basenameFromPath(dirPath);
 
     setDirs((prev) => {
       const exists = prev.find((d) => d.path === dirPath);
@@ -244,6 +252,8 @@ export function useFileBrowser(): UseFileBrowserReturn {
               isLoading: false,
               hasLoadedTree: true,
               error: null,
+              truncated: data.truncated === true,
+              fileLimit: typeof data.fileLimit === "number" && data.fileLimit > 0 ? data.fileLimit : undefined,
             }
             : d
         )
@@ -282,7 +292,7 @@ export function useFileBrowser(): UseFileBrowserReturn {
         const vaultDirs = prev.filter((d) => d.isVault);
         const regularDirs = directories.map((path) => ({
           path,
-          name: path.split("/").pop() || path,
+          name: basenameFromPath(path),
           tree: [],
           // Keep initial roots loading until their first snapshot resolves. If
           // the SSE watcher starts before /api/reference/files finishes,
@@ -304,7 +314,7 @@ export function useFileBrowser(): UseFileBrowserReturn {
   }, []);
 
   const addVaultDir = useCallback(async (vaultPath: string) => {
-    const name = vaultPath.split("/").pop() || vaultPath;
+    const name = basenameFromPath(vaultPath);
 
     // Atomically replace any existing vault dirs (handles vault path change without accumulating stale entries)
     setDirs((prev) => {

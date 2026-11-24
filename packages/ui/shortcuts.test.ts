@@ -112,15 +112,16 @@ describe('shortcuts', () => {
       'Search',
       'Layout',
       'File Actions',
-      'History',
       'File Navigation',
+      'History',
+      'Go to',
+      'Call tree',
       'All-Files View',
       'Markdown Files',
       'Annotations',
       'Suggestion Editor',
       'AI Assistant',
       'PR Comments',
-      'Tour',
     ]);
   });
 
@@ -137,6 +138,20 @@ describe('shortcuts', () => {
         .map(entry => `${entry.scopeId}.${entry.actionId}`);
       expect(claimants).toEqual(['document-view.toggleFocusMode']);
     }
+  });
+
+  // Change navigation (#1543) is N / Shift+N in both review views. `P` is the
+  // Markdown view key, so previous-change must never be P; and with no
+  // cross-scope arbitration a second claimant on either key would double-fire.
+  it('binds next / previous change once, to N and Shift+N, clear of the Markdown P', () => {
+    expect(getShortcut(reviewSettingsShortcutRegistry, 'review-editor', 'nextChange')?.bindings).toEqual(['N']);
+    expect(getShortcut(reviewSettingsShortcutRegistry, 'review-editor', 'prevChange')?.bindings).toEqual(['Shift+N']);
+    const claimants = (binding: string) => listRegistryShortcuts(reviewSettingsShortcutRegistry)
+      .filter(entry => entry.bindings.includes(binding))
+      .map(entry => `${entry.scopeId}.${entry.actionId}`);
+    expect(claimants('N')).toEqual(['review-editor.nextChange']);
+    expect(claimants('Shift+N')).toEqual(['review-editor.prevChange']);
+    expect(claimants('P')).toEqual(['review-markdown-preview.cycleMarkdownView']);
   });
 
   // The two HTML-surface chords are the only way back into annotate mode after
@@ -229,6 +244,44 @@ describe('shortcuts', () => {
     expect(matchesShortcutBinding(spaceEvent, 'Space')).toBe(true);
     expect(matchesShortcutBinding(questionEvent, '?')).toBe(true);
     expect(matchesShortcutBinding(wrongEvent, 'Mod+Enter')).toBe(false);
+  });
+
+  it('matches a letter by its physical key only in a scope that opts in (lettersByCode)', () => {
+    // Russian layout: the E key types у. Off by default, so plan review and code review match as before.
+    const cyrillicE = { key: 'у', code: 'KeyE', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false } as KeyboardEvent;
+    const plain = defineShortcutScope({ id: 'plain', title: 'Plain', shortcuts: { act: { description: 'Act', bindings: ['E'], section: 'S' } } });
+    const optedIn = defineShortcutScope({ id: 'opted', title: 'Opted', lettersByCode: true, shortcuts: { act: { description: 'Act', bindings: ['E'], section: 'S' } } });
+    const calls: string[] = [];
+    expect(dispatchShortcutEvent(plain, { act: () => calls.push('plain') }, cyrillicE)).toBe(false);
+    expect(dispatchShortcutEvent(optedIn, { act: () => calls.push('opted') }, cyrillicE)).toBe(true);
+    expect(calls).toEqual(['opted']);
+    // A Latin character on another key is that character, opted in or not (AZERTY's A on KeyQ is never Q).
+    const azertyA = { ...cyrillicE, key: 'a', code: 'KeyQ' } as KeyboardEvent;
+    expect(matchesShortcutBinding(azertyA, 'Q', { lettersByCode: true })).toBe(false);
+    expect(matchesShortcutBinding(azertyA, 'A', { lettersByCode: true })).toBe(true);
+  });
+
+  it('lettersByCode never turns punctuation, a dead key or an unidentified key into a letter', () => {
+    const on = { lettersByCode: true };
+    const key = (k: string, code: string, shiftKey = false) => ({ key: k, code, ctrlKey: false, metaKey: false, shiftKey, altKey: false }) as KeyboardEvent;
+    // US Dvorak: `.` on KeyE, `>` (Shift) on KeyE, `;` on KeyZ, `'` on KeyQ.
+    expect(matchesShortcutBinding(key('.', 'KeyE'), 'E', on)).toBe(false);
+    expect(matchesShortcutBinding(key('>', 'KeyE', true), 'Shift+E', on)).toBe(false);
+    expect(matchesShortcutBinding(key(';', 'KeyZ'), 'Z', on)).toBe(false);
+    expect(matchesShortcutBinding(key("'", 'KeyQ'), 'Q', on)).toBe(false);
+    // Hebrew: `/` on KeyQ stays `/` only.
+    expect(matchesShortcutBinding(key('/', 'KeyQ'), 'Q', on)).toBe(false);
+    expect(matchesShortcutBinding(key('/', 'KeyQ'), '/', on)).toBe(true);
+    // AZERTY `,` on KeyM; Colemak `;` on KeyP.
+    expect(matchesShortcutBinding(key(',', 'KeyM'), 'M', on)).toBe(false);
+    expect(matchesShortcutBinding(key(';', 'KeyP'), 'P', on)).toBe(false);
+    // Dead and unidentified keys.
+    expect(matchesShortcutBinding(key('Dead', 'KeyE'), 'E', on)).toBe(false);
+    expect(matchesShortcutBinding(key('Unidentified', 'KeyE'), 'E', on)).toBe(false);
+    // A non-Latin letter still falls back (Hebrew ק on KeyE), and Dvorak's real letters match by character.
+    expect(matchesShortcutBinding(key('ק', 'KeyE'), 'E', on)).toBe(true);
+    expect(matchesShortcutBinding(key('e', 'KeyD'), 'E', on)).toBe(true);
+    expect(matchesShortcutBinding(key('e', 'KeyD'), 'D', on)).toBe(false);
   });
 
   it('dispatches matching registry actions', () => {
@@ -449,5 +502,28 @@ describe('shortcuts', () => {
     }, altGrEvent);
 
     expect(handled).toBe(false);
+  });
+
+  // Rich-text copy is the toolbar's Copy button only (owner's decision on #2191):
+  // Cmd+Option+C is Chrome's Inspect Element key on a Mac, and new shortcuts
+  // need the owner's approval. No surface may bind Alt+C, and Mod+C stays the
+  // one copy binding, described as before.
+  it('registers no keyboard shortcut for rich-text copy', () => {
+    const registries = [
+      planReviewSettingsShortcutRegistry,
+      annotateSettingsShortcutRegistry,
+      reviewSettingsShortcutRegistry,
+    ];
+    const altC = { key: 'c', code: 'KeyC', ctrlKey: true, metaKey: false, shiftKey: false, altKey: true } as KeyboardEvent;
+    const macAltC = { key: 'ç', code: 'KeyC', ctrlKey: false, metaKey: true, shiftKey: false, altKey: true } as KeyboardEvent;
+    for (const registry of registries) {
+      for (const entry of listRegistryShortcuts(registry)) {
+        expect(entry.description.toLowerCase()).not.toContain('rich');
+        for (const binding of entry.bindings) {
+          expect(matchesShortcutBinding(altC, binding)).toBe(false);
+          expect(matchesShortcutBinding(macAltC, binding)).toBe(false);
+        }
+      }
+    }
   });
 });

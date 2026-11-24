@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { openPackedApp, PACKED_ASSETS_MARKER } from '../packages/shared/packed-app';
+import { DIAGRAM_ENGINE_MODE } from '../packages/ui/utils/diagram-engine';
 
 const root = resolve(import.meta.dir, '..');
 const read = (path: string) => readFileSync(resolve(root, path), 'utf8');
@@ -85,31 +87,50 @@ describe('review entry assets', () => {
   // through utils/mermaid's own import('mermaid'), so a plan with no diagram
   // never pays for it in a chunked build (the share portal). Re-adding the
   // eager entry to either app would put the whole runtime back into that
-  // entry chunk with no error anywhere; the review editor never renders a
-  // Mermaid block at all.
+  // entry chunk with no error anywhere; the review editor draws diagrams only
+  // through the separately served engine (below).
   test('neither app registers the eager Mermaid runtime', () => {
     expect(read('packages/editor/App.tsx')).not.toContain('mermaid-eager');
     expect(read('packages/review-editor/App.tsx')).not.toContain('mermaid-eager');
   });
 
-  // The review app renders Mermaid and Graphviz fences as code, never as
-  // diagrams (Markdown preview; approval record, 2026-10-12 amendment:
-  // performance wins). A lazy import does not help here: the single-file
-  // build inlines every dynamic import, so naming a diagram engine anywhere in
-  // the review app's graph puts ~6.7 MB of runtimes into every review page.
-  // The built-bundle markers below are the proof; this names the culprit.
+  // The review app draws Mermaid and Graphviz fences (Markdown preview, guide
+  // overviews) ONLY through the engine the review server serves as separate
+  // files (apps/review/diagram-engine; approval "review-diagrams-on-demand",
+  // honoring the 2026-10-12 rule that diagrams return to code review only
+  // through true lazy loading, never by bundling). A lazy import does not
+  // help here: the single-file build inlines every dynamic import, so naming
+  // a diagram engine anywhere in the review page's graph puts ~6.7 MB of
+  // runtimes into every review page. The built-bundle markers below are the
+  // proof; this names the culprit. The engine's own sources live in
+  // apps/review/diagram-engine and are reached only by its build script.
   test('the review app imports no diagram engine, not even lazily', () => {
     const diagramModule = /(?:from\s+|import\s*\(?\s*)['"](?:[^'"]*(?:components\/(?:MermaidBlock|GraphvizBlock|DiagramBlock|Viewer)|components\/diagram\/[^'"]*|utils\/(?:mermaid|graphviz|diagram-render)[^'"\/]*)|mermaid|@viz-js\/viz)['"]/;
+    const engineSources = /(?:from\s+|import\s*\(?\s*)['"][^'"]*diagram-engine\/(?:engine|runtime-[a-z]+)(?:\.tsx?)?['"]/;
     const walk = (dir: string): string[] =>
       readdirSync(resolve(root, dir), { withFileTypes: true }).flatMap((entry) =>
         entry.isDirectory()
           ? entry.name === 'node_modules' || entry.name === 'dist' ? [] : walk(`${dir}/${entry.name}`)
           : /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [`${dir}/${entry.name}`] : [],
       );
-    const offenders = ['packages/review-editor', 'packages/guide-viewer', 'apps/review']
+    const pageSources = ['packages/review-editor', 'packages/guide-viewer', 'apps/review']
       .flatMap(walk)
-      .filter((path) => diagramModule.test(read(path)));
-    expect(offenders).toEqual([]);
+      .filter((path) => !path.startsWith('apps/review/diagram-engine/'));
+    expect(pageSources.filter((path) => diagramModule.test(read(path)))).toEqual([]);
+    expect(pageSources.filter((path) => engineSources.test(read(path)))).toEqual([]);
+    // The page reaches the engine only by URL, from the one loader, and only
+    // a diagram fence asks it to load (so a review without diagrams never
+    // requests it).
+    const urlImports = pageSources.filter((path) => /\bimport\(\s*\/\*\s*@vite-ignore\s*\*\/\s*url\s*\)/.test(read(path)));
+    expect(urlImports).toEqual(['packages/review-editor/utils/diagramEngine.ts']);
+    const loaders = pageSources.filter((path) => path !== 'packages/review-editor/utils/diagramEngine.ts' && /\bloadDiagramEngine\b/.test(read(path)));
+    expect(loaders).toEqual(['packages/review-editor/components/ReviewDiagramFence.tsx']);
+    // The engine build rewrites the renderer slots' runtime imports to the
+    // served URLs and fails unless it finds exactly one each.
+    const build = read('apps/review/diagram-engine/build.ts');
+    expect(build).toContain("path.join(uiRoot, 'utils/mermaid.ts')");
+    expect(build).toContain("path.join(uiRoot, 'utils/graphviz.ts')");
+    expect(read('apps/review/package.json')).toContain('"build": "vite build && bun diagram-engine/build.ts && sem-jiff-copy-wasm dist/sem-diff"');
   });
 
   // The other half of the optimization: the renderers must stay OFF the
@@ -143,13 +164,36 @@ describe('review entry assets', () => {
     expect(read('packages/ui/utils/graphviz.ts')).not.toMatch(staticImport('@viz-js/viz'));
     expect(read('packages/ui/utils/graphviz.ts')).toContain("import('@viz-js/viz')");
     expect(read('packages/ui/utils/generateIdentity.ts')).not.toMatch(staticImport('unique-username-generator'));
+    // Pele (the second Mermaid engine, off by default) arrives only through
+    // `pele/lazy`, whose core and diagram types are chunks of their own.
+    for (const path of ['packages/ui/utils/pele.ts', 'packages/ui/utils/diagram-render.ts', 'packages/ui/utils/diagram-engine.ts', 'packages/ui/utils/peleTheme.ts', 'packages/ui/components/DiagramBlock.tsx', 'packages/ui/components/MermaidBlock.tsx']) {
+      expect(read(path)).not.toMatch(/^import\s+(?!type\b)[^;]*from\s+['"]pele(?:\/[^'"]*)?['"]/m);
+    }
+    expect(read('packages/ui/utils/pele.ts')).toContain("import('pele/lazy')");
+  });
+
+  // While the switch is 'mermaid', Pele's library is in no build: its one
+  // import sits behind `PELE_IN_BUILD` (utils/pele.ts), a constant Rollup
+  // folds. A second import of Pele anywhere else (a new module, a component)
+  // would bring it back ungated, and the single-file builds would inline all
+  // of it, so only that one file may name it outside tests.
+  test("only utils/pele.ts names Pele's library, and only behind its build gate", () => {
+    const listed = Bun.spawnSync(['git', 'ls-files', '-z', '--', 'packages', 'apps', 'build'], { cwd: root }).stdout.toString().split('\0');
+    const sources = listed.filter((file) => /\.(?:[cm]?[jt]sx?)$/.test(file) && !/(?:^|\/)(?:test-setup|tests?)\/|\.test\.[jt]sx?$/.test(file));
+    expect(sources.length).toBeGreaterThan(100);
+    const naming = sources.filter((file) => {
+      const text = existsSync(resolve(root, file)) ? read(file) : '';
+      return /\bimport\(\s*['"]pele(?:\/[^'"]*)?['"]|^\s*(?:import|export)\s+(?!type\b)[^;]*from\s+['"]pele(?:\/[^'"]*)?['"]/m.test(text);
+    });
+    expect(naming).toEqual(['packages/ui/utils/pele.ts']);
+    expect(read('packages/ui/utils/pele.ts')).toMatch(/PELE_IN_BUILD\s*\?\s*import\('pele\/lazy'\)/);
   });
 
   // The Inbox window's guided review (PLAN step 5) reaches the guide chain and
-  // review-editor's diff renderer through GuidePane's one dynamic import of
-  // `#guide-reader` (packages/inbox/guide/GuideReader.tsx). The single-file
-  // build inlines that chunk, so what this keeps waiting for Open is the
-  // mount (the diff render, the highlighter), not the bytes. A static import
+  // review-editor's diff renderer through lazyParts.tsx's one dynamic import of
+  // `#guide-reader` (packages/inbox/guide/GuideReader.tsx). That import is
+  // where the window's build splits (build/pack-inbox.ts), so the reader's
+  // bytes load on the first Open, never at page load (#2593). A static import
   // elsewhere would make the window depend on the reader directly, and that
   // boundary would be gone.
   // The surface a phone hosts (PLAN step S1) has no network at all: every
@@ -176,13 +220,46 @@ describe('review entry assets', () => {
           ? entry.name === 'node_modules' ? [] : walk(`${dir}/${entry.name}`)
           : /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [`${dir}/${entry.name}`] : [],
       );
-    const readers = ['packages/inbox/guide/GuideReader.tsx', 'packages/inbox/guide/SurfaceGuideReader.tsx'];
+    // Shape's board (its Code view is a guided review) is the same kind of lazy module: `#shape-board`. So is the
+    // Post to GitHub/GitLab dialog of a pull request's review (the review app's own): `#platform-post`. The PR page's
+    // All files (the review app's tree and file view) rides the reader's chunk, re-exported by GuideReader.tsx. So do
+    // the rendered Markdown files (renderedFiles.tsx), which only GuideReader.tsx imports, and the review app's keys on
+    // a review (ReviewKeys.tsx, with reviewWalk.ts).
+    const readers = ['packages/inbox/guide/GuideReader.tsx', 'packages/inbox/guide/SurfaceGuideReader.tsx', 'packages/inbox/shape/ShapeBoard.tsx', 'packages/inbox/guide/PlatformPost.tsx', 'packages/inbox/guide/PullRepoParts.tsx', 'packages/inbox/guide/PullChangesTree.tsx', 'packages/inbox/guide/useSemDiffClient.ts', 'packages/inbox/guide/renderedFiles.tsx', 'packages/inbox/guide/ReviewKeys.tsx', 'packages/inbox/guide/reviewWalk.ts'];
     const eager = walk('packages/inbox').filter((path) => !readers.includes(path) && heavy.test(read(path)));
     expect(eager).toEqual([]);
-    expect(read('packages/inbox/components/GuidePane.tsx')).toContain("lazy(() => import('#guide-reader'))");
+    // The window's parts (lazyParts.tsx): fetched in idle time, each through its dynamic import only.
+    expect(read('packages/inbox/lazyParts.tsx')).toContain("lazyPart(() => import('#guide-reader'))");
     // The surface's reader (one section per screen) and its diagram engine wait the same way.
     expect(read('packages/inbox/surface/SurfaceGuide.tsx')).toContain("lazy(() => import('#surface-guide-reader'))");
     expect(read('packages/inbox/surface/SurfaceDocument.tsx')).toContain("lazy(() => import('./SurfaceDiagram'))");
+    expect(read('packages/inbox/lazyParts.tsx')).toContain("lazyPart(() => import('#shape-board'))");
+    // The posting dialog waits for the review's ending, and nothing else imports it.
+    expect(read('packages/inbox/lazyParts.tsx')).toContain("lazyPart(() => import('#platform-post'))");
+    const post = /^import\s+(?!type\b)[^;]*from\s+['"](?:#platform-post|[^'"]*guide\/PlatformPost(?:\.tsx)?)['"]/m;
+    expect(walk('packages/inbox').filter((path) => post.test(read(path)))).toEqual([]);
+    // The board itself (ShapeSurface, through the shape index) reaches the window only through #shape-board.
+    const board = /^import\s+(?!type\b)[^;]*from\s+['"]@plannotator\/ui\/components\/shape(?:\/ShapeSurface)?['"]/m;
+    expect(walk('packages/inbox').filter((path) => path !== 'packages/inbox/shape/ShapeBoard.tsx' && board.test(read(path)))).toEqual([]);
+  });
+
+  // Inbox search's palette (the approved "inbox-search" design: "the palette
+  // body is lazy, mounted on the first open ... so it never rides the window's
+  // first paint") reaches the window only through SearchHost's one dynamic
+  // import of `#search-palette`. A type-only import is erased; any other
+  // import of the palette module would put it back on the first paint.
+  test('the Inbox window mounts the search palette only through its dynamic import', () => {
+    const palette = /^import\s+(?!type\b)[^;]*from\s+['"](?:#search-palette|[^'"]*search\/SearchPalette(?:\.tsx)?)['"]/m;
+    const walk = (dir: string): string[] =>
+      readdirSync(resolve(root, dir), { withFileTypes: true }).flatMap((entry) =>
+        entry.isDirectory()
+          ? entry.name === 'node_modules' ? [] : walk(`${dir}/${entry.name}`)
+          : /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [`${dir}/${entry.name}`] : [],
+      );
+    const eager = [...walk('packages/inbox'), ...walk('apps/inbox')].filter((path) => palette.test(read(path)));
+    expect(eager).toEqual([]);
+    expect(read('packages/inbox/lazyParts.tsx')).toContain("lazyPart(() => import('#search-palette'))");
+    expect(read('packages/inbox/package.json')).toContain('"#search-palette": "./search/SearchPalette.tsx"');
   });
 
   // Built-artifact check: a lost eager import would still type-check and pass
@@ -202,14 +279,15 @@ describe('review entry assets', () => {
   //   12 the plan editor loads the runtime lazily by policy, and an eager
   //   import creeping back in would only show up as a bigger portal entry
   //   chunk. The review bundle carries no Mermaid and no Graphviz at all: its
-  //   Markdown preview shows diagram fences as code (see the import guard
-  //   above), so both presence markers are asserted absent there.
+  //   diagrams come from the separately served engine files (see the import
+  //   guard above, and the engine files checked below), so both presence
+  //   markers are asserted absent there.
   // - Presence markers (a KaTeX class name, a Mermaid diagram id, an
   //   Emscripten symbol from Graphviz, the bridge global), which only say the
-  //   runtime is still inlined by inlineDynamicImports. KaTeX is inlined
+  //   runtime is still packed into the bundle. KaTeX is packed
   //   through utils/math-default-loader.ts's import('katex') whether or not it is registered,
   //   so `katex-display` cannot prove registration and is not asked to; the
-  //   Mermaid diagram id in the plan bundle likewise proves inlining only.
+  //   Mermaid diagram id in the plan bundle likewise proves packing only.
   //
   // dist/ is gitignored, so this is skipped on an unbuilt checkout; the CI job
   // that builds the bundles runs it right after.
@@ -225,6 +303,43 @@ describe('review entry assets', () => {
       const missing = present.filter((marker) => !html.includes(marker));
       const unexpected = absent.filter((marker) => html.includes(marker));
       expect({ path, missing, unexpected }).toEqual({ path, missing: [], unexpected: [] });
+    });
+  }
+
+  // The engine files the review server serves, built beside the page by
+  // `apps/review`'s build (diagram-engine/build.ts) and copied by build:hook.
+  // Each runtime lives in its own file, the engine carries neither, and the
+  // engine brings no React of its own: every module it shares with the page
+  // is read from the host the page installs (no bare import survives).
+  const ENGINE_DIRS = ['apps/review/dist/diagram-engine', 'apps/hook/dist/diagram-engine'];
+  for (const dir of ENGINE_DIRS) {
+    test.skipIf(!existsSync(resolve(root, dir)))(`${dir} holds the engine and both runtimes, apart`, () => {
+      const file = (name: string) => readFileSync(resolve(root, dir, `${name}.js`), 'utf8');
+      const engine = file('engine');
+      const mermaid = file('mermaid');
+      const graphviz = file('graphviz');
+      const facts = {
+        dir,
+        engineHasMermaid: engine.includes('flowchart-v2'),
+        engineHasGraphviz: engine.includes('viz_set_y_invert'),
+        engineReadsHost: engine.includes('__plannotatorDiagramEngineHost'),
+        // Every import the engine names (statements and literal dynamic
+        // imports); the runtimes are imported by URL from the host, never by name.
+        engineImports: new Bun.Transpiler({ loader: 'js' }).scanImports(engine).map((entry) => entry.path),
+        mermaidRuntime: mermaid.includes('flowchart-v2'),
+        graphvizRuntime: graphviz.includes('viz_set_y_invert'),
+        mermaidCarriesKatex: mermaid.includes('katex-display'),
+      };
+      expect(facts).toEqual({
+        dir,
+        engineHasMermaid: false,
+        engineHasGraphviz: false,
+        engineReadsHost: true,
+        engineImports: [],
+        mermaidRuntime: true,
+        graphvizRuntime: true,
+        mermaidCarriesKatex: false,
+      });
     });
   }
 
@@ -260,6 +375,17 @@ describe('review entry assets', () => {
     }
   });
 
+  test('the opt-in @pierre/patches WASM is aliased out of every bundled app', () => {
+    for (const config of [
+      'apps/review/vite.config.ts',
+      'apps/hook/vite.config.ts',
+      'apps/portal/vite.config.ts',
+      'apps/inbox/vite.config.ts',
+    ]) {
+      expect(read(config)).toContain("'@pierre/patches': path.resolve(");
+    }
+  });
+
   // The alias assertions above only read SOURCE. A future @pierre/diffs bump
   // could reach the same inlined blob through a different import specifier and
   // every source check would still pass, so this reads the ARTIFACT: a base64
@@ -269,7 +395,7 @@ describe('review entry assets', () => {
   // dist/ is gitignored, so this skips cleanly on an unbuilt checkout. The CI
   // job that builds the bundles runs this file right after the build so the
   // assertion is not silently optional there.
-  const bundles = ['apps/review/dist/index.html', 'apps/hook/dist/index.html', 'apps/hook/dist/inbox.html', 'apps/hook/dist/surface.html'];
+  const bundles = ['apps/review/dist/index.html', 'apps/hook/dist/index.html', 'apps/hook/dist/inbox.html', 'apps/hook/dist/surface.html', 'apps/hook/dist/shape.html'];
   for (const path of bundles) {
     test.skipIf(!existsSync(resolve(root, path)))(`${path} ships no inlined WebAssembly`, () => {
       // Asserted on a boolean, not the string: these bundles are ~20MB and a
@@ -278,6 +404,168 @@ describe('review entry assets', () => {
       expect({ path, inlinedWasm }).toEqual({ path, inlinedWasm: false });
     });
   }
+
+  // The plan and review bundles are packed (build/pack-app.ts) so a session's
+  // first load moves only the page, its entry chunk and its stylesheet; the
+  // lazy chunks (Shiki grammars, Mermaid, ELK, Graphviz, KaTeX, fonts) stay in
+  // the pack until something imports them. Re-inlining them
+  // (`inlineDynamicImports`, vite-plugin-singlefile) builds and passes
+  // everything else while quietly restoring the ~25 MB first load over a
+  // tailnet or tunnel, so this reads the ARTIFACT.
+  const forkBundles = { 'apps/hook/dist/inbox.html': true, 'apps/hook/dist/surface.html': false, 'apps/hook/dist/shape.html': false };
+  for (const [path, fork] of Object.entries(forkBundles)) {
+    test.skipIf(!existsSync(resolve(root, path)))(`${path} draws diffs with ${fork ? 'the vendored fork' : 'the stock'} @pierre/diffs`, () => {
+      const onFork = readFileSync(resolve(root, path), 'utf8').includes('data-connector-level');
+      expect({ path, onFork }).toEqual({ path, onFork: fork });
+    });
+  }
+
+  const packedBundles = ['apps/review/dist/index.html', 'apps/hook/dist/index.html', 'apps/hook/dist/review.html'];
+  for (const path of packedBundles) {
+    test.skipIf(!existsSync(resolve(root, path)))(`${path} loads only its entry chunk and stylesheet up front`, async () => {
+      const bundle = readFileSync(resolve(root, path), 'utf8');
+      const app = openPackedApp(bundle);
+      const upFront = [...app.html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)].map((m) => m[1]);
+      let bytes = app.html.length;
+      for (const asset of upFront) {
+        const answer = await app.answer(asset, 'GET', null, false);
+        expect({ asset, status: answer.status }).toEqual({ asset, status: 200 });
+        bytes += answer.body.length;
+      }
+      expect(upFront.length).toBeGreaterThan(0);
+      expect(bytes / bundle.length).toBeLessThan(1 / 3);
+    });
+
+    // Packing before vite:build-import-analysis has rewritten the chunks ships
+    // its placeholder, and the app then throws on its first dynamic import.
+    test.skipIf(!existsSync(resolve(root, path)))(`${path} packs finished chunks`, () => {
+      const preloadPlaceholder = readFileSync(resolve(root, path), 'utf8').includes('__VITE_PRELOAD__');
+      expect({ path, preloadPlaceholder }).toEqual({ path, preloadPlaceholder: false });
+    });
+
+    // Vite emits KaTeX's woff and ttf fallbacks before katexWoff2Only strips
+    // their url()s, so only the plugin's own prune keeps ~1.1 MB of fonts no
+    // browser reads out of each packed bundle (#1617).
+    test.skipIf(!existsSync(resolve(root, path)))(`${path} packs no KaTeX woff or ttf fallback`, () => {
+      const fallback = /\/assets\/KaTeX_[^"]*\.(?:woff|ttf)"/.test(readFileSync(resolve(root, path), 'utf8'));
+      expect({ path, fallback }).toEqual({ path, fallback: false });
+    });
+  }
+
+  // While the switch is 'mermaid' no built file carries any of Pele's
+  // library: not the single-file builds that inline every dynamic import
+  // (the Inbox surface, the Shape page, code review's diagram engine), and no
+  // never-loaded lazy chunk in a packed app either. These markers are class
+  // names only Pele's own svg writer prints (Plannotator's finder reads
+  // `pele-edge`, `pele-node`, `pele-marker`, never these). The last two are
+  // Plannotator's own Pele code (`utils/pele-labels.ts`), which the same
+  // switch keeps out: its math labels' attribute and class.
+  const PELE_MARKERS = ['pele-shape-', 'pele-icon', 'pele-ticket', 'pele-slice-labels', 'pele-commit-label', 'data-pele-tex', 'pele-math'];
+  const builtFiles = [
+    'apps/review/dist/index.html',
+    'apps/review/dist/diagram-engine/engine.js',
+    'apps/hook/dist/index.html',
+    'apps/hook/dist/redline.html',
+    'apps/hook/dist/review.html',
+    'apps/hook/dist/inbox.html',
+    'apps/hook/dist/surface.html',
+    'apps/hook/dist/shape.html',
+    'apps/hook/dist/diagram-engine/engine.js',
+    'apps/inbox/dist/index.html',
+    'apps/inbox/dist/surface.html',
+    'apps/inbox/dist/shape.html',
+    'apps/opencode-plugin/plannotator.html',
+    'apps/opencode-plugin/review-editor.html',
+    'apps/opencode-plugin/diagram-engine/engine.js',
+  ];
+  for (const path of builtFiles) {
+    test.skipIf(DIAGRAM_ENGINE_MODE !== 'mermaid' || !existsSync(resolve(root, path)))(`${path} carries none of Pele while the engine switch is 'mermaid'`, () => {
+      const text = readFileSync(resolve(root, path), 'utf8');
+      const markers = PELE_MARKERS.filter((marker) => text.includes(marker));
+      expect({ path, markers }).toEqual({ path, markers: [] });
+    });
+  }
+
+  // The phone's surface and the Shape page stay one self-contained page each
+  // (vite-plugin-singlefile): a native shell loads the surface with no server
+  // and no network behind it, and the Shape page's server serves it whole, with
+  // no asset route behind it.
+  for (const path of ['apps/hook/dist/surface.html', 'apps/hook/dist/shape.html']) {
+    test.skipIf(!existsSync(resolve(root, path)))(`${path} stays single-file`, () => {
+      const html = readFileSync(resolve(root, path), 'utf8');
+      const facts = { path, packed: html.includes(PACKED_ASSETS_MARKER), linksAssets: /(?:src|href)="\/assets\//.test(html) };
+      expect(facts).toEqual({ path, packed: false, linksAssets: false });
+    });
+  }
+
+  // The Inbox window (#2593) is one file whose scripts are packed behind the
+  // page (build/pack-inbox.ts) and served by the Inbox. Inlined, every lazy
+  // part was parsed and run at page load and held for the tab's life (~150 MB
+  // for an empty Inbox). Going back to vite-plugin-singlefile or
+  // `inlineDynamicImports`, a static import of a lazy part, or a non-ASCII
+  // character in a script (V8 then keeps that script at two bytes per
+  // character) builds and passes everything else, so this reads the ARTIFACT.
+  const inboxWindow = 'apps/hook/dist/inbox.html';
+  /** One marker per part that must wait for first use, and so must be in the pack but not up front. */
+  const INBOX_LAZY_MARKERS: Record<string, string> = {
+    'guide viewer (#guide-reader)': 'data-guide-code-view-mounted',
+    'Shiki TypeScript grammar': '"scopeName":"source.ts"',
+    Mermaid: 'flowchart-v2',
+    Graphviz: 'viz_set_y_invert',
+    KaTeX: 'katex-display',
+    // Pele is in no build while the engine switch is 'mermaid' (checked
+    // above); once it is on, it is a lazy part like Mermaid.
+    ...(DIAGRAM_ENGINE_MODE === 'mermaid' ? {} : { Pele: 'pele-shape-' }),
+  };
+  test.skipIf(!existsSync(resolve(root, inboxWindow)))(`${inboxWindow} loads its entry script up front and the review, diagrams and grammars on first use`, async () => {
+    const bundle = readFileSync(resolve(root, inboxWindow), 'utf8');
+    const app = openPackedApp(bundle);
+    const markerAt = bundle.indexOf(PACKED_ASSETS_MARKER);
+    expect(markerAt).toBeGreaterThan(0);
+    const indexAt = markerAt + PACKED_ASSETS_MARKER.length;
+    const packed = Object.keys(JSON.parse(bundle.slice(indexAt, bundle.indexOf('\n', indexAt))) as Record<string, unknown>);
+    const text = async (asset: string) => {
+      const answer = await app.answer(asset, 'GET', null, false);
+      expect({ asset, status: answer.status }).toEqual({ asset, status: 200 });
+      return answer.body.toString();
+    };
+    // Up front: the page and what it links (its entry script, any module preloads), with the static imports they make.
+    const upFront = new Map<string, string>();
+    const load = async (asset: string): Promise<void> => {
+      if (upFront.has(asset)) return;
+      const code = await text(asset);
+      upFront.set(asset, code);
+      for (const entry of new Bun.Transpiler({ loader: 'js' }).scanImports(code)) {
+        if (entry.kind === 'import-statement') await load(new URL(entry.path, `http://inbox${asset}`).pathname);
+      }
+    };
+    for (const m of app.html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)) await load(m[1]!);
+    const all = new Map<string, string>();
+    for (const asset of packed) all.set(asset, await text(asset));
+    const has = (codes: Iterable<string>, marker: string) => [...codes].some((code) => code.includes(marker));
+    const upFrontBytes = app.html.length + [...upFront.values()].reduce((n, code) => n + code.length, 0);
+    const facts = {
+      // The stylesheet stays in the page, so it paints as the single-file page did; only scripts are packed.
+      stylesheetInline: app.html.includes('<style') && !/<link rel="stylesheet"/.test(app.html),
+      onlyScriptsPacked: packed.every((asset) => asset.endsWith('.js')),
+      entryScripts: [...app.html.matchAll(/<script type="module"[^>]*\ssrc="\/assets\//g)].length,
+      preloadPlaceholder: bundle.includes('__VITE_PRELOAD__'),
+      lazyPartsPacked: Object.entries(INBOX_LAZY_MARKERS).filter(([, marker]) => !has(all.values(), marker)).map(([part]) => part),
+      lazyPartsUpFront: Object.entries(INBOX_LAZY_MARKERS).filter(([, marker]) => has(upFront.values(), marker)).map(([part]) => part),
+      nonAsciiScripts: [...all].filter(([, code]) => /[^\x00-\x7f]/.test(code)).map(([asset]) => asset),
+      upFrontUnderAThird: upFrontBytes / bundle.length < 1 / 3,
+    };
+    expect(facts).toEqual({
+      stylesheetInline: true,
+      onlyScriptsPacked: true,
+      entryScripts: 1,
+      preloadPlaceholder: false,
+      lazyPartsPacked: [],
+      lazyPartsUpFront: [],
+      nonAsciiScripts: [],
+      upFrontUnderAThird: true,
+    });
+  });
 });
 
 describe('marketing embeds', () => {
@@ -299,5 +587,12 @@ describe('marketing embeds', () => {
     const toolstrip = read('packages/ui/components/AnnotationToolstrip.tsx');
     expect(toolstrip).not.toContain('www.youtube.com/embed/');
     expect(toolstrip).toContain('www.youtube-nocookie.com/embed/');
+  });
+
+  test('the Tater sprite sheets reach only the plan editor, which registers them', () => {
+    const sprite = /from\s+['"][^'"]*TaterSprite(?:Pullup|Sitting)['"]/;
+    expect(read('packages/ui/components/Viewer.tsx')).not.toMatch(sprite);
+    expect(read('packages/ui/components/AnnotationToolstrip.tsx')).not.toMatch(sprite);
+    expect(read('packages/editor/App.tsx')).toContain("import '@plannotator/ui/utils/tater-sprites-eager';");
   });
 });

@@ -48,8 +48,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -99,8 +98,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -152,8 +150,7 @@
         "archived": [],
         "counts": {
           "waiting": 0,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -208,8 +205,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -266,8 +262,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -320,8 +315,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -374,8 +368,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -430,8 +423,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -484,8 +476,7 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 1
         },
         "threads": {
           "t1": {
@@ -542,13 +533,12 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 0
         },
         "threads": {
           "t1": {
             "section": "waiting",
-            "unread": true,
+            "unread": false,
             "unseen": 0,
             "read": false,
             "archived": false,
@@ -596,13 +586,12 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 0
         },
         "threads": {
           "t1": {
             "section": "waiting",
-            "unread": true,
+            "unread": false,
             "unseen": 0,
             "read": false,
             "archived": false,
@@ -650,13 +639,12 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 0
         },
         "threads": {
           "t1": {
             "section": "waiting",
-            "unread": true,
+            "unread": false,
             "unseen": 0,
             "read": false,
             "archived": false,
@@ -704,13 +692,12 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 0
         },
         "threads": {
           "t1": {
             "section": "waiting",
-            "unread": true,
+            "unread": false,
             "unseen": 0,
             "read": false,
             "archived": false,
@@ -762,13 +749,12 @@
         "archived": [],
         "counts": {
           "waiting": 1,
-          "unread": 1,
-          "decisions_waiting": 0
+          "unread": 0
         },
         "threads": {
           "t1": {
             "section": "waiting",
-            "unread": true,
+            "unread": false,
             "unseen": 0,
             "read": false,
             "archived": false,
@@ -816,8 +802,7 @@
         ],
         "counts": {
           "waiting": 0,
-          "unread": 0,
-          "decisions_waiting": 0
+          "unread": 0
         },
         "threads": {
           "t1": {

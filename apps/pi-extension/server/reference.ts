@@ -22,6 +22,7 @@ import {
 	buildFileTree,
 	isFileBrowserExcludedPath,
 } from "../generated/reference-common.ts";
+import { explicitFileBrowserMaxFiles, listFileBrowserFiles } from "../generated/file-browser-files.ts";
 import {
 	filterWorkspaceStatusForDirectory,
 	getWorkspaceStatusForDirectory,
@@ -29,6 +30,10 @@ import {
 	type WorkspaceFileChange,
 } from "../generated/workspace-status.ts";
 import { detectObsidianVaults } from "../generated/integrations-common.ts";
+import { isReferenceReadPath, referenceReadRefusal, vaultDocRefusal } from "../generated/reference-reader.ts";
+import { crossOriginRefusalBody } from "../generated/request-origin.ts";
+import { isSameOriginRequest } from "./request-origin-guard.ts";
+import { isThisMachineRequest } from "./this-machine.ts";
 import {
 	resolveUserPath,
 	warmFileListCache,
@@ -36,13 +41,14 @@ import {
 	MAX_ANNOTATABLE_FILE_BYTES,
 	isAnnotatableTextPath,
 } from "../generated/resolve-file.ts";
-import { diagramRenderKindForPath, isDiagramRenderKind } from "../generated/annotatable.ts";
+import { documentRenderKindForPath, isDocumentRenderKind } from "../generated/annotatable.ts";
 import {
 	DOC_ACCESS_DENIED,
 	DOC_TOO_LARGE,
 	docResolutionError,
 	getAllowedRootPaths,
 	getTrustedBaseDir,
+	isDocServeAllowed,
 	isPathAllowed,
 	relativizeToAllowedRoots,
 	resolveAllowedDocPath,
@@ -72,7 +78,7 @@ import { preloadFile } from "@pierre/diffs/ssr";
  * included, for legacy shape parity — see serverAnnotate.ts). Mirrors
  * packages/server/reference-handlers.ts.
  */
-export type FolderAnnotateHistory = Omit<AnnotateHistoryResult, "diffCurrent">;
+export type FolderAnnotateHistory = Omit<AnnotateHistoryResult, "diffCurrent" | "isNew">;
 
 type Res = ServerResponse;
 
@@ -91,7 +97,10 @@ export interface HandleDocOptions {
 	 *  (`resolveBundleSourceSavePaths`). Every other document stays read-only. */
 	sourceSaveBundlePaths?: ReadonlySet<string>;
 	onSourceDocumentServed?: (path: string) => void;
+	onDocumentServed?: (path: string) => void;
 	rootPaths?: string[];
+	/** A reader on this machine (`isThisMachineReader`, this-machine-reader.ts): documents are served from anywhere, code files keep the roots (`isDocServeAllowed`). */
+	anyPath?: boolean;
 	/**
 	 * When set, /api/doc runs annotate's per-file version-history pipeline for
 	 * eligible markdown-branch documents (local file under an allowed root,
@@ -175,9 +184,9 @@ function applyDocOptions<T extends Record<string, unknown>>(
 	if (
 		options.annotateHistory &&
 		typeof data.filepath === "string" &&
-		// Diagram sources (.mmd/.dot) take the markdown branch's raw text, so
+		// Diagram and AsciiDoc sources take the markdown branch's raw text, so
 		// they keep per-file version history exactly like a .txt.
-		(data.renderAs === "markdown" || isDiagramRenderKind(data.renderAs)) &&
+		(data.renderAs === "markdown" || isDocumentRenderKind(data.renderAs)) &&
 		data.isConverted !== true &&
 		typeof data.markdown === "string" &&
 		isAnnotatableTextPath(data.filepath)
@@ -234,6 +243,7 @@ function jsonDoc(
 	status?: number,
 	sourceSnapshot?: SourceFileSnapshot,
 ): void {
+	if (typeof data.filepath === "string") options?.onDocumentServed?.(data.filepath);
 	json(res, applyDocOptions(data, options, sourceSnapshot), status);
 }
 
@@ -283,11 +293,12 @@ function readDocument(res: Res, path: string, convert: boolean, options: HandleD
 			}
 			return;
 		}
-		// A diagram source is served as its raw text with the engine named in
-		// `renderAs`; the editor renders it through the same DiagramBlock a
-		// ```mermaid fence uses instead of the markdown pipeline.
-		const diagramKind = diagramRenderKindForPath(path);
-		jsonDoc(res, { markdown: snapshot.text, filepath: path, renderAs: diagramKind ?? "markdown" }, options, undefined, snapshot);
+		// A diagram or AsciiDoc source is served as its raw text with the engine
+		// named in `renderAs`; the editor renders a diagram through the same
+		// DiagramBlock a ```mermaid fence uses, and AsciiDoc through its own
+		// block parser, instead of the markdown pipeline.
+		const renderKind = documentRenderKindForPath(path);
+		jsonDoc(res, { markdown: snapshot.text, filepath: path, renderAs: renderKind ?? "markdown" }, options, undefined, snapshot);
 	} catch {
 		json(res, { error: "Failed to read file" }, 500);
 	}
@@ -332,7 +343,8 @@ export async function handleDocRequest(res: Res, url: URL, options: HandleDocOpt
 	}
 
 	// A base is only honored when it is itself inside an allowed root.
-	const resolvedBase = getTrustedBaseDir(url.searchParams.get("base"), allowedRoots);
+	const anyPath = options.anyPath === true;
+	const resolvedBase = getTrustedBaseDir(url.searchParams.get("base"), allowedRoots, anyPath);
 	const convert = url.searchParams.get("convert") === "1";
 	// `?doc=1` (set by the file browser) forces annotatable plain-text rendering
 	// for extensions that overlap CODE_FILE_REGEX (.yaml, .json, .toml, .ini,
@@ -344,11 +356,12 @@ export async function handleDocRequest(res: Res, url: URL, options: HandleDocOpt
 		base: resolvedBase,
 		forceDoc,
 		roots: allowedRoots,
+		anyPath,
 	});
 	// The one authorization site. A named path is gated whether or not it
 	// exists, so an escaping name is denied rather than reported absent.
 	const named = resolution.kind === "file" || resolution.kind === "not_found" ? resolution.path : undefined;
-	if (named !== undefined && !isPathAllowed(named, allowedRoots)) {
+	if (named !== undefined && !isDocServeAllowed(named, resolution.kind === "file" ? resolution.render : null, allowedRoots, anyPath)) {
 		sendDocError(res, DOC_ACCESS_DENIED);
 		return;
 	}
@@ -414,6 +427,23 @@ export async function handleDocExistsRequest(res: Res, req: IncomingMessage, opt
 	json(res, { results });
 }
 
+/**
+ * The Files sidebar and Obsidian routes (`isReferenceReadPath`): refused for
+ * another site, and for a reader off this machine outside the session's roots
+ * and Obsidian's own vaults (`referenceReadRefusal`). True when it answered.
+ */
+export function refuseReferenceRead(req: IncomingMessage, res: Res, url: URL, roots: () => string[]): boolean {
+	if (!isReferenceReadPath(url.pathname)) return false;
+	if (!isSameOriginRequest(req)) {
+		json(res, crossOriginRefusalBody(), 403);
+		return true;
+	}
+	const refusal = referenceReadRefusal(url, { thisMachine: isThisMachineRequest(req), roots: roots() });
+	if (!refusal) return false;
+	json(res, { error: refusal.error }, refusal.status);
+	return true;
+}
+
 export function handleObsidianVaultsRequest(res: Res): void {
 	json(res, { vaults: detectObsidianVaults() });
 }
@@ -439,7 +469,8 @@ export function handleObsidianFilesRequest(res: Res, url: URL): void {
 	}
 }
 
-export function handleObsidianDocRequest(res: Res, url: URL): void {
+/** `thisMachine`: the reader is a page on this machine (`vaultDocRefusal`). */
+export function handleObsidianDocRequest(res: Res, url: URL, thisMachine = false): void {
 	const vaultPath = url.searchParams.get("vaultPath");
 	const filePath = url.searchParams.get("path");
 	if (!vaultPath || !filePath) {
@@ -475,12 +506,10 @@ export function handleObsidianDocRequest(res: Res, url: URL): void {
 		}
 	}
 
-	// Security: must be within vault
-	if (
-		!resolvedFile.startsWith(resolvedVault + "/") &&
-		resolvedFile !== resolvedVault
-	) {
-		json(res, { error: "Access denied: path is outside vault" }, 403);
+	// Inside the vault (after symlinks too, off this machine), a regular Markdown file, within 2MB.
+	const refusal = vaultDocRefusal(resolvedFile, resolvedVault, thisMachine);
+	if (refusal) {
+		json(res, { error: refusal.error }, refusal.status);
 		return;
 	}
 
@@ -508,15 +537,19 @@ export async function handleFileBrowserRequest(res: Res, url: URL): Promise<void
 		return;
 	}
 	try {
-		const files = new Set<string>();
-		const diskFiles: string[] = [];
-		walkMarkdownFiles(resolvedDir, resolvedDir, diskFiles);
-		for (const file of diskFiles) files.add(file);
 		const workspaceStatus = filterWorkspaceStatusForDirectory(await getWorkspaceStatusForDirectory(resolvedDir), resolvedDir, includeWorkspaceFile);
-		for (const file of getWorkspaceStatusRelativePaths(workspaceStatus, resolvedDir, includeWorkspaceFile)) {
-			files.add(file);
-		}
-		json(res, { tree: buildFileTree([...files].sort()), workspaceStatus });
+		// Pi's file browser had no cap: it applies one only when
+		// PLANNOTATOR_FILE_BROWSER_MAX_FILES is set, and lists every file otherwise.
+		const listing = await listFileBrowserFiles(resolvedDir, {
+			seed: getWorkspaceStatusRelativePaths(workspaceStatus, resolvedDir, includeWorkspaceFile),
+			limit: explicitFileBrowserMaxFiles(),
+		});
+		json(res, {
+			tree: buildFileTree(listing.files),
+			workspaceStatus,
+			truncated: listing.truncated,
+			...(Number.isFinite(listing.limit) ? { fileLimit: listing.limit } : {}),
+		});
 	} catch {
 		json(res, { error: "Failed to list directory files" }, 500);
 	}

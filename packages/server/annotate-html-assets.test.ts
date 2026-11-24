@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHtmlAssetRegistry, framedDocumentNotFound, inlineHtmlLocalAssets } from "./html-assets";
+import { HTML_ASSET_SUBRESOURCE_CSP } from "@plannotator/shared/html-assets";
 import { startAnnotateServer } from "./annotate";
 import { startAnnotateServer as startPiAnnotateServer } from "../../apps/pi-extension/server/serverAnnotate";
+import { startPlannotatorServer } from "./index";
+import { startPlanReviewServer as startPiPlanReviewServer } from "../../apps/pi-extension/server/serverPlan";
 
 describe("annotate raw HTML assets", () => {
   test("rewrites raw HTML support assets and serves them from the source directory", async () => {
@@ -39,6 +42,82 @@ describe("annotate raw HTML assets", () => {
     expect(imageResponse?.status).toBe(200);
     expect(imageResponse?.headers.get("content-type")).toBe("image/png");
     expect(await imageResponse?.text()).toBe("png-bytes");
+  });
+
+  test("every non-HTML asset carries the sandbox CSP and nosniff: an SVG or XML opened as a document runs no script on the session origin", async () => {
+    // A page in a top-level tab has only its response CSP as a sandbox, so it can
+    // navigate its own tab to a sibling .svg; without a policy there, that SVG ran
+    // script on this origin. As a subresource (<img>, CSS) the policy does not apply.
+    const dir = mkdtempSync(join(tmpdir(), "plannotator-html-assets-svg-"));
+    const htmlPath = join(dir, "page.html");
+    const html = '<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body><img src="chart.svg"></body></html>';
+    writeFileSync(htmlPath, html, "utf-8");
+    writeFileSync(join(dir, "chart.svg"), '<svg xmlns="http://www.w3.org/2000/svg"><script>fetch("/api/plan")</script></svg>', "utf-8");
+    writeFileSync(join(dir, "data.xml"), '<html xmlns="http://www.w3.org/1999/xhtml"><script>1</script></html>', "utf-8");
+    writeFileSync(join(dir, "style.css"), "body { color: red; }", "utf-8");
+    writeFileSync(join(dir, "app.js"), "1", "utf-8");
+    const assets = createHtmlAssetRegistry();
+    const base = assets.rewriteHtml(html, htmlPath).match(/<base href="([^"]+)"/)![1]!;
+    for (const name of ["chart.svg", "data.xml", "style.css", "app.js"]) {
+      const url = new URL(`${base}${name}`, "http://localhost");
+      const response = await assets.handle(new Request(String(url)), url);
+      expect([name, response?.status, response?.headers.get("content-security-policy")]).toEqual([
+        name,
+        200,
+        "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:",
+      ]);
+      expect(response?.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+    // The page itself keeps its document policy (scripts run, at an opaque origin).
+    const page = new URL(`${base}page.html`, "http://localhost");
+    expect((await assets.handle(new Request(String(page)), page))?.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // An SVG (or XML) opened directly in a tab is a scriptable document on the
+  // session's origin; the sandbox CSP gives it an opaque origin and no script.
+  // As an <img> it never ran script, so it loads exactly as before.
+  test("serves SVG, XML and every other asset with the sandbox CSP and nosniff; an <img> still loads", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "plannotator-html-assets-svg-"));
+    try {
+      const htmlPath = join(dir, "page.html");
+      const html = '<!doctype html><html><body><img src="./chart.svg"><img src="./logo.png"></body></html>';
+      writeFileSync(htmlPath, html, "utf-8");
+      writeFileSync(join(dir, "chart.svg"), '<svg xmlns="http://www.w3.org/2000/svg"><script>1</script></svg>', "utf-8");
+      writeFileSync(join(dir, "logo.png"), "png-bytes", "utf-8");
+      writeFileSync(join(dir, "data.xml"), "<root/>", "utf-8");
+
+      const assets = createHtmlAssetRegistry();
+      const rawHtml = assets.rewriteHtml(html, htmlPath);
+      const get = async (name: string) => {
+        const path = rawHtml.match(new RegExp(`"([^"]+${name.replace(".", "\\.")})"`))?.[1];
+        expect(path).toBeTruthy();
+        const url = new URL(path!, "http://localhost");
+        return assets.handle(new Request(String(url)), url);
+      };
+
+      const svg = await get("chart.svg");
+      expect(svg?.status).toBe(200);
+      expect(svg?.headers.get("content-type")).toBe("image/svg+xml");
+      expect(svg?.headers.get("content-security-policy")).toBe(HTML_ASSET_SUBRESOURCE_CSP);
+      expect(svg?.headers.get("x-content-type-options")).toBe("nosniff");
+
+      // An XML file in the same folder, reached the way a page's <base href>
+      // reaches it: the SVG's token with another name.
+      const svgPath = rawHtml.match(/"([^"]+chart\.svg)"/)![1];
+      const xmlUrl = new URL(svgPath.replace(/chart\.svg$/, "data.xml"), "http://localhost");
+      const xml = await assets.handle(new Request(String(xmlUrl)), xmlUrl);
+      expect(xml?.status).toBe(200);
+      expect(xml?.headers.get("content-security-policy")).toBe(HTML_ASSET_SUBRESOURCE_CSP);
+
+      const png = await get("logo.png");
+      expect(png?.status).toBe(200);
+      // Every non-HTML asset, not only the scriptable types (a response CSP never applies to an <img> load).
+      expect(png?.headers.get("content-security-policy")).toBe(HTML_ASSET_SUBRESOURCE_CSP);
+      expect(png?.headers.get("x-content-type-options")).toBe("nosniff");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("folder HTML loads parent-relative CSS and scripts and shares their bytes", async () => {
@@ -229,7 +308,7 @@ describe("annotate embedded local documents", () => {
     expect(response?.headers.get("content-type")).toContain("text/html");
     // Defense in depth for a reviewer who opens the asset URL in a top-level
     // tab: no allow-same-origin means an opaque origin there too.
-    expect(response?.headers.get("content-security-policy")).toBe("sandbox allow-scripts");
+    expect(response?.headers.get("content-security-policy")).toBe("sandbox allow-scripts allow-modals");
     expect(response?.headers.get("content-security-policy")).not.toContain("allow-same-origin");
     expect(response?.headers.get("x-content-type-options")).toBe("nosniff");
     expect(await response?.text()).toContain("EMBEDDED_SIBLING");
@@ -409,7 +488,8 @@ describe("annotate catch-all: framed requests", () => {
 
   test("a plain request for a missing path still gets the app, as before #1561", async () => {
     await withServer(async (url) => {
-      for (const path of ["/prototype-slash.html", "/assets/frame", "/"]) {
+      // (Not under /assets/: that prefix is the packed chunks route, where a miss is 404.)
+      for (const path of ["/prototype-slash.html", "/docs/frame", "/"]) {
         const response = await fetch(`${url}${path}`);
         expect(response.status).toBe(200);
         expect(await response.text()).toContain("PLANNOTATOR_APP_SHELL");
@@ -419,6 +499,115 @@ describe("annotate catch-all: framed requests", () => {
 });
 
 for (const [runtime, startServer] of [["Bun", startAnnotateServer], ["Pi", startPiAnnotateServer]] as const) {
+  test(`${runtime} serves local Markdown videos only from beside or below the document`, async () => {
+    const parent = realpathSync(mkdtempSync(join(tmpdir(), "plannotator-markdown-video-")));
+    const docDir = join(parent, "proof");
+    mkdirSync(join(docDir, "media"), { recursive: true });
+    const filePath = join(docDir, "proof.md");
+    writeFileSync(filePath, '<video controls src="media/demo.webm"></video>');
+    writeFileSync(join(docDir, "media", "demo.webm"), "WEBM_BYTES");
+    writeFileSync(join(parent, "private.webm"), "PRIVATE_BYTES");
+    symlinkSync(join(parent, "private.webm"), join(docDir, "media", "escape.webm"));
+    // A video name that links to a file of another kind inside the folder, and a hidden folder.
+    writeFileSync(join(docDir, "notes.txt"), "PRIVATE_NOTES");
+    symlinkSync(join(docDir, "notes.txt"), join(docDir, "media", "notes.mp4"));
+    mkdirSync(join(docDir, ".git"));
+    writeFileSync(join(docDir, ".git", "clip.webm"), "HIDDEN_VIDEO");
+    symlinkSync(join(docDir, ".git", "clip.webm"), join(docDir, "media", "hidden.webm"));
+    const linkedDir = join(parent, "linked");
+    mkdirSync(linkedDir);
+    const linkedDocument = join(linkedDir, "linked.md");
+    writeFileSync(linkedDocument, '<video src="clip.webm"></video>');
+    writeFileSync(join(linkedDir, "clip.webm"), "LINKED_VIDEO");
+    const oversized = join(docDir, "media", "large.mp4");
+    writeFileSync(oversized, "");
+    truncateSync(oversized, 50 * 1024 * 1024 + 1);
+    const server = await startServer({ markdown: '<video controls src="media/demo.webm"></video>', filePath, htmlContent: "<html></html>" });
+    const get = (path: string, base = docDir) => fetch(`${server.url}/api/annotate-media?path=${encodeURIComponent(path)}&base=${encodeURIComponent(base)}`);
+    try {
+      const playable = await get("media/demo.webm");
+      expect(playable.status).toBe(200);
+      expect(playable.headers.get("content-type")).toContain("video/webm");
+      expect(await playable.text()).toBe("WEBM_BYTES");
+      expect((await get("media/large.mp4")).status).toBe(413);
+      for (const path of ["../private.webm", "media/escape.webm", "/private.webm", "media/demo.txt"]) {
+        expect((await get(path)).status).not.toBe(200);
+      }
+      for (const path of ["media/notes.mp4", ".git/clip.webm", "media/hidden.webm"]) {
+        const refused = await get(path);
+        expect(refused.status).toBe(403);
+        expect(await refused.text()).not.toContain("PRIVATE_NOTES");
+      }
+      expect((await get("private.webm", parent)).status).not.toBe(200);
+      expect((await get("clip.webm", linkedDir)).status).toBe(403);
+      expect((await fetch(`${server.url}/api/doc?path=${encodeURIComponent(linkedDocument)}`)).status).toBe(200);
+      expect(await (await get("clip.webm", linkedDir)).text()).toBe("LINKED_VIDEO");
+      expect((await fetch(`${server.url}/api/annotate-media?path=media%2Fdemo.webm&base=${encodeURIComponent(docDir)}`, {
+        headers: { "Sec-Fetch-Site": "cross-site" },
+      })).status).toBe(403);
+    } finally {
+      server.stop();
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+  test(`${runtime} local Markdown videos answer byte ranges, so a player can seek`, async () => {
+    const docDir = realpathSync(mkdtempSync(join(tmpdir(), "plannotator-markdown-video-range-")));
+    const filePath = join(docDir, "proof.md");
+    writeFileSync(filePath, '<video controls src="demo.mp4"></video>');
+    writeFileSync(join(docDir, "demo.mp4"), "0123456789");
+    const server = await startServer({ markdown: '<video controls src="demo.mp4"></video>', filePath, htmlContent: "<html></html>" });
+    const get = (range?: string) => fetch(`${server.url}/api/annotate-media?path=demo.mp4&base=${encodeURIComponent(docDir)}`, { headers: range ? { Range: range } : {} });
+    try {
+      const whole = await get();
+      expect(whole.status).toBe(200);
+      expect(whole.headers.get("accept-ranges")).toBe("bytes");
+      expect(whole.headers.get("content-type")).toContain("video/mp4");
+      expect(await whole.text()).toBe("0123456789");
+      for (const [range, contentRange, body] of [
+        ["bytes=0-1", "bytes 0-1/10", "01"],
+        ["bytes=4-", "bytes 4-9/10", "456789"],
+        ["bytes=-3", "bytes 7-9/10", "789"],
+        ["bytes=8-100", "bytes 8-9/10", "89"],
+      ] as const) {
+        const part = await get(range);
+        expect(part.status).toBe(206);
+        expect(part.headers.get("content-range")).toBe(contentRange);
+        expect(await part.text()).toBe(body);
+      }
+      const past = await get("bytes=10-");
+      expect(past.status).toBe(416);
+      expect(past.headers.get("content-range")).toBe("bytes */10");
+      // Several ranges, or one that is not a byte range, get the whole file.
+      for (const range of ["bytes=0-1,4-5", "bytes=5-2", "items=0-1"]) {
+        const answer = await get(range);
+        expect(answer.status).toBe(200);
+        expect(await answer.text()).toBe("0123456789");
+      }
+    } finally {
+      server.stop();
+      rmSync(docDir, { recursive: true, force: true });
+    }
+  });
+  test(`${runtime} plan review plays a linked document's local video once that document is open`, async () => {
+    const docDir = realpathSync(mkdtempSync(join(tmpdir(), "plannotator-plan-video-")));
+    const linked = join(docDir, "notes.md");
+    writeFileSync(linked, '<video controls src="clip.webm"></video>');
+    writeFileSync(join(docDir, "clip.webm"), "PLAN_VIDEO");
+    const server = runtime === "Bun"
+      ? await startPlannotatorServer({ plan: "# Plan\n\nSee notes.md", origin: "claude-code", htmlContent: "<html></html>" })
+      : await startPiPlanReviewServer({ plan: "# Plan\n\nSee notes.md", origin: "pi", htmlContent: "<html></html>" });
+    const media = `${server.url}/api/annotate-media?path=clip.webm&base=${encodeURIComponent(docDir)}`;
+    try {
+      expect((await fetch(media)).status).toBe(403);
+      expect((await fetch(`${server.url}/api/doc?path=${encodeURIComponent(linked)}`)).status).toBe(200);
+      const answer = await fetch(media, { headers: { Range: "bytes=0-3" } });
+      expect(answer.status).toBe(206);
+      expect(await answer.text()).toBe("PLAN");
+    } finally {
+      server.stop();
+      rmSync(docDir, { recursive: true, force: true });
+    }
+  });
   test(`${runtime} folder API resolves shared assets within the selected folder`, async () => {
     const parent = realpathSync(mkdtempSync(join(tmpdir(), "plannotator-folder-api-")));
     const root = join(parent, "course");

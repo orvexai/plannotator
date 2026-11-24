@@ -2,7 +2,10 @@
  * Pi mirror of packages/server/review-draft-pr.test.ts: /api/draft in PR mode survives a changed PR diff (#1590), and every
  * decision clears it under both keys. Local reviews keep the content-hash key.
  *
- * Temp PLANNOTATOR_DATA_DIR per test; PATH emptied so no platform CLI runs.
+ * Temp PLANNOTATOR_DATA_DIR per test. The server's PR commands (the platform
+ * user, viewed files, PR context) go to a fake runtime, never the real `gh`
+ * (emptying PATH is no guard: in the Bun mirror a spawn without `env` resolves
+ * on the PATH the process started with).
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
@@ -10,10 +13,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PRMetadata } from './generated/pr-types.ts';
 import { startReviewServer } from './server/serverReview.ts';
+import { setPRCommandRuntimeForTests } from './server/pr.ts';
+import { createFakePRRuntime, type FakePRRuntime } from '../../tests/helpers/fake-pr-runtime.ts';
 
-const ENV_KEYS = ['PLANNOTATOR_AI', 'PLANNOTATOR_DATA_DIR', 'PATH', 'PLANNOTATOR_PORT', 'PLANNOTATOR_REMOTE', 'PLANNOTATOR_BROWSER'] as const;
+const ENV_KEYS = ['PLANNOTATOR_AI', 'PLANNOTATOR_DATA_DIR', 'PLANNOTATOR_PORT', 'PLANNOTATOR_REMOTE', 'PLANNOTATOR_BROWSER'] as const;
 const saved: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
 const tempDirs: string[] = [];
+let prCommands: FakePRRuntime | null = null;
 
 const prMetadata: PRMetadata = {
   platform: 'github',
@@ -45,13 +51,16 @@ function sandbox(): string {
   process.env.PLANNOTATOR_REMOTE = '0';
   process.env.PLANNOTATOR_BROWSER = '/usr/bin/true';
   delete process.env.PLANNOTATOR_PORT;
-  process.env.PATH = makeTempDir('plannotator-draft-pr-path-');
+  prCommands = createFakePRRuntime();
+  setPRCommandRuntimeForTests(prCommands.runtime);
   const dataDir = makeTempDir('plannotator-draft-pr-data-');
   process.env.PLANNOTATOR_DATA_DIR = dataDir;
   return dataDir;
 }
 
 afterEach(() => {
+  setPRCommandRuntimeForTests(null);
+  prCommands = null;
   for (const key of ENV_KEYS) {
     if (saved[key] === undefined) delete process.env[key];
     else process.env[key] = saved[key]!;
@@ -131,7 +140,7 @@ describe('PR review drafts across a push', () => {
       });
       for (const patch of [PATCH_BEFORE_PUSH, PATCH_AFTER_PUSH]) {
         await withSession(patch, prMetadata, async (url) => {
-          expect((await fetch(`${url}/api/draft`)).status).toBe(404);
+          expect((await fetch(`${url}/api/draft`)).status).toBe(204);
         });
       }
     });
@@ -152,25 +161,34 @@ describe('PR review drafts across a push', () => {
         body: JSON.stringify(draftBody(4)),
       });
       expect(late.status).toBe(409);
-      expect((await fetch(`${staleTab}/api/draft`)).status).toBe(404);
+      expect((await fetch(`${staleTab}/api/draft`)).status).toBe(204);
     });
     await withSession(PATCH_AFTER_PUSH, prMetadata, async (url) => {
       const res = await fetch(`${url}/api/draft`);
-      expect(res.status).toBe(404);
-      expect((await res.json()).draftGeneration).toBe(4);
+      expect(res.status).toBe(204);
+      expect(Number(res.headers.get("Plannotator-Draft-Generation"))).toBe(4);
     });
   });
 });
 
-describe('local reviews are unchanged', () => {
-  test('a changed local diff still misses the draft, and only the content-hash file is written', async () => {
+describe('platform commands', () => {
+  test('a PR session runs its gh commands through the fake runtime, not a process', async () => {
+    sandbox();
+    await withSession(PATCH_BEFORE_PUSH, prMetadata, (url) => saveDraft(url, 3));
+    const commands = prCommands!.calls.map((call) => [call.cmd, ...call.args].join(' '));
+    expect(commands).toContain('gh api user --jq .login --hostname github.invalid');
+  });
+});
+
+describe('reviews without a Git identity', () => {
+  test('a changed static diff still misses the draft, and only the content-hash file is written', async () => {
     const dataDir = sandbox();
     await withSession(PATCH_BEFORE_PUSH, undefined, (url) => saveDraft(url, 3));
     const files = readdirSync(join(dataDir, 'drafts'));
     expect(files).toHaveLength(1);
     expect(files[0]).toMatch(/^[0-9a-f]{16}\.json$/);
     await withSession(PATCH_AFTER_PUSH, undefined, async (url) => {
-      expect((await fetch(`${url}/api/draft`)).status).toBe(404);
+      expect((await fetch(`${url}/api/draft`)).status).toBe(204);
     });
   });
 });
@@ -234,10 +252,10 @@ describe('in-place PR switches', () => {
     });
     // A teammate pushes to #42; reopening it must not offer the submitted comments.
     await withSession(PATCH_AFTER_PUSH, prMetadata, async (url) => {
-      expect((await fetch(`${url}/api/draft`)).status).toBe(404);
+      expect((await fetch(`${url}/api/draft`)).status).toBe(204);
     });
     await withSession(PATCH_PR_43, pr43, async (url) => {
-      expect((await fetch(`${url}/api/draft`)).status).toBe(404);
+      expect((await fetch(`${url}/api/draft`)).status).toBe(204);
     });
   });
 

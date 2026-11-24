@@ -7,16 +7,16 @@
  * and Chromium drives the window.
  *
  * Proves: the tiles at the foot of the thread; the markdown plan beside the
- * thread with Full screen, drawn in Plannotator's plan look (Grid by default,
- * Clean under the `plannotator-grid-enabled=false` cookie), a selection comment listed in the reply box's
+ * thread with Full screen, always drawn in the Clean look (plan review's Grid
+ * setting is not read), a selection comment listed in the reply box's
  * annotations chip; the HTML prototype full screen with its relative image
  * resolved, its iframe loading the sibling page (never the Inbox, #1554), the
  * frame unable to read the Inbox API, a marker pinned on "Retry all"; leaving
  * full screen keeps the file beside the thread with `‹ Inbox` leading its
  * header, which closes the file and brings the list back (focus on its row); a node
  * comment on a Mermaid diagram; the file edited on disk and the changed line,
- * with "Open the version it sent" showing the bytes sent; Send carrying the
- * picks and the annotations, read back by wait_for_reply; a path outside the
+ * with "View sent version" showing the bytes sent; Send carrying the
+ * picks and the annotations, read back by read_thread; a path outside the
  * project, a symlink retargeted to a directory, `.env` and a request by path
  * each refused; delete thread removing its blobs and the store size falling.
  *
@@ -25,12 +25,14 @@
  * .local/proof/attachments/ with a contact sheet.
  */
 
-import { expect, test, type Browser, type BrowserContext, type FrameLocator, type Page } from '@playwright/test';
+import { expect, test, type Browser, type BrowserContext, type FrameLocator, type Page } from './inbox-test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync, appendFileSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DEMO_MESSAGES, SimAgent, scratchProject } from '../../scripts/inbox-sim';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { forgetFileViewChoice } from './file-view';
+import { cutInHeadRow } from './head-row';
 
 const repo = resolve(__dirname, '../..');
 const builtBinary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
@@ -154,9 +156,13 @@ function pageFrame(page: Page): FrameLocator {
   return page.frameLocator('[data-attachment-pane] iframe').first();
 }
 
-/** Plannotator's comment composer (CommentPopover), once it is open. */
+/**
+ * Plannotator's comment composer (CommentPopover), once it is open. Scoped to
+ * the popover: the reply box is the same composer textarea (ComposerTokenTextarea)
+ * and can come later in the DOM.
+ */
 function composer(page: Page) {
-  return page.locator('textarea[data-pn-mobile-editable="true"]').last();
+  return page.locator('[data-comment-popover] textarea[data-pn-mobile-editable="true"]').last();
 }
 
 /** Drag-select `text` inside the open markdown document with the real mouse. */
@@ -196,7 +202,7 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   const dataDir = join(root, 'data');
   const home = join(root, 'home');
   mkdirSync(home);
-  const env = { PATH: process.env.PATH ?? '', HOME: home, PLANNOTATOR_DATA_DIR: dataDir };
+  const env = { PATH: process.env.PATH ?? '', HOME: home, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_DATA_DIR: dataDir };
   const started = spawnSync(builtBinary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   const url = started.stdout.trim();
@@ -236,6 +242,9 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
     attachments: {},
   };
 });
+
+/** A view pressed in a test is remembered: forgotten after each, so the next opens by today's rule (file-view.ts). */
+test.afterEach(async () => forgetFileViewChoice(world?.page));
 
 test.afterAll(async () => {
   try {
@@ -349,51 +358,58 @@ test('the thread shows its attachments at the foot; the plan opens beside the th
   expect(page.url()).toContain(`file=${world.attachments.plan}`);
 });
 
-test("the plan follows Plannotator's look: Grid (the default) is the card on the grid paper, Clean the document edge to edge", async () => {
+test('the plan is always the Clean look: the document edge to edge on the card colour, even with Grid chosen in plan review', async () => {
   const page = world.page;
   const pane = page.locator(`[data-attachment-pane="${world.attachments.plan}"]`);
   const scroll = pane.locator('.ib-docscroll');
   const article = scroll.locator('article');
-  // No choice made: the registry's default, Grid (the store writes the default back as the cookie on first read), drawn with plan review's classes.
-  const seeded = (await world.context.cookies()).find((c) => c.name === 'plannotator-grid-enabled');
-  expect(seeded?.value ?? 'true').toBe('true');
-  await expect(scroll).toHaveAttribute('data-look', 'grid');
-  await expect(scroll).toHaveClass(/\bbg-grid\b/);
-  await expect(article).toHaveClass(/\bshadow-xl\b/);
-  await expect(article).toHaveClass(/\bborder\b/);
-  await shot('2.1b-plan-look-grid');
+  const isClean = async () => {
+    await expect(scroll).toHaveAttribute('data-look', 'clean');
+    await expect(scroll).toHaveClass(/\bbg-card\b/);
+    await expect(scroll).not.toHaveClass(/\bbg-grid\b/);
+    await expect(article).not.toHaveClass(/\bshadow-xl\b/);
+    await expect(article).toContainText('Retry worker for Stripe 409s');
+    const [scrollBg, articleBg] = await Promise.all([scroll, article].map((l) => l.evaluate((el) => getComputedStyle(el).backgroundColor)));
+    expect(articleBg).toBe(scrollBg);
+  };
+  await isClean();
+  await shot('2.1b-plan-look-clean');
 
-  // The cookie Plannotator's Settings writes for "Clean": the same pane draws the flat document on the card colour.
-  await world.context.addCookies([{ name: 'plannotator-grid-enabled', value: 'false', url: world.url }]);
+  // The cookie plan review's Settings writes for "Grid" changes nothing here.
+  await world.context.addCookies([{ name: 'plannotator-grid-enabled', value: 'true', url: world.url }]);
   await page.reload();
-  await expect(scroll).toHaveAttribute('data-look', 'clean');
-  await expect(scroll).toHaveClass(/\bbg-card\b/);
-  await expect(article).not.toHaveClass(/\bshadow-xl\b/);
-  await expect(article).toContainText('Retry worker for Stripe 409s');
-  const [scrollBg, articleBg] = await Promise.all([scroll, article].map((l) => l.evaluate((el) => getComputedStyle(el).backgroundColor)));
-  expect(articleBg).toBe(scrollBg);
-  await shot('2.1c-plan-look-clean');
-
-  // Back to the default for the rest of the proof.
+  await isClean();
   await world.context.clearCookies({ name: 'plannotator-grid-enabled' });
   await page.reload();
-  await expect(scroll).toHaveAttribute('data-look', 'grid');
+  await expect(scroll).toBeVisible();
+});
+
+test('selecting text in a Markdown attachment offers Comment and Looks good, never a quick label', async () => {
+  const page = world.page;
+  await selectText(page, 'retries them one by one');
+  const toolbar = page.locator('.annotation-toolbar');
+  await expect(toolbar.locator('button[aria-label="Comment"]')).toBeVisible();
+  await expect(toolbar.locator('button[aria-label="Looks good"]')).toBeVisible();
+  await expect(toolbar.locator('button[aria-label="Quick label"]')).toHaveCount(0);
+  await shot('2.1c-attachment-toolbar-no-quick-label');
+  await page.keyboard.press('Escape');
+  await expect(toolbar).toHaveCount(0);
 });
 
 test('a selection comment on the plan is saved and listed in the reply box chip', async () => {
   const page = world.page;
   const pane = page.locator(`[data-attachment-pane="${world.attachments.plan}"]`);
   await selectText(page, 'retries them one by one');
-  await page.locator('button[title="Comment"]').click();
+  await page.locator('.annotation-toolbar button[aria-label="Comment"]').click();
   await composer(page).fill('One by one is right. Keep Retry all out of v1.');
-  await page.getByRole('button', { name: 'Save' }).click();
+  await page.locator('[data-comment-popover]').getByRole('button', { name: 'Comment', exact: true }).click();
   await expect(pane.locator('.ib-apanel')).toContainText('One by one is right');
 
   await selectText(page, 'at most three times, 2, 4 and 8 seconds apart');
-  await page.locator('button[title="Comment"]').click();
+  await page.locator('.annotation-toolbar button[aria-label="Comment"]').click();
   await composer(page).fill('Does Stripe say how long a key stays in flight? If it can be longer than 14 seconds the third retry still collides.');
   await shot('2.2-selection-comment-beside-the-thread');
-  await page.getByRole('button', { name: 'Save' }).click();
+  await page.locator('[data-comment-popover]').getByRole('button', { name: 'Comment', exact: true }).click();
   await expect(pane.locator('.ib-apanel')).toContainText('Does Stripe say');
 
   // Stored per attachment and version, in the project's annotations.jsonl.
@@ -405,17 +421,21 @@ test('a selection comment on the plan is saved and listed in the reply box chip'
 
   await pane.getByRole('button', { name: 'Full screen' }).click();
   await expect(pane).toHaveClass(/ib-full/);
-  await expect(pane.locator('[data-strip-chip]')).toHaveText('2 annotations');
+  await expect(pane.locator('[data-strip-chip]')).toContainText('2 annotations ride your next Send');
   await shot('2.3-full-screen-annotation-mode');
-  await pane.getByRole('button', { name: 'Exit full screen' }).click();
+  await pane.getByRole('button', { name: 'Side by side' }).click();
   await expect(pane).not.toHaveClass(/ib-full/);
 
-  // The chip inside the reply box lists each annotation with its file, quote and comment.
+  // The reply box lists each annotation with its file, quote and comment. Beside the file (the 440 px thread column)
+  // the two open questions and "2 comments" do not fit beside Send and its tools as chips, so they are the one summary
+  // line (approval "inbox-reply-box", D4), and with questions too its sheet's Review opens the list.
   await page.getByRole('button', { name: 'Reply', exact: true }).click();
-  const chip = page.locator('[data-annotations-chip]');
-  await expect(chip).toHaveText('2 annotations');
-  await chip.click();
-  const pop = page.getByRole('dialog', { name: '2 annotations ride this reply' });
+  const line = page.locator('section.ib-pane .ib-rbox [data-foot-summary]');
+  await expect(line).toContainText('2 comments');
+  await expect(page.locator('section.ib-pane .ib-rbox [data-annotations-chip]')).toHaveCount(0);
+  await line.click();
+  await page.getByRole('dialog', { name: 'Goes with this reply' }).getByRole('button', { name: 'Review comments' }).click();
+  const pop = page.getByRole('dialog', { name: '2 comments' });
   await expect(pop.locator('[data-annotation-row]')).toHaveCount(2);
   await expect(pop.locator('[data-annotation-row]').first()).toContainText('retry-plan.md');
   await expect(pop.locator('[data-annotation-row]').first()).toContainText('"retries them one by one"');
@@ -433,9 +453,9 @@ test('the HTML prototype opens full screen: its image and frame load from its fo
   await page.getByRole('button', { name: 'Open admin-view.html' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.html}"]`);
   await expect(pane).toBeVisible();
-  // HTML opens in the annotation mode by default: full screen, Exit full screen offered.
+  // HTML opens full screen by default, Side by side offered.
   await expect(pane).toHaveClass(/ib-full/);
-  await expect(pane.getByRole('button', { name: 'Exit full screen' })).toBeVisible();
+  await expect(pane.getByRole('button', { name: 'Side by side' })).toBeVisible();
   const frame = pageFrame(page);
   await expect(frame.locator('#retry-all')).toHaveText('Retry all (40)');
   // The relative image resolved against the file's own folder.
@@ -447,20 +467,49 @@ test('the HTML prototype opens full screen: its image and frame load from its fo
   // The page's script could not read the Inbox API from its sandboxed frame.
   await expect(frame.locator('#probe')).toHaveText('inbox api refused');
 
-  // Pinpoint is armed: a click on the button pins a comment to it.
+  // It opens in Interact; with Annotate on, a click on the button pins a comment to it.
+  await expect(page.locator('[data-full-view-pen]')).toHaveAttribute('aria-pressed', 'false');
+  await page.locator('[data-full-view-pen]').click();
+  await expect(page.locator('[data-full-view-pen]')).toHaveAttribute('aria-pressed', 'true');
   await frame.locator('#retry-all').click();
   await composer(page).fill('Retry all should ask first. Forty charges at once is a lot to undo.');
-  await page.getByRole('button', { name: 'Save' }).click();
+  await page.locator('[data-comment-popover]').getByRole('button', { name: 'Comment', exact: true }).click();
   await expect(pane.locator('.ib-apanel')).toContainText('Retry all should ask first');
   const model = (await (await inboxFetch(`/api/inbox/threads/${world.threads.billing}/attachments`)).json()) as {
     annotations: { attachment_id: string; annotation: { htmlAnchor?: { tagName: string }; elementContext?: { tag: string } } }[];
   };
   const pin = model.annotations.find((a) => a.attachment_id === world.attachments.html)!;
   expect(pin.annotation.htmlAnchor?.tagName.toLowerCase()).toBe('button');
-  await expect(pane.locator('[data-strip-chip]')).toHaveText('3 annotations');
+  await expect(pane.locator('[data-strip-chip]')).toContainText('3 annotations ride your next Send');
   await shot('2.4-html-full-screen-marker-pinned');
 
-  await pane.getByRole('button', { name: 'Exit full screen' }).click();
+  // "Open in" → Browser (the split button's left half on an HTML file): the page in
+  // a tab of its own, from its own folder, under the same sandbox. Only the new tab
+  // is driven here; no app is ever launched by this spec.
+  // Full screen has no header: Open in is in the toolbar's ⋯.
+  await pane.locator('[data-full-view-more]').click();
+  const [tab] = await Promise.all([world.context.waitForEvent('page'), page.locator(`[data-full-view-menu="${world.attachments.html}"] [data-open-in-item="browser"]`).click()]);
+  await tab.waitForLoadState();
+  expect(new URL(tab.url()).pathname).toMatch(/^\/api\/html-assets\/[0-9a-f]{16}\/admin-view\.html$/);
+  await expect(tab.locator('#retry-all')).toHaveText('Retry all (40)');
+  await expect.poll(() => tab.locator('#badge').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(88);
+  await expect(tab.frameLocator('#detail').locator('#detail-text')).toHaveText("Charge detail from the attachment's own folder");
+  // Opaque origin, no network: the page still cannot read the Inbox.
+  await expect(tab.locator('#probe')).toHaveText('inbox api refused');
+  // Top-level, the page's response CSP is its only sandbox: navigating its own tab
+  // to a sibling SVG must not escape it. The SVG carries its own sandbox, so its
+  // script never runs and the Inbox API is never reached from this origin.
+  writeFileSync(
+    join(world.billing, 'proto', 'escape.svg'),
+    `<svg xmlns="http://www.w3.org/2000/svg"><text id="t" y="20">svg</text><script>document.documentElement.setAttribute('data-ran','yes');fetch('/api/inbox/threads').then(function(){document.documentElement.setAttribute('data-read','yes')})</script></svg>`,
+  );
+  const escape = await tab.goto(new URL('escape.svg', tab.url()).href);
+  expect(escape!.headers()['content-security-policy']).toBe("sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:");
+  await tab.waitForTimeout(300);
+  expect(await tab.evaluate(() => [document.documentElement.getAttribute('data-ran'), document.documentElement.getAttribute('data-read')])).toEqual([null, null]);
+  await tab.close();
+
+  await pane.getByRole('button', { name: 'Side by side' }).click();
   await expect(pane).not.toHaveClass(/ib-full/);
   await pane.getByRole('button', { name: 'Close admin-view.html' }).click();
   await expect(pane).toHaveCount(0);
@@ -468,18 +517,38 @@ test('the HTML prototype opens full screen: its image and frame load from its fo
 });
 
 /**
- * The open reply box's chips (picks, skip, annotations): each inside the box,
- * none overflowing its own box, each label on one line. Problems as text, so a
- * failure names the chip.
+ * The open reply box's row on a computer (approval "inbox-reply-box", T6, decision D4): one row inside the box, and
+ * what goes with the reply as chips (picks, skip, annotations) when they fit, else as the one summary line. Each chip
+ * inside the box, none overflowing its own box, each label on one line; the summary line on one line, inside the row.
+ * Problems as text, so a failure names the chip.
  */
 async function replyChipProblems(page: Page, sentenceMayWrap = false): Promise<string[]> {
   return page.evaluate((sentenceMayWrap) => {
     const box = [...document.querySelectorAll<HTMLElement>('section.ib-pane .ib-rbox')].find((b) => b.getClientRects().length > 0);
     if (!box) return ['no reply box on screen'];
     const outer = box.getBoundingClientRect();
-    const chips = [...box.querySelectorAll<HTMLElement>('.ib-rfoot .ib-rchip, .ib-rfoot .ib-skipchip')];
-    if (chips.length < 2) return [`expected at least two chips, found ${chips.length}`];
+    const row = box.querySelector<HTMLElement>('[data-reply-row]');
+    if (!row) return ['no row in the reply box'];
     const problems: string[] = [];
+    const controls = [...row.querySelectorAll<HTMLElement>('button, label')].filter((el) => el.getClientRects().length > 0);
+    const middles = controls.map((el) => {
+      const r = el.getBoundingClientRect();
+      const name = el.getAttribute('aria-label') ?? el.textContent?.trim() ?? '?';
+      if (r.left < outer.left - 0.5 || r.right > outer.right + 0.5) problems.push(`"${name}" leaves the reply box`);
+      return { name, middle: r.top + r.height / 2 };
+    });
+    for (const m of middles) if (Math.abs(m.middle - middles[0]!.middle) > 2) problems.push(`"${m.name}" is not on the row`);
+    const summary = row.querySelector<HTMLElement>('[data-foot-summary-text]');
+    if (summary) {
+      const range = document.createRange();
+      range.selectNodeContents(summary);
+      const tops = new Set([...range.getClientRects()].filter((r) => r.width > 0).map((r) => Math.round(r.top)));
+      if (tops.size > 1) problems.push('the summary line breaks across lines');
+      if (row.querySelector('.ib-rchips')) problems.push('both the chips and the summary line');
+      return problems;
+    }
+    const chips = [...row.querySelectorAll<HTMLElement>('.ib-rchips .ib-rchip, .ib-rchips .ib-skipchip')];
+    if (chips.length < 2) return [...problems, `expected at least two chips or the summary line, found ${chips.length} chips`];
     for (const chip of chips) {
       const name = chip.textContent?.replace(/\s+/g, ' ').trim() ?? '?';
       const r = chip.getBoundingClientRect();
@@ -496,6 +565,46 @@ async function replyChipProblems(page: Page, sentenceMayWrap = false): Promise<s
     }
     return problems;
   }, sentenceMayWrap);
+}
+
+/**
+ * A phone's open reply box (approval "inbox-reply-box", T6): no chip; the line naming the questions and comments on its
+ * own line over the row, its words on one line; the row (paperclip, Skills, who gets the reply in a thread with several
+ * agents, mic, Send) one row inside the box. Problems as text. `narrow`: a box far narrower than its row, where Send and the mic must still be inside it.
+ */
+async function phoneFootProblems(page: Page, narrow = false): Promise<string[]> {
+  return page.evaluate((narrow) => {
+    const box = [...document.querySelectorAll<HTMLElement>('section.ib-pane .ib-rbox')].find((b) => b.getClientRects().length > 0);
+    if (!box) return ['no reply box on screen'];
+    const row = box.querySelector<HTMLElement>('[data-reply-row][data-phone]');
+    if (!row) return ['no phone row in the reply box'];
+    const foot = box.querySelector<HTMLElement>('[data-reply-line]');
+    if (!foot) return ['no line over the row'];
+    const problems: string[] = [];
+    if (box.querySelector('.ib-rchip:not(.ib-rfilesn), .ib-skipchip')) problems.push('a chip in the phone box');
+    const outer = box.getBoundingClientRect();
+    if (!foot.querySelector('[data-foot-summary]')) problems.push('no line for the questions and comments');
+    const lineBox = foot.getBoundingClientRect();
+    if (lineBox.left < outer.left - 0.5 || lineBox.right > outer.right + 0.5) problems.push('the line leaves the reply box');
+    const kept = narrow ? '[data-reply-send], [data-voice-mic]' : 'button, label';
+    const controls = [...row.querySelectorAll<HTMLElement>(kept)].filter((el) => el.getClientRects().length > 0);
+    if (!controls.some((el) => el.matches('[data-reply-send]'))) problems.push('no Send in the row');
+    const middles = controls.map((el) => {
+      const r = el.getBoundingClientRect();
+      const name = el.getAttribute('aria-label') ?? el.textContent?.trim() ?? '?';
+      if (r.left < outer.left - 0.5 || r.right > outer.right + 0.5) problems.push(`"${name}" leaves the reply box`);
+      return { name, middle: r.top + r.height / 2 };
+    });
+    for (const m of middles) if (Math.abs(m.middle - middles[0]!.middle) > 2) problems.push(`"${m.name}" is not on the row`);
+    const text = foot.querySelector('[data-foot-summary-text]');
+    if (text) {
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      const tops = new Set([...range.getClientRects()].filter((r) => r.width > 0).map((r) => Math.round(r.top)));
+      if (tops.size > 1) problems.push('the line breaks across lines');
+    }
+    return problems;
+  }, narrow);
 }
 
 /** Wait until the open reply box keeps its place and size for 150 ms: the layout a new window size settles on. */
@@ -519,14 +628,21 @@ async function replyBoxSettled(page: Page): Promise<void> {
 }
 
 /**
- * The "N annotations ride this reply" list, opened from the reply box's chip:
+ * The list of comments, opened from the reply box's chip:
  * inside the window (its close button too), and every quote and comment
  * wrapped inside the list, the long ones over more than one line.
  */
 async function annotationListProblems(page: Page, shotName?: string): Promise<string[]> {
-  const chip = page.locator('section.ib-pane .ib-rfoot [data-annotations-chip]');
-  await chip.click();
-  const list = page.getByRole('dialog', { name: /ride this reply/ });
+  const chip = page.locator('section.ib-pane .ib-rbox [data-annotations-chip]');
+  if (await chip.count()) await chip.click();
+  else {
+    // The summary line (a phone, or a computer row too narrow for the chips), then (with questions too) its sheet's
+    // Review (approval "inbox-reply-foot-phone"; "inbox-reply-box", D4).
+    await page.locator('section.ib-pane .ib-rbox [data-foot-summary]').click();
+    const sheet = page.getByRole('dialog', { name: 'Goes with this reply' });
+    if (await sheet.count()) await sheet.getByRole('button', { name: 'Review comments' }).click();
+  }
+  const list = page.getByRole('dialog', { name: /^\d+ comments?$/ });
   await expect(list).toBeVisible();
   const problems = await list.evaluate((pop) => {
     const out: string[] = [];
@@ -551,15 +667,17 @@ async function annotationListProblems(page: Page, shotName?: string): Promise<st
   return problems;
 }
 
-test("the reply box's chips wrap inside it beside a file, stacked and on a phone; no chip breaks its own label", async () => {
+test("the reply box's chips wrap inside it beside a file and stacked, a phone's foot is one row; no chip breaks its own label", async () => {
   const page = world.page;
   // The reply box is open (picks, the skip chip, 3 annotations) from the tests above.
   await page.getByRole('button', { name: 'Open admin-view.html' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.html}"]`);
-  await pane.getByRole('button', { name: 'Exit full screen' }).click();
+  await pane.getByRole('button', { name: 'Side by side' }).click();
   await expect(pane).not.toHaveClass(/ib-full/);
-  // The 440 px thread column beside the file.
-  await expect(page.locator('section.ib-pane .ib-rfoot [data-annotations-chip]')).toHaveText('3 annotations');
+  // The 440 px thread column beside the file: the picks, the skip chip and "3 comments" do not fit beside Send and
+  // its tools, so they fold into the one summary line (approval "inbox-reply-box", D4), which names the comments.
+  await expect(page.locator('section.ib-pane .ib-rbox [data-foot-summary]')).toContainText('3 comments');
+  await expect(page.locator('section.ib-pane .ib-rbox [data-annotations-chip]')).toHaveCount(0);
   expect(await replyChipProblems(page)).toEqual([]);
   expect(await annotationListProblems(page)).toEqual([]);
   await pane.getByRole('button', { name: 'Close admin-view.html' }).click();
@@ -573,32 +691,37 @@ test("the reply box's chips wrap inside it beside a file, stacked and on a phone
       { width: 390, height: 844, phone: true },
       { width: 320, height: 640, phone: true },
     ]) {
+      // Out of the row's middle cell first: the list's Escape puts focus back on its chip, and the row holds its fit
+      // while the person is in that cell (ReplyRow.tsx), so the new size would be fitted only once focus left it.
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
       await page.setViewportSize({ width: size.width, height: size.height });
       await expect(page.locator('section.ib-pane .ib-rbox').filter({ visible: true })).toHaveCount(1);
       // Measure the layout this size settles on, not the frame before the window's own resize reaches React
       // (the docked sidebar still beside a 134 px reply box at 390 px; the narrow-box step below proves that frame).
       await replyBoxSettled(page);
-      expect(await replyChipProblems(page, 'phone' in size), `${size.width} by ${size.height}`).toEqual([]);
+      // A phone draws no chips: one line over the row, then the paperclip, Skills, the mic and Send (approval "inbox-reply-box").
+      expect(await ('phone' in size ? phoneFootProblems(page) : replyChipProblems(page)), `${size.width} by ${size.height}`).toEqual([]);
       expect(await annotationListProblems(page, size.width === 1440 ? '2.4f-annotation-list-inside-the-window' : undefined), `the list at ${size.width} by ${size.height}`).toEqual([]);
       if (size.width === 1440) {
-        // The two-pane desktop draws the chips as before: one row, each 26 px tall.
-        const rows = await page.locator('section.ib-pane .ib-rfoot > *').evaluateAll((els) =>
+        // The two-pane desktop has room for the chips: one row, each 26 px tall.
+        const rows = await page.locator('section.ib-pane [data-reply-row] .ib-rchips > *').evaluateAll((els) =>
           els.map((el) => {
             const chip = (el.matches('.ib-annchip') ? el.firstElementChild! : el).getBoundingClientRect();
             return { top: Math.round(chip.top), height: Math.round(chip.height) };
           }),
         );
+        expect(rows.length).toBeGreaterThanOrEqual(2);
         expect(new Set(rows.map((r) => r.top)).size).toBe(1);
         expect(rows.every((r) => r.height === 26)).toBe(true);
       }
       if (size.width === 390) {
         await page.locator('section.ib-pane .ib-rbox').filter({ visible: true }).scrollIntoViewIfNeeded();
         await shot('2.4e-reply-chips-phone');
-        // A reply box narrower than the skip chip's sentence and its button side by side (on CI, the frame after a
-        // resize to 390 px before the phone layout lands): the chip wraps inside itself, whatever the font's metrics.
+        // A reply box far narrower than its line (on CI, the frame after a resize to 390 px before the layout settles):
+        // the row stays one row inside the box, the line cut short rather than pushed out.
         const narrow = await page.addStyleTag({ content: 'section.ib-pane .ib-rbox { width: 134px !important; }' });
         try {
-          expect(await replyChipProblems(page, true), 'a 134 px reply box').toEqual([]);
+          expect(await phoneFootProblems(page, true), 'a 134 px reply box').toEqual([]);
           await shot('2.4h-reply-chips-narrow-box');
         } finally {
           await narrow.evaluate((el) => el.remove());
@@ -622,16 +745,19 @@ test('leaving full screen keeps the file beside the thread with ‹ Inbox leadin
   await page.getByRole('button', { name: 'Open admin-view.html' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.html}"]`);
   await expect(pane).toHaveClass(/ib-full/);
-  const exit = pane.getByRole('button', { name: 'Exit full screen' });
+  const exit = pane.getByRole('button', { name: 'Side by side' });
   await exit.focus();
   await page.keyboard.press('Enter');
   await expect(pane).not.toHaveClass(/ib-full/);
-  // Focus stays on the toggle, now Full screen; the way back is in view at the top left, ahead of Archive.
-  await expect(pane.getByRole('button', { name: 'Full screen' })).toBeFocused();
+  // Focus on the header switch's Side by side, now pressed; the way back is in view at the top left, ahead of Mark read; Archive ends the header.
+  await expect(pane.getByRole('button', { name: 'Side by side' })).toBeFocused();
   await expect(back).toBeVisible();
   await expect(back).toHaveAccessibleName('Back to Inbox');
   await expect(back).toHaveText('Inbox');
   await expect(thread.locator('.ib-phead > *').first()).toHaveAttribute('data-file-back', '');
+  // Archive, then ⋯ More (the copy menu, design record "inbox-copy-message"), end the header.
+  await expect(thread.locator('.ib-phead > *').last()).toHaveAttribute('data-thread-more', '');
+  await expect(thread.locator('.ib-phead [data-archive]')).toHaveCount(0);
   await expect(thread.getByRole('button', { name: 'Close the thread' })).toHaveCount(0);
   await expect(nav).toBeHidden();
   await expect(page.locator('.ib-listcol')).toHaveCount(0);
@@ -772,7 +898,7 @@ test('a click on the tile itself, its name rather than Open, opens the file', as
   await expect(pane).toHaveCount(0);
 });
 
-test('the agent edits the plan on disk: the changed line, the annotations survive, and "Open the version it sent" shows the bytes sent', async () => {
+test('the agent edits the plan on disk: the changed line, the annotations survive, and "View sent version" shows the bytes sent', async () => {
   const page = world.page;
   appendFileSync(join(world.billing, 'docs', 'retry-plan.md'), '\n## Open questions\n\nHow long does Stripe keep a key in flight?\n');
   await page.goto(`${world.url}#thread=${world.threads.billing}`);
@@ -780,8 +906,8 @@ test('the agent edits the plan on disk: the changed line, the annotations surviv
   await page.getByRole('button', { name: 'Open retry-plan.md' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.plan}"]`);
   const line = pane.locator('[data-changed-line]');
-  await expect(line).toContainText('Changed since Claude Code sent it at');
-  await expect(line).toContainText('Edited');
+  await expect(line).toContainText('Viewing the current file (edited ');
+  await expect(line).toContainText('. Claude Code sent an earlier version at ');
   await expect(pane.locator('.ib-docscroll')).toContainText('How long does Stripe keep a key in flight?');
   // Both comments still sit on their text in the edited file.
   await expect(pane.locator('.ib-apanel')).toContainText('One by one is right');
@@ -790,9 +916,9 @@ test('the agent edits the plan on disk: the changed line, the annotations surviv
   await expect(pane.locator('.ib-docscroll mark, .ib-docscroll [data-highlight-id]').first()).toBeVisible();
   await shot('2.2-changed-line');
 
-  await line.getByRole('button', { name: 'Open the version it sent' }).click();
+  await line.getByRole('button', { name: 'View sent version' }).click();
   await expect(pane).toHaveAttribute('data-version', 'sent');
-  await expect(pane.locator('[data-changed-line]')).toContainText('The version Claude Code sent at');
+  await expect(pane.locator('[data-changed-line]')).toContainText('Viewing the version Claude Code sent at');
   await expect(pane.locator('.ib-docscroll')).toContainText('Refund handling and the 402 path stay as they are.');
   await expect(pane.locator('.ib-docscroll')).not.toContainText('How long does Stripe keep a key in flight?');
   expect(page.url()).toContain('v=sent');
@@ -800,7 +926,7 @@ test('the agent edits the plan on disk: the changed line, the annotations surviv
   expect(await (await inboxFetch(`/api/inbox/attachments/${world.attachments.plan}?version=sent`)).text()).toBe(PLAN);
   expect(await (await inboxFetch(`/api/inbox/attachments/${world.attachments.plan}`)).text()).toContain('## Open questions');
   await shot('2.2-the-version-it-sent');
-  await pane.locator('[data-changed-line]').getByRole('button', { name: 'Open the file as it is now' }).click();
+  await pane.locator('[data-changed-line]').getByRole('button', { name: 'View current file' }).click();
   await expect(pane).toHaveAttribute('data-version', 'current');
   await pane.getByRole('button', { name: 'Close retry-plan.md' }).click();
 });
@@ -837,28 +963,45 @@ test('the header says the message has files: its count opens the same tiles unde
   // The keyboard opens it again; a tile there opens the file beside the thread, as the foot's does.
   await page.keyboard.press('Enter');
   await expect(band).toBeVisible();
+  // The band slides in (`ib-hatts-in`, 180 ms). A click while it moves finds the tile "not stable", and Playwright's
+  // fourth try scrolls it to the top of the thread first (`block: 'start'`), the sender row out of view, before the
+  // file opens (#3528 CI: scrollTop 17 to 62, no scroll by the page). Settled, the click is a person's: nothing scrolls.
+  await band.evaluate((el) => Promise.all(el.getAnimations().map((animation) => animation.finished)));
   await band.getByRole('button', { name: 'Open retry-plan.md' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.plan}"]`);
   await expect(pane).toBeVisible();
   expect(page.url()).toContain(`file=${world.attachments.plan}`);
+  // The thread beside the file is 440 px: the head row goes to two lines, and the count is drawn whole (inbox-polish, item 5).
+  expect(Math.round((await page.locator('section.ib-pane').first().boundingBox())!.width)).toBe(440);
+  expect(await cutInHeadRow(count)).toBeNull();
+  expect(await cutInHeadRow(count.locator('.ib-hflag'))).toBeNull();
   await pane.getByRole('button', { name: 'Close retry-plan.md' }).click();
   await expect(pane).toHaveCount(0);
   await count.click();
   await expect(band).toBeHidden();
+  // A thread pane of about 568 px (a 1180 px window beside the list): still whole.
+  await page.setViewportSize({ width: 1180, height: 900 });
+  try {
+    await expect.poll(async () => Math.round((await page.locator('section.ib-pane').boundingBox())!.width)).toBeLessThan(600);
+    expect(await cutInHeadRow(count)).toBeNull();
+    expect(await cutInHeadRow(count.locator('.ib-hflag'))).toBeNull();
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 900 });
+  }
 });
 
-test('Send carries the picks and then the annotations as feedback; wait_for_reply returns both', async () => {
+test('Send carries the picks and then the annotations as feedback; read_thread returns both', async () => {
   const page = world.page;
   await page.getByRole('radio', { name: /Retry with the same idempotency key/ }).click();
   await page.getByRole('radio', { name: /^Yes/ }).click();
-  await expect(page.locator('.ib-pfoot')).toContainText('Not sent');
-  await page.getByRole('button', { name: 'Edit the reply' }).click();
+  await expect(page.locator('.ib-pfoot [data-draft-foot]')).toContainText('Draft');
+  await page.getByRole('button', { name: 'Edit draft' }).click();
   await expect(page.locator('[data-picks-chip]')).toHaveText('2 picks');
   const chip = page.locator('[data-annotations-chip]');
-  await expect(chip).toHaveText('3 annotations');
+  await expect(chip).toHaveText('3 comments');
   await shot('2.6-picks-and-annotations-ride-the-reply');
   await chip.click();
-  const pop = page.getByRole('dialog', { name: '3 annotations ride this reply' });
+  const pop = page.getByRole('dialog', { name: '3 comments' });
   await expect(pop.locator('[data-annotation-row]')).toHaveCount(3);
   await expect(pop.locator('[data-annotation-row]').nth(2)).toContainText('admin-view.html');
   await expect(pop.locator('[data-annotation-row]').nth(2)).toContainText('button');
@@ -869,15 +1012,15 @@ test('Send carries the picks and then the annotations as feedback; wait_for_repl
   await pop.locator('[data-annotation-row]').nth(2).getByRole('button', { name: /admin-view\.html/ }).click();
   await expect(page.locator(`[data-attachment-pane="${world.attachments.html}"]`)).toBeVisible();
   expect(page.url()).toContain('at=');
+  // Full screen: Write the reply is in the comments drawer's foot (the drawer never opens by itself).
+  await page.locator(`[data-attachment-pane="${world.attachments.html}"] [data-full-view-comments]`).click();
   await page.locator(`[data-attachment-pane="${world.attachments.html}"]`).getByRole('button', { name: 'Write the reply' }).click();
   await expect(page.locator(`[data-attachment-pane="${world.attachments.html}"]`)).not.toHaveClass(/ib-full/);
 
-  const waiting = world.claude.waitForReply(world.threads.billing, 40);
   await page.getByRole('textbox', { name: 'Reply to Claude Code' }).fill('Two notes on the files below.');
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Send' }).click();
-  const reply = await waiting;
-  expect(reply.status).toBe('replied');
-  const body = reply.reply.body as string;
+  const reply = await world.claude.nextReply(world.threads.billing, 40);
+  const body = reply.body as string;
   // The picks first ...
   expect(body).toContain('Answered 2 questions.');
   expect(body).toContain('Two notes on the files below.');
@@ -890,9 +1033,6 @@ test('Send carries the picks and then the annotations as feedback; wait_for_repl
   expect(body).toContain('## proto/admin-view.html');
   expect(body).toContain('Retry all should ask first. Forty charges at once is a lot to undo.');
   expect(body).toContain('button');
-  // read_thread returns the same reply.
-  const thread = await world.claude.readThread(world.threads.billing);
-  expect(thread.messages.at(-1).body).toBe(body);
   // Sent annotations leave the chip and the tiles.
   await expect(page.locator('.ib-delivered')).toBeVisible();
   const after = (await (await inboxFetch(`/api/inbox/threads/${world.threads.billing}/attachments`)).json()) as { annotations: unknown[] };
@@ -915,7 +1055,7 @@ test('Settings: the store size counts the sent files; delete thread removes its 
   // Open docs-site's row and delete its thread (the diagram's blob goes with it).
   await page.locator('[data-store-project="docs-site"] .ib-fold').click();
   const row = page.locator(`[data-store-thread="${world.threads.docs}"]`);
-  await row.getByRole('button', { name: /Delete thread/ }).click();
+  await row.getByRole('button', { name: /Delete from Inbox/ }).click();
   await expect(row.getByRole('button', { name: /click again to delete/ })).toHaveText('Delete? Click again');
   await shot('7.1-settings-delete-asks-once-more');
   await row.getByRole('button', { name: /click again to delete/ }).click();
@@ -923,13 +1063,16 @@ test('Settings: the store size counts the sent files; delete thread removes its 
   await expect.poll(bytesOf).toBeLessThan(before);
   const blobsAfter = readdirSync(join(world.dataDir, 'inbox', 'blobs'));
   expect(blobsAfter).toHaveLength(2);
-  const flowSha = (await world.claude.readThread(world.threads.billing)).messages[0].attachments.map((a: { sent_sha256: string }) => a.sent_sha256);
+  // The sent versions' hashes, from the window's own route (read_thread leaves sha256s out).
+  const billingFiles = (await (await inboxFetch(`/api/inbox/threads/${world.threads.billing}/attachments`)).json()) as { attachments: { message_id: string; sent_sha256: string }[] };
+  const firstBilling = billingFiles.attachments[0]!.message_id;
+  const flowSha = billingFiles.attachments.filter((a) => a.message_id === firstBilling).map((a) => a.sent_sha256);
   expect(blobsAfter.sort()).toEqual([...flowSha].sort());
   expect((await inboxFetch(`/api/inbox/attachments/${world.attachments.flow}`)).status).toBe(404);
   await shot('7.1-settings-after-delete');
 
-  // Delete project removes the rest: the billing project and its two blobs.
-  await page.locator('[data-store-project="billing-svc"]').getByRole('button', { name: /Delete project/ }).click();
+  // The project's Delete removes the rest: the billing project and its two blobs.
+  await page.locator('[data-store-project="billing-svc"]').getByRole('button', { name: /Delete from Inbox/ }).click();
   await page.locator('[data-store-project="billing-svc"]').getByRole('button', { name: /click again to delete/ }).click();
   await expect(page.locator('[data-store-project="billing-svc"]')).toHaveCount(0);
   expect(readdirSync(join(world.dataDir, 'inbox', 'blobs'))).toHaveLength(0);

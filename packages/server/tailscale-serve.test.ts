@@ -12,9 +12,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { TailscaleRunResult } from "@plannotator/shared/tailscale";
 import {
+  announceTailscaleSession,
   disableTailscaleServe,
+  enableServeSteps,
   enableTailscaleServe,
   resetTailscaleServeForTests,
+  runTailscaleSteps,
+  runTailscaleStepsAsync,
+  takeDownOwnServeSteps,
 } from "./tailscale-serve";
 import { createRequestHostGuard } from "./request-host-guard";
 
@@ -130,6 +135,24 @@ describe("enableTailscaleServe", () => {
     expect(calls.at(-1)).toEqual(["serve", "--https=4321", "off"]);
   });
 
+  // What `tailscale serve` prints when Serve is off for the tailnet (its CLI
+  // prints the control server's text and link on stdout, then exits 0 or waits).
+  const SERVE_OFF = "\nServe is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=nABC\n\n";
+
+  test("Serve off for the tailnet, CLI exits 0: says so with Tailscale's link and takes nothing down", () => {
+    const { runner, calls } = makeRunner({ serve: { status: 0, stdout: SERVE_OFF, stderr: "" } });
+    expect(() => enableTailscaleServe(4321, runner)).toThrow(
+      /Serve is off for your tailnet[\s\S]*not a Plannotator bug[\s\S]*https:\/\/login\.tailscale\.com\/f\/serve\?node=nABC/,
+    );
+    expect(calls.some((args) => args.includes("off"))).toBe(false);
+  });
+
+  test("Serve off for the tailnet, CLI waits until we time out: the link it printed still reaches the user", () => {
+    const timedOut = Object.assign(new Error("spawnSync tailscale ETIMEDOUT"), { code: "ETIMEDOUT" });
+    const { runner } = makeRunner({ serve: { error: timedOut, status: null, stdout: SERVE_OFF, stderr: "" } });
+    expect(() => enableTailscaleServe(4321, runner)).toThrow(/Serve is off[\s\S]*f\/serve\?node=nABC/);
+  });
+
   test("a failed serve command reports the daemon detail", () => {
     const { runner } = makeRunner({
       serve: { status: 1, stdout: "", stderr: "invalid port" },
@@ -233,5 +256,141 @@ describe("enableTailscaleServe for the Inbox (8443, persisted, re-pointed)", () 
     const { runner, calls } = makeRunner({ status: { status: 0, stdout: mapped("http://127.0.0.1:3000"), stderr: "" } });
     expect(() => enableTailscaleServe(52900, runner, { httpsPort: 8443, ownTargets: ["http://127.0.0.1:52900"], persist: true })).toThrow(/already routes port 8443/);
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe("announceTailscaleSession", () => {
+  const withoutReadyFile = async (fn: () => Promise<void>): Promise<void> => {
+    const original = process.env.PLANNOTATOR_READY_FILE;
+    delete process.env.PLANNOTATOR_READY_FILE;
+    try {
+      await fn();
+    } finally {
+      if (original === undefined) delete process.env.PLANNOTATOR_READY_FILE;
+      else process.env.PLANNOTATOR_READY_FILE = original;
+    }
+  };
+
+  // The tailnet path used to print its own "served over your tailnet" block;
+  // with the shared ready line on every start it would have printed the URL
+  // twice. One ready line, then the tailnet line and the QR.
+  test("prints the ready line once, above the tailnet line, and opens no browser", async () => {
+    const url = "https://vps-1.tail1234.ts.net:4321";
+    const capture = captureStderr();
+    try {
+      await withoutReadyFile(() => announceTailscaleSession(url, 4321));
+    } finally {
+      capture.restore();
+    }
+    const output = capture.output();
+    // Literal text, not the constant (see shared-handlers.test.ts).
+    expect(output.split("Plannotator session ready: ").length - 1).toBe(1);
+    expect(output.split(url).length - 1).toBe(1);
+    expect(output).toContain(`\n  Plannotator session ready: ${url}\n`);
+    expect(output.indexOf("Plannotator session ready: ")).toBeLessThan(output.indexOf("Served over your tailnet"));
+    expect(output).not.toContain("Could not open a browser");
+  });
+});
+
+describe("the same calls, at once or without blocking", () => {
+  const outcome = async <T>(run: () => T | Promise<T>) => {
+    try {
+      return { ok: true, value: await run() };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
+    }
+  };
+
+  test("every sequence makes the same calls and answers the same, a runner that throws included", async () => {
+    const mapped = JSON.stringify({ TCP: { "8443": { HTTPS: true } }, Web: { "vps-1.tail1234.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:4321" } } } } });
+    const worlds: { name: string; responses: Parameters<typeof makeRunner>[0]; throwOnOff?: number }[] = [
+      { name: "free port", responses: {} },
+      { name: "status fails", responses: { status: { status: 1, stdout: "", stderr: "Tailscale is stopped." } } },
+      { name: "someone else's mapping", responses: { status: { status: 0, stdout: mapped, stderr: "" } } },
+      { name: "serve answers no url, off fails once", responses: { serve: { status: 0, stdout: "ok", stderr: "" }, off: (i) => ({ status: i === 0 ? 1 : 0, stdout: "", stderr: "" }) } },
+      { name: "own mapping taken down, the off throwing once", responses: { status: { status: 0, stdout: mapped, stderr: "" } }, throwOnOff: 0 },
+    ];
+    const sequences = [
+      { name: "enable", steps: () => enableServeSteps(4321, { httpsPort: 8443, ownTargets: [], persist: true }) },
+      { name: "take down own", steps: () => takeDownOwnServeSteps(8443, ["http://127.0.0.1:4321"]) },
+    ];
+    const stderr = captureStderr();
+    try {
+      for (const world of worlds) {
+        for (const sequence of sequences) {
+          const runner = () => {
+            const made = makeRunner(world.responses);
+            let offs = 0;
+            const run = (args: string[]) => {
+              if (args.includes("off") && world.throwOnOff === offs++) {
+                made.calls.push(args);
+                throw new Error("spawn failed");
+              }
+              return made.runner(args);
+            };
+            return { run, calls: made.calls };
+          };
+          const atOnce = runner();
+          const later = runner();
+          const syncAnswer = await outcome(() => runTailscaleSteps(sequence.steps(), atOnce.run));
+          const asyncAnswer = await outcome(() =>
+            runTailscaleStepsAsync(sequence.steps(), (args) => new Promise((resolve, reject) => setTimeout(() => {
+              try {
+                resolve(later.run(args));
+              } catch (error) {
+                reject(error);
+              }
+            }, 1))),
+          );
+          const label = `${world.name} / ${sequence.name}`;
+          expect({ label, answer: asyncAnswer, calls: later.calls }).toEqual({ label, answer: syncAnswer, calls: atOnce.calls });
+        }
+      }
+    } finally {
+      stderr.restore();
+    }
+  });
+
+  test("while a call waits, the event loop keeps turning", async () => {
+    let ticks = 0;
+    const timer = setInterval(() => (ticks += 1), 5);
+    try {
+      const { runner } = makeRunner({});
+      const answer = await runTailscaleStepsAsync(enableServeSteps(4321, { persist: true }), (args) => new Promise((resolve) => setTimeout(() => resolve(runner(args)), 60)));
+      expect(answer.url).toBe("https://vps-1.tail1234.ts.net:4321");
+      expect(ticks).toBeGreaterThan(5);
+    } finally {
+      clearInterval(timer);
+    }
+  });
+});
+
+describe("a take-down never believes an empty serve status while Tailscale is not running", () => {
+  const run = (backend: string | null, statusFails = false) => {
+    const calls: string[][] = [];
+    const runner = (args: string[]): TailscaleRunResult => {
+      calls.push(args);
+      if (args[0] === "serve") return { status: 0, stdout: "{}", stderr: "" };
+      if (statusFails) return { status: 1, stdout: "", stderr: "failed to connect to local tailscaled" };
+      return { status: 0, stdout: JSON.stringify(backend === null ? { Self: {} } : { BackendState: backend }), stderr: "" };
+    };
+    return { calls, answer: runTailscaleSteps(takeDownOwnServeSteps(8443, ["http://127.0.0.1:4321"]), runner) };
+  };
+
+  test("stopped (or starting, signed out): the mapping may come back with Tailscale, so it is \"later\", never \"none\"", () => {
+    for (const backend of ["Stopped", "Starting", "NeedsLogin"]) {
+      const { calls, answer } = run(backend);
+      expect(answer).toBe("later");
+      expect(calls).toEqual([
+        ["serve", "status", "--json"],
+        ["status", "--json"],
+      ]);
+    }
+  });
+
+  test("running, or a status that names no state or cannot be read: the empty read is believed, as before", () => {
+    expect(run("Running").answer).toBe("none");
+    expect(run(null).answer).toBe("none");
+    expect(run(null, true).answer).toBe("none");
   });
 });

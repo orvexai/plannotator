@@ -21,16 +21,18 @@
  * PNGs at 1440 by 900 land in .local/proof/archived/.
  */
 
-import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import { expect, test, type Browser, type BrowserContext, type Page } from './inbox-test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { SimAgent, scratchProject } from '../../scripts/inbox-sim';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { NO_BROWSER } from '../helpers/no-browser';
 
 const repo = resolve(__dirname, '../..');
 const binary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
-const proofDir = join(resolve(process.env.PLANNOTATOR_E2E_PROOF_DIR ?? join(repo, '.local/proof')), 'archived');
+const proofRoot = resolve(process.env.PLANNOTATOR_E2E_PROOF_DIR ?? join(repo, '.local/proof'));
+const proofDir = join(proofRoot, 'archived');
 
 const SEARCH = ['Search for the docs site.', '', ':::question', 'Which search index should the docs use?', '', '- [ ] Pagefind', '- [ ] Orama', ':::'].join('\n');
 
@@ -61,9 +63,16 @@ async function listed(page: Page): Promise<string[]> {
   return page.locator('.ib-lbody [data-row]').evaluateAll((rows) => rows.map((r) => r.getAttribute('data-row') ?? ''));
 }
 
+/**
+ * Unfold Quiet, every caller's list holds it. Waits for the band first: right
+ * after a reload the list may not be drawn yet, and a bare count() then read 0,
+ * skipped the click, and left Quiet folded (its rows missing from `listed`).
+ */
 const openQuiet = async (page: Page) => {
   const band = page.locator('[data-section-id="quiet"] .ib-band');
-  if ((await band.count()) && (await band.getAttribute('aria-expanded')) !== 'true') await band.click();
+  await expect(band).toBeVisible();
+  if ((await band.getAttribute('aria-expanded')) !== 'true') await band.click();
+  await expect(band).toHaveAttribute('aria-expanded', 'true');
 };
 
 /** Archive a thread through the window's own route (the thread id is its first message's). */
@@ -88,7 +97,7 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   rmSync(proofDir, { recursive: true, force: true });
   mkdirSync(proofDir, { recursive: true });
   const root = inboxScratch('plannotator-inbox-archived-e2e-');
-  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: 'none' };
+  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_RELAY_URL: 'http://127.0.0.1:9', PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: NO_BROWSER };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   const url = started.stdout.trim();
@@ -164,7 +173,8 @@ test('the archived open thread keeps its row until the person leaves; then no se
   await shot('02-list-before');
 
   await page.locator(`.ib-lbody [data-thread-id="${threads.build}"]`).click();
-  await page.locator('section.ib-pane').getByRole('button', { name: 'Archive the thread' }).click();
+  await page.locator('section.ib-pane [data-thread-more]').click();
+  await page.getByRole('menuitem', { name: 'Archive thread' }).click();
   await expect(page.locator('.ib-pfoot')).toContainText('Archived. The next message from');
   const held = page.locator(`.ib-lbody [data-row="${threads.build}"]`);
   await expect(held).toBeVisible();
@@ -209,7 +219,7 @@ test('Unarchive opens the thread back in the main list', async () => {
   await block.locator(`[data-archived-thread="${threads.deploy}"]`).getByRole('button', { name: 'Unarchive Preview deploy is up' }).click();
   await expect(page).toHaveURL(new RegExp(`#thread=${threads.deploy}$`));
   await expect(page.locator('section.ib-pane').getByRole('heading', { name: 'Preview deploy is up' })).toBeVisible();
-  await expect(page.locator('[data-inbox-toast]')).toContainText('Moved back to your Inbox');
+  await expect(page.locator('[data-inbox-toast]')).toContainText('Back in your Inbox');
   // Back in the list, in whatever section its state puts it: opening it was a look, so a news-only thread is Quiet.
   await openQuiet(page);
   await expect(page.locator(`.ib-lbody [data-row="${threads.deploy}"]`)).toBeVisible();
@@ -254,5 +264,30 @@ test("an agent's reply into an archived thread brings it back to the list and ou
   expect(thread.thread.resolved_at).not.toBeNull();
   expect(thread.thread.messages.at(-1)).toMatchObject({ author: { kind: 'person' } });
   expect(thread.thread.messages.at(-1)!.body).toContain('Yes');
+  expect(world.errors).toEqual([]);
+});
+
+// resolve_message's moved_to (the owner, 2026-11-22: one picture of it): Codex asked in its own thread, Claude Code
+// asked it again in its brief and archived the old thread pointing there. The old thread's foot names the brief, and
+// its question reads Closed. The picture: moved-thread/01-closed-card-light.png.
+test("a thread whose questions moved: its foot names the brief, and its question reads Closed", async () => {
+  const { page } = world;
+  const [claude, codex] = world.agents as [SimAgent, SimAgent];
+  const ask = (prompt: string) => [':::question', prompt, '', '- [ ] Yes, for Ada Novak', '- [ ] No, email Charlie Dunn', ':::'].join('\n');
+  const old = await codex.send({ project_path: world.billing, subject: 'Refund for Ada Novak', thread: 'Refund for Ada Novak', body: `Overnight work on refunds.\n\n${ask('Refund the double charge?')}` });
+  const brief = await claude.send({ project_path: world.billing, subject: 'Morning brief', thread: 'Morning brief', body: `Three things from last night.\n\n${ask('Refund the double charge? (from Refund for Ada Novak)')}` });
+  await claude.resolve(old.thread_id as string, brief.thread_id as string);
+  await page.goto(new URL(`#thread=${old.thread_id as string}`, world.url).href);
+  const pane = page.locator('section.ib-pane');
+  await expect(page.locator('[data-moved-to]')).toContainText('Its questions moved to');
+  await expect(page.locator('[data-moved-to]')).toContainText('Morning brief');
+  await expect(pane.locator('[data-question-status]').first()).toContainText('Closed');
+  await expect(pane.locator('[data-question-status]').first()).toContainText('Closed when the thread was archived.');
+  const dir = join(proofRoot, 'moved-thread');
+  mkdirSync(dir, { recursive: true });
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'reduce' });
+  await page.waitForTimeout(200);
+  await page.screenshot({ path: join(dir, '01-closed-card-light.png') });
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
   expect(world.errors).toEqual([]);
 });

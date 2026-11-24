@@ -33,7 +33,7 @@ export const ASK_SESSION_WATCH_URL = 'https://x.com/plannotator/status/210687521
 const OUTBOUND_ACTION_CLASS =
   'inline-flex min-h-9 items-center gap-2 rounded-lg border border-border bg-surface-0/40 px-3 text-sm font-medium text-foreground outline-none transition-colors motion-reduce:transition-none hover:bg-surface-1/70 focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-card';
 
-/** Where the marketing deploy publishes `apps/marketing/public/assets/`. */
+/** The marketing site's hosted media (videos are uploaded there by hand, not kept in the repo). */
 const MEDIA_BASE_URL = 'https://plannotator.ai/assets';
 
 export const ASK_SESSION_DEMO = {
@@ -151,7 +151,7 @@ function DemoPlayer({ reducedMotion }: { readonly reducedMotion: boolean }) {
           data-ask-session-playback={playing ? 'pause' : 'play'}
           className={
             playing
-              ? 'absolute bottom-3 left-3 grid size-9 place-items-center rounded-full border border-border/60 bg-background/70 text-foreground opacity-0 outline-none backdrop-blur-sm transition-opacity motion-reduce:transition-none group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary'
+              ? 'absolute bottom-3 left-3 grid size-9 place-items-center rounded-full border border-border/60 bg-background/70 text-foreground opacity-0 outline-none backdrop-blur-sm transition-opacity motion-reduce:transition-none group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:ring-2 focus-visible:ring-primary'
               : 'absolute left-1/2 top-1/2 grid size-16 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border border-border/60 bg-background/80 text-foreground shadow-lg outline-none backdrop-blur-sm transition-transform motion-reduce:transition-none hover:scale-105 focus-visible:ring-2 focus-visible:ring-primary'
           }
         >

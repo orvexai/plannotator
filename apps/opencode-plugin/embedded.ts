@@ -8,6 +8,7 @@ import {
   getAnnotateMessageFeedbackPrompt,
 } from "@plannotator/shared/prompts";
 import { deliverOpenCodePrompt } from "./prompt-delivery-error";
+import { scheduleOpenCodeDailyPing } from "./daily-ping";
 import type { SessionBridge } from "@plannotator/ai/session-bridge";
 
 export interface EmbeddedPlanReviewInput {
@@ -80,6 +81,10 @@ export async function runEmbeddedPlanReview(
 ): Promise<EmbeddedPlanReviewResult> {
   input.abortSignal?.throwIfAborted();
   const { startPlannotatorServer, handleServerReady } = await loadPlanServer();
+  // The daily ping (daily-ping.ts): in the background, never awaited.
+  scheduleOpenCodeDailyPing("plan");
+  const { listOpenCodeSession } = await import("./session-registry");
+  const { detectProjectName } = await import("@plannotator/server/project");
   const server = await startPlannotatorServer({
     plan: input.planContent,
     origin: "opencode",
@@ -89,15 +94,23 @@ export async function runEmbeddedPlanReview(
     htmlContent: input.htmlContent,
     opencodeClient: input.client,
     sessionBridge: input.sessionBridge,
+    // submit_plan's executor delivers an approval's feedback as the
+    // approved-with-notes prompt.
+    approvalNotesSupported: true,
     ...(input.opencodeToolCapable ? { opencodeToolCapable: true } : {}),
     onReady: async (url, isRemote, port) => {
-      await handleServerReady(url, isRemote, port);
+      // announce: false. This runs in OpenCode's own process, sharing stderr
+      // with its TUI renderer, and input.logReady already shows the URL (a
+      // toast on OpenCode 1, a transcript notice on OpenCode 2).
+      await handleServerReady(url, isRemote, port, { announce: false });
       input.logReady(url, isRemote, port);
     },
   });
 
   const timeoutMs = input.timeoutSeconds === null ? null : input.timeoutSeconds * 1000;
+  let unlist = () => {};
   try {
+    unlist = listOpenCodeSession(server, "plan", await detectProjectName().catch(() => null));
     const result = await waitForPlanReviewDecision({
       waitForDecision: server.waitForDecision,
       timeoutMs,
@@ -111,6 +124,7 @@ export async function runEmbeddedPlanReview(
     await waitForPlanReviewCloseDelay(1500, input.abortSignal);
     return result;
   } finally {
+    unlist();
     await server.stop();
   }
 }
@@ -122,6 +136,7 @@ export async function handleEmbeddedCommand(
     client: any;
     htmlContent: string;
     reviewHtmlContent: string;
+    reviewDiagramEngineDir?: string;
     getSharingEnabled: () => Promise<boolean>;
     getShareBaseUrl: () => string | undefined;
     getPasteApiUrl: () => string | undefined;

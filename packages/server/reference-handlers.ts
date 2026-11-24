@@ -6,9 +6,9 @@
  */
 
 import { existsSync, statSync } from "fs";
-import { readdir } from "fs/promises";
-import { join, relative, resolve } from "path";
+import { resolve } from "path";
 import { buildFileTree, isFileBrowserExcludedPath } from "@plannotator/shared/reference-common";
+import { listFileBrowserFiles } from "@plannotator/shared/file-browser-files";
 import {
 	filterWorkspaceStatusForDirectory,
 	getWorkspaceStatusForDirectory,
@@ -19,19 +19,19 @@ import { parseCodePath, type ParsedCodePath } from "@plannotator/shared/code-fil
 import { detectObsidianVaults } from "./integrations";
 import {
 	resolveUserPath,
-	getFileBrowserMaxFiles,
 	warmFileListCache,
 	getAnnotatableDocRegex,
 	MAX_ANNOTATABLE_FILE_BYTES,
 	isAnnotatableTextPath,
 } from "@plannotator/shared/resolve-file";
-import { diagramRenderKindForPath, isDiagramRenderKind } from "@plannotator/shared/annotatable";
+import { documentRenderKindForPath, isDocumentRenderKind } from "@plannotator/shared/annotatable";
 import {
 	DOC_ACCESS_DENIED,
 	DOC_TOO_LARGE,
 	docResolutionError,
 	getAllowedRootPaths,
 	getTrustedBaseDir,
+	isDocServeAllowed,
 	isPathAllowed,
 	isPlanDirBase,
 	relativizeToAllowedRoots,
@@ -44,6 +44,7 @@ import {
 	type ResolveAllowedDocPathResult,
 } from "@plannotator/shared/doc-resolve";
 import { htmlToMarkdown } from "@plannotator/shared/html-to-markdown";
+import { vaultDocRefusal } from "@plannotator/shared/reference-reader";
 import { disabledSourceSave, type SourceFileSnapshot, type SourceSaveCapability } from "@plannotator/shared/source-save";
 import {
 	createBundleSourceSaveCapability,
@@ -62,7 +63,7 @@ import { preloadFile } from "@pierre/diffs/ssr";
  * payload still returns the full AnnotateHistoryResult, `diffCurrent`
  * included, for legacy shape parity — see annotate.ts).
  */
-export type FolderAnnotateHistory = Omit<AnnotateHistoryResult, "diffCurrent">;
+export type FolderAnnotateHistory = Omit<AnnotateHistoryResult, "diffCurrent" | "isNew">;
 
 // --- Route handlers ---
 
@@ -81,7 +82,10 @@ export interface HandleDocOptions {
 	 *  (`resolveBundleSourceSavePaths`). Every other document stays read-only. */
 	sourceSaveBundlePaths?: ReadonlySet<string>;
 	onSourceDocumentServed?: (path: string) => void;
+	onDocumentServed?: (path: string) => void;
 	rootPaths?: string[];
+	/** A reader on this machine (`isThisMachineReader`, this-machine-reader.ts): documents are served from anywhere, code files keep the roots (`isDocServeAllowed`). */
+	anyPath?: boolean;
 	/** Plan review: the plan file on disk, whose directory serves the documents the plan links. */
 	planFile?: PlanFile | null;
 	/**
@@ -166,9 +170,9 @@ function applyDocOptions<T extends Record<string, unknown>>(
 	if (
 		options.annotateHistory &&
 		typeof data.filepath === "string" &&
-		// Diagram sources (.mmd/.dot) take the markdown branch's raw text, so
+		// Diagram and AsciiDoc sources take the markdown branch's raw text, so
 		// they keep per-file version history exactly like a .txt.
-		(data.renderAs === "markdown" || isDiagramRenderKind(data.renderAs)) &&
+		(data.renderAs === "markdown" || isDocumentRenderKind(data.renderAs)) &&
 		data.isConverted !== true &&
 		typeof data.markdown === "string" &&
 		isAnnotatableTextPath(data.filepath)
@@ -219,6 +223,7 @@ function applyDocOptions<T extends Record<string, unknown>>(
 }
 
 function docJson(data: Record<string, unknown>, options?: HandleDocOptions, sourceSnapshot?: SourceFileSnapshot): Response {
+	if (typeof data.filepath === "string") options?.onDocumentServed?.(data.filepath);
 	return Response.json(applyDocOptions(data, options, sourceSnapshot));
 }
 
@@ -234,12 +239,13 @@ async function readDocument(path: string, convert: boolean, options: HandleDocOp
 				? docJson({ markdown: htmlToMarkdown(snapshot.text), filepath: path, isConverted: true, renderAs: "markdown" }, options)
 				: docJson({ rawHtml: snapshot.text, renderAs: "html", filepath: path }, options);
 		}
-		// A diagram source is served as its raw text with the engine named in
-		// `renderAs`; the editor renders it through the same DiagramBlock a
-		// ```mermaid fence uses instead of the markdown pipeline.
-		const diagramKind = diagramRenderKindForPath(path);
+		// A diagram or AsciiDoc source is served as its raw text with the engine
+		// named in `renderAs`; the editor renders a diagram through the same
+		// DiagramBlock a ```mermaid fence uses, and AsciiDoc through its own
+		// block parser, instead of the markdown pipeline.
+		const renderKind = documentRenderKindForPath(path);
 		return docJson(
-			{ markdown: snapshot.text, filepath: path, renderAs: diagramKind ?? "markdown" },
+			{ markdown: snapshot.text, filepath: path, renderAs: renderKind ?? "markdown" },
 			options,
 			snapshot,
 		);
@@ -292,7 +298,8 @@ export async function handleDoc(req: Request, options: HandleDocOptions = {}): P
 	// directory base is for the plan's own links (below): root resolution runs
 	// without it, so a plan stored inside the project keeps the project-root
 	// fallback, HTML links included.
-	const resolvedBase = isPlanDirBase(base, options.planFile) ? null : getTrustedBaseDir(base, allowedRoots);
+	const anyPath = options.anyPath === true;
+	const resolvedBase = isPlanDirBase(base, options.planFile) ? null : getTrustedBaseDir(base, allowedRoots, anyPath);
 	// HTML renders raw by default; `?convert=1` (set by the frontend when the session's
 	// --markdown preference is on) forces Turndown conversion instead.
 	const convert = url.searchParams.get("convert") === "1";
@@ -312,11 +319,12 @@ export async function handleDoc(req: Request, options: HandleDocOptions = {}): P
 		base: resolvedBase,
 		forceDoc,
 		roots: allowedRoots,
+		anyPath,
 	});
 	// The one authorization site. A named path is gated whether or not it
 	// exists, so an escaping name is denied rather than reported absent.
 	const named = resolution.kind === "file" || resolution.kind === "not_found" ? resolution.path : undefined;
-	if (named !== undefined && !isPathAllowed(named, allowedRoots)) {
+	if (named !== undefined && !isDocServeAllowed(named, resolution.kind === "file" ? resolution.render : null, allowedRoots, anyPath)) {
 		return errorResponse(DOC_ACCESS_DENIED);
 	}
 	if (resolution.kind !== "file") {
@@ -426,8 +434,11 @@ export async function handleObsidianFiles(req: Request): Promise<Response> {
 	}
 }
 
-/** Read an Obsidian vault document. Supports direct path and bare filename search. */
-export async function handleObsidianDoc(req: Request): Promise<Response> {
+/**
+ * Read an Obsidian vault document. Supports direct path and bare filename search.
+ * `thisMachine`: the reader is a page on this machine (`vaultDocRefusal`).
+ */
+export async function handleObsidianDoc(req: Request, thisMachine = false): Promise<Response> {
 	const url = new URL(req.url);
 	const vaultPath = url.searchParams.get("vaultPath");
 	const filePath = url.searchParams.get("path");
@@ -474,13 +485,9 @@ export async function handleObsidianDoc(req: Request): Promise<Response> {
 		}
 	}
 
-	// Security: must be within vault
-	if (!resolvedFile.startsWith(resolvedVault + "/")) {
-		return Response.json(
-			{ error: "Access denied: path is outside vault" },
-			{ status: 403 },
-		);
-	}
+	// Inside the vault (after symlinks too, off this machine), a regular Markdown file, within 2MB.
+	const refusal = vaultDocRefusal(resolvedFile, resolvedVault, thisMachine);
+	if (refusal) return Response.json({ error: refusal.error }, { status: refusal.status });
 
 	try {
 		const file = Bun.file(resolvedFile);
@@ -506,44 +513,6 @@ function includeWorkspaceFile(relativePath: string, _change: WorkspaceFileChange
 	return getAnnotatableDocRegex().test(relativePath) && !isFileBrowserExcludedPath(relativePath);
 }
 
-type FileBrowserWalkState = {
-	files: Set<string>;
-	limit: number;
-	truncated: boolean;
-};
-
-function addFileBrowserFile(state: FileBrowserWalkState, relativePath: string): void {
-	if (state.files.has(relativePath)) return;
-	if (state.files.size >= state.limit) {
-		state.truncated = true;
-		return;
-	}
-	state.files.add(relativePath);
-}
-
-async function walkFileBrowserFiles(dir: string, root: string, state: FileBrowserWalkState): Promise<void> {
-	if (state.truncated) return;
-	let entries;
-	try {
-		entries = await readdir(dir, { withFileTypes: true });
-	} catch {
-		return;
-	}
-
-	for (const entry of entries) {
-		if (state.truncated) return;
-		const fullPath = join(dir, entry.name);
-		const relativePath = relative(root, fullPath).replace(/\\/g, "/");
-		if (entry.isDirectory()) {
-			if (isFileBrowserExcludedPath(relativePath)) continue;
-			await walkFileBrowserFiles(fullPath, root, state);
-		} else if (entry.isFile() && getAnnotatableDocRegex().test(entry.name)) {
-			if (isFileBrowserExcludedPath(relativePath)) continue;
-			addFileBrowserFile(state, relativePath);
-		}
-	}
-}
-
 /** List markdown files in a directory as a nested tree. */
 export async function handleFileBrowserFiles(req: Request): Promise<Response> {
 	const url = new URL(req.url);
@@ -561,29 +530,20 @@ export async function handleFileBrowserFiles(req: Request): Promise<Response> {
 	}
 
 	try {
-		const state: FileBrowserWalkState = {
-			files: new Set<string>(),
-			limit: getFileBrowserMaxFiles(),
-			truncated: false,
-		};
-		// Seed the user's own modified/untracked files BEFORE the bulk walk: the
-		// walk fills the cap in raw readdir order and addFileBrowserFile drops
-		// everything once the cap latches — the one set of files that must never
-		// silently vanish from the browser is the ones the user just touched.
+		// The user's own modified/untracked files are seeded before the walk, so
+		// they are never the ones the cap leaves out.
 		const workspaceStatus = filterWorkspaceStatusForDirectory(await getWorkspaceStatusForDirectory(resolvedDir), resolvedDir, includeWorkspaceFile);
-		for (const match of getWorkspaceStatusRelativePaths(workspaceStatus, resolvedDir, includeWorkspaceFile)) {
-			addFileBrowserFile(state, match);
-			if (state.truncated) break;
-		}
-		await walkFileBrowserFiles(resolvedDir, resolvedDir, state);
-		const sortedFiles = [...state.files].sort();
+		const listing = await listFileBrowserFiles(resolvedDir, {
+			seed: getWorkspaceStatusRelativePaths(workspaceStatus, resolvedDir, includeWorkspaceFile),
+		});
+		const sortedFiles = listing.files;
 
 		const tree = buildFileTree(sortedFiles);
 		return Response.json({
 			tree,
 			workspaceStatus,
-			truncated: state.truncated,
-			fileLimit: state.limit,
+			truncated: listing.truncated,
+			fileLimit: listing.limit,
 		});
 	} catch {
 		return Response.json(

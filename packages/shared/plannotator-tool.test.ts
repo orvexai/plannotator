@@ -39,6 +39,15 @@ describe('plannotator tool: arguments', () => {
     expect(args({ action: 'last' })).toEqual([])
   })
 
+  // #1907: a review's gate is the host's (deliver a bare Approve as a
+  // message); passing --gate on would make a CLI older than `review --gate`
+  // refuse the launch.
+  test('a gated review is accepted and its gate is never passed to the CLI', () => {
+    const parsed = parsePlannotatorToolInput({ action: 'review', gate: true, options: { base: 'main' } })
+    expect(parsed).toEqual({ ok: true, input: { action: 'review', gate: true, options: { base: 'main' } } })
+    expect(args({ action: 'review', gate: true, target: '../wt' })).toEqual(['../wt'])
+  })
+
   test('false defaults a model fills in are ignored, not errors', () => {
     expect(args({ action: 'review', gate: false, options: { markdown: false } })).toEqual([])
     expect(args({ action: 'last', gate: false, options: {} })).toEqual([])
@@ -54,7 +63,7 @@ describe('plannotator tool: strict validation', () => {
     expect(error({ action: 'annotate', target: 'a.md\nb.md' })).toContain('control')
     expect(error({ action: 'annotate', target: '  ' })).toContain('empty')
     expect(error({ action: 'last', target: 'x.md' })).toContain('no target')
-    expect(error({ action: 'review', gate: true })).toContain('gate')
+    expect(error({ action: 'last', gate: true })).toContain('gate')
     expect(error({ action: 'annotate', target: 'a.md', options: { base: 'main' } })).toContain('options.base')
     expect(error({ action: 'review', options: { base: '-c' } })).toContain('"-"')
     expect(error({ action: 'review', options: { base: 'a b' } })).toContain('spaces')
@@ -68,6 +77,75 @@ describe('plannotator tool: strict validation', () => {
     expect(Object.keys(PLANNOTATOR_TOOL_INPUT_SCHEMA.properties).sort()).toEqual(['action', 'gate', 'options', 'session', 'target'])
     expect([...PLANNOTATOR_TOOL_INPUT_SCHEMA.properties.action.enum].sort()).toEqual(['annotate', 'close', 'last', 'list', 'review'])
     expect(Object.keys(PLANNOTATOR_TOOL_INPUT_SCHEMA.properties.options.properties).sort()).toEqual(['base', 'markdown'])
+  })
+})
+
+// #2292: GitHub Copilot's Responses models treat the function as strict, so
+// every property is required and the model fills each one it means to omit
+// with an empty value. The failure: every call is refused ("takes no target")
+// and the model repeats it, so the tool cannot be used on that route at all.
+describe('plannotator tool: empty optional fields from a strict-schema model', () => {
+  // The exact call from the report, sent 17 times in a row.
+  const copilotList = { action: 'list', target: '', gate: false, options: { base: '', markdown: false }, session: '' }
+
+  test('the reported Copilot list call is the plain list call', () => {
+    expect(parsePlannotatorToolInput(copilotList)).toEqual({ ok: true, input: { action: 'list' } })
+  })
+
+  test('every action accepts its strict-schema shape, keeping only the fields it set', () => {
+    const filled = { target: '', gate: false, options: { base: '', markdown: false }, session: '' }
+    expect(parsePlannotatorToolInput({ ...filled, action: 'last' })).toEqual({ ok: true, input: { action: 'last' } })
+    expect(parsePlannotatorToolInput({ ...filled, action: 'review' })).toEqual({ ok: true, input: { action: 'review' } })
+    expect(parsePlannotatorToolInput({ ...filled, action: 'review', options: { base: 'main', markdown: false } })).toEqual({
+      ok: true,
+      input: { action: 'review', options: { base: 'main' } },
+    })
+    expect(parsePlannotatorToolInput({ ...filled, action: 'annotate', target: 'spec.md', gate: true })).toEqual({
+      ok: true,
+      input: { action: 'annotate', target: 'spec.md', gate: true },
+    })
+    expect(parsePlannotatorToolInput({ ...filled, action: 'close', session: 'pn-3f2a9c' })).toEqual({
+      ok: true,
+      input: { action: 'close', session: 'pn-3f2a9c' },
+    })
+  })
+
+  test('null, an empty list and an empty object are absent too, at the top level and in options', () => {
+    expect(parsePlannotatorToolInput({ action: 'list', target: null, gate: null, options: null, session: null })).toEqual({ ok: true, input: { action: 'list' } })
+    expect(parsePlannotatorToolInput({ action: 'last', target: [], options: {} })).toEqual({ ok: true, input: { action: 'last' } })
+    expect(parsePlannotatorToolInput({ action: 'annotate', target: 'a.md', options: { base: null, markdown: null } })).toEqual({
+      ok: true,
+      input: { action: 'annotate', target: 'a.md' },
+    })
+    const tailnet = parsePlannotatorToolInput({ action: 'list', tailscale: null, target: '' }, { tailscale: true })
+    expect(tailnet).toEqual({ ok: true, input: { action: 'list' } })
+  })
+
+  // The failure: reading empty as absent loosens a required field, and an
+  // empty annotate target or close session is accepted.
+  test('a required field sent empty is still missing', () => {
+    for (const empty of ['', null, []]) {
+      expect(error({ ...copilotList, action: 'annotate', target: empty })).toContain('needs a target')
+    }
+    for (const empty of ['', null]) {
+      expect(error({ ...copilotList, action: 'close', session: empty })).toContain('needs a session')
+      expect(error({ ...copilotList, action: empty })).toContain('action must be')
+    }
+  })
+
+  // The failure: the empty-value rule swallows a real value or an unknown
+  // key, and a wrong call slips through instead of being refused.
+  test('non-empty values are still checked strictly', () => {
+    expect(error({ ...copilotList, target: 'x.md' })).toContain('no target')
+    expect(error({ ...copilotList, session: 'pn-3f2a9c' })).toContain('session')
+    expect(error({ ...copilotList, action: 'annotate', target: '  ' })).toContain('empty')
+    expect(error({ ...copilotList, action: 'annotate', target: ['a.md', ''] })).toContain('target[1]')
+    expect(error({ ...copilotList, options: { base: '', markdown: false, diffType: '' } })).toContain('unknown option "diffType"')
+    expect(error({ ...copilotList, json: '' })).toContain('unknown field "json"')
+    expect(error({ ...copilotList, tailscale: null })).toContain('unknown field "tailscale"')
+    expect(error({ ...copilotList, options: 'none' })).toContain('options must be an object')
+    expect(error({ ...copilotList, gate: 0 })).toContain('gate')
+    expect(error({ ...copilotList, action: 'close', session: '  ' })).toContain('pn-3f2a9c')
   })
 })
 
@@ -93,7 +171,7 @@ describe('plannotator tool v2: several targets', () => {
   })
 
   test('refuses an empty list, a bad entry, and a list outside annotate', () => {
-    expect(error({ action: 'annotate', target: [] })).toContain('empty list')
+    expect(error({ action: 'annotate', target: [] })).toContain('needs a target')
     expect(error({ action: 'annotate', target: ['a.md', '--hook'] })).toContain('target[1]')
     expect(error({ action: 'annotate', target: ['a.md', 3] })).toContain('target[1]')
     expect(error({ action: 'review', target: ['a', 'b'] })).toContain('annotate')

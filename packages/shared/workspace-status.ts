@@ -1,3 +1,4 @@
+import { childEnv } from "./child-env";
 import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile, realpath, stat } from "node:fs/promises";
@@ -23,6 +24,8 @@ function getGitTimeoutMs(): number {
 
 function runGit(cwd: string, args: string[]): GitResult {
 	const result = spawnSync("git", ["--no-optional-locks", "-C", cwd, ...args], {
+		env: childEnv(),
+		windowsHide: true,
 		encoding: "utf8",
 		maxBuffer: GIT_MAX_BUFFER,
 	});
@@ -38,6 +41,7 @@ function runGitAsync(cwd: string, args: string[]): Promise<GitResult> {
 	return new Promise((resolveResult) => {
 		const child = spawn("git", ["--no-optional-locks", "-C", cwd, ...args], {
 			stdio: ["ignore", "pipe", "pipe"],
+			windowsHide: true,
 		});
 		let stdout = "";
 		let stderr = "";

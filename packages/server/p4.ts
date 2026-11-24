@@ -5,6 +5,7 @@
  * Mirrors the structure of git.ts for consistent VCS abstraction.
  */
 
+import { childEnv } from "@plannotator/shared/child-env";
 import {
   type DiffResult,
   type DiffType,
@@ -23,8 +24,10 @@ async function runP4(
   try {
     const proc = Bun.spawn(["p4", ...args], {
       cwd: options?.cwd,
+      env: childEnv(),
       stdout: "pipe",
       stderr: "pipe",
+      windowsHide: true,
     });
 
     const [stdout, stderr, exitCode] = await Promise.all([
@@ -228,7 +231,9 @@ function convertP4DiffToGitFormat(
         relativePath = toRelativePath(rawPath, normalizedRoot);
       }
 
-      result.push(`diff --git a/${relativePath} b/${relativePath}`);
+      const header = `diff --git a/${relativePath} b/${relativePath}`;
+      // A Perforce separator may already have started this file's patch.
+      if (result.at(-1) !== header) result.push(header);
       result.push(`--- a/${relativePath}`);
       continue;
     }

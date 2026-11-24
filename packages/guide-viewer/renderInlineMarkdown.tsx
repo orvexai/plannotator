@@ -1,10 +1,42 @@
 import React from 'react';
+import { isCodeFilePath } from '@plannotator/core/code-file';
+import { GUIDE_LINK_TARGET_SOURCE } from '@plannotator/core/guide-links';
+
+/**
+ * Renders a guide link (`[label](code:…)`, `symbol:…`, `chapter:…`). Hosts that
+ * can act on the link return a control; `null` falls back to the label as
+ * plain text, which is also what happens when no renderer is given.
+ */
+export type GuideLinkRenderer = (href: string, label: React.ReactNode, key: number) => React.ReactNode | null;
+
+/**
+ * A host's own wrap for an inline code span that names a code file (`src/a.ts:12`): `text` is the span's words, `code`
+ * the span as it is drawn without a host. With no provider, nothing changes.
+ */
+export type GuideCodeSpanRenderer = (text: string, code: React.ReactNode) => React.ReactNode;
+export const GuideCodeSpanContext = React.createContext<GuideCodeSpanRenderer | null>(null);
+
+function GuideCodeSpan({ text, children }: { text: string; children: React.ReactNode }) {
+  const wrap = React.useContext(GuideCodeSpanContext);
+  return <>{wrap && isCodeFilePath(text) ? wrap(text, children) : children}</>;
+}
+
+// An http(s) link's or image's destination, with the optional title markdown
+// allows after it. The URL reads one level of balanced parentheses, as
+// `INLINE_DESTINATION` and `GUIDE_LINK_TARGET_SOURCE` already do.
+const URL_DESTINATION = String.raw`(https?:\/\/(?:[^()\s]|\([^()\s]*\))*)(?:[ \t]+(?:"[^"]*"|'[^']*'))?`;
+
+export interface InlineMarkdownOptions {
+  renderLink?: GuideLinkRenderer;
+  resolveImageSrc?: (src: string) => string;
+}
 
 /**
  * Renders simple inline markdown: `code`, **bold**, *italic*, _italic_, and
- * fenced code blocks (```...```). Enough for review comments.
+ * fenced code blocks (```...```). Enough for review comments. Guide links
+ * (`code:`, `symbol:`, `chapter:`) go through `opts.renderLink`.
  */
-export function renderInlineMarkdown(text: string): React.ReactNode[] {
+export function renderInlineMarkdown(text: string, opts?: InlineMarkdownOptions): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
   let key = 0;
 
@@ -24,7 +56,7 @@ export function renderInlineMarkdown(text: string): React.ReactNode[] {
       );
     } else {
       // Process inline markdown
-      nodes.push(...renderInline(part, key));
+      nodes.push(...renderInline(part, key, opts));
       key++;
     }
   }
@@ -32,12 +64,17 @@ export function renderInlineMarkdown(text: string): React.ReactNode[] {
   return nodes;
 }
 
-function renderInline(text: string, startKey: number): React.ReactNode[] {
+function renderInline(text: string, startKey: number, opts?: InlineMarkdownOptions, inLink = false): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
   let key = startKey;
 
   // Match inline patterns: [text](url), `code`, **bold**, *italic*, _italic_, bare URLs
-  const regex = /(\[([^\]]+)\]\((https?:\/\/[^)]+)\)|`[^`]+`|\*\*[^*]+\*\*|(?<!\w)_([^_\s](?:[\s\S]*?[^_\s])?)_(?!\w)|\*[^*]+\*|https?:\/\/[^\s<)\]]+)/g;
+  // The last alternative is a guide link: [label](code:…|symbol:…|chapter:…),
+  // its target read as guide-links reads it (balanced parentheses allowed).
+  const regex = new RegExp(
+    String.raw`(\[([^\]]+)\]\(${URL_DESTINATION}\)|` + '`[^`]+`' + String.raw`|\*\*[^*]+\*\*|(?<!\w)_([^_\s](?:[\s\S]*?[^_\s])?)_(?!\w)|\*[^*]+\*|https?:\/\/[^\s<)\]]+|\[([^\]]+)\]\((${GUIDE_LINK_TARGET_SOURCE})\))`,
+    'g',
+  );
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -53,13 +90,18 @@ function renderInline(text: string, startKey: number): React.ReactNode[] {
     }
 
     const token = match[0];
-    if (match[1] && match[2] && match[3]) {
+    if (match[5] !== undefined && match[6] !== undefined) {
+      const label = renderInline(match[5], 0, undefined, true);
+      const rendered = opts?.renderLink?.(match[6], label, key);
+      nodes.push(rendered ?? <span key={key} data-guide-link={match[6]}>{label}</span>);
+      key++;
+    } else if (match[1] && match[2] && match[3]) {
       if (isImage) {
         // Markdown image: ![alt](url). Broken sources hide themselves.
         nodes.push(
           <img
             key={key++}
-            src={match[3]}
+            src={opts?.resolveImageSrc?.(match[3]) ?? match[3]}
             alt={match[2]}
             loading="lazy"
             className="max-w-full h-auto rounded my-1"
@@ -75,7 +117,9 @@ function renderInline(text: string, startKey: number): React.ReactNode[] {
         );
       }
     } else if (token.startsWith('`')) {
-      nodes.push(<code key={key++} className="inline-code">{token.slice(1, -1)}</code>);
+      // A span inside a guide link's label is that link's words: the link decides what a click does.
+      const code = <code className="inline-code">{token.slice(1, -1)}</code>;
+      nodes.push(inLink ? <React.Fragment key={key++}>{code}</React.Fragment> : <GuideCodeSpan key={key++} text={token.slice(1, -1)}>{code}</GuideCodeSpan>);
     } else if (token.startsWith('**')) {
       nodes.push(<strong key={key++}>{token.slice(2, -2)}</strong>);
     } else if (token.startsWith('_')) {
@@ -84,9 +128,10 @@ function renderInline(text: string, startKey: number): React.ReactNode[] {
     } else if (token.startsWith('*')) {
       nodes.push(<em key={key++}>{token.slice(1, -1)}</em>);
     } else if (token.startsWith('http')) {
-      // Bare URL
+      // Bare URL. Marked as a ref written in prose (`@plannotator/ui` utils/refCardClick's REF_CARD_PROSE_ATTR): with
+      // click to pin on, a click on a pasted issue / PR URL opens its card; any other link follows its href.
       nodes.push(
-        <a key={key++} href={token} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline break-all">
+        <a key={key++} href={token} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline break-all" data-ref-card-prose="">
           {token}
         </a>
       );
