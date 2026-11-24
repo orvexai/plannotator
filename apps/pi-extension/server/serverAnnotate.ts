@@ -56,12 +56,16 @@ import {
 } from "../generated/source-save-node.ts";
 
 import {
+	handleCustomThemesScript,
+	customThemesPage,
 	handleFavicon,
+	handleAnnotateMediaRequest,
 	handleImageRequest,
 	handleStarAskRequest,
 	handleReferenceSkillsRequest,
 	handleReferenceSkillContentRequest,
 	readDraftGenerationFromBody,
+	sendMissingDraft,
 	readDraftGenerationFromUrl,
 	handleSaveNotesRequest,
 	handleUploadRequest,
@@ -860,6 +864,8 @@ export async function startAnnotateServer(options: {
 	const bundleSourceSavePaths = bundleFiles ? resolveBundleSourceSavePaths(bundlePaths) : null;
 	const openedSourceFilePaths = new Set<string>();
 	if (initialSingleFileSourcePath) openedSourceFilePaths.add(initialSingleFileSourcePath);
+	const servedMediaDocuments = new Set<string>();
+	if (initialSingleFileSourcePath) servedMediaDocuments.add(initialSingleFileSourcePath);
 	const getPrimarySource = () => {
 		const mode = options.mode || "annotate";
 		if (mode === "annotate-last") {
@@ -921,7 +927,7 @@ export async function startAnnotateServer(options: {
 	let liveSessionToken = "";
 	let liveAppUrl = "";
 
-	const app = openPackedApp(options.htmlContent);
+	const app = openPackedApp(options.htmlContent, { page: (html) => customThemesPage(html) });
 	const requestHostGuard = createRequestHostGuard();
 	const server = createServer(async (req, res) => {
 		// Host allowlist first, before any route (request-host-guard.ts).
@@ -1269,6 +1275,8 @@ export async function startAnnotateServer(options: {
 			if (!(await handleStarAskRequest(req, res, url, "annotate", isRemoteSession()))) handleApiNotFound(res, url.pathname);
 		} else if (url.pathname === "/api/image") {
 			handleImageRequest(res, url);
+		} else if (url.pathname === "/api/annotate-media" && req.method === "GET") {
+			handleAnnotateMediaRequest(req, res, url, servedMediaDocuments);
 		} else if (htmlAssets.handle(req, res, url)) {
 			return;
 		} else if (url.pathname === "/api/upload" && req.method === "POST") {
@@ -1307,7 +1315,7 @@ export async function startAnnotateServer(options: {
 			} else {
 				const loaded = annotateDrafts.load();
 				if (loaded.found) json(res, loaded.draft);
-				else json(res, { found: false, ...(loaded.draftGeneration !== null ? { draftGeneration: loaded.draftGeneration } : {}) }, 404);
+				else sendMissingDraft(res, loaded.draftGeneration);
 			}
 		} else if (url.pathname === "/api/draft/document") {
 			if (req.method === "GET") {
@@ -1360,6 +1368,7 @@ export async function startAnnotateServer(options: {
 				sourceSaveFolderPath: options.mode === "annotate-folder" ? options.folderPath : undefined,
 				sourceSaveBundlePaths: bundleSourceSavePaths ?? undefined,
 				onSourceDocumentServed: (path) => openedSourceFilePaths.add(path),
+				onDocumentServed: (path) => servedMediaDocuments.add(path),
 				rootPaths: getReferenceRootPaths(),
 				anyPath: isThisMachineRequest(req),
 				annotateHistory:
@@ -1461,6 +1470,9 @@ export async function startAnnotateServer(options: {
 			return;
 		} else if (url.pathname === "/favicon.png" || url.pathname === "/favicon.ico") {
 			handleFavicon(res, url.pathname);
+		} else if (url.pathname === "/plannotator-themes.js" && req.method === "GET") {
+			// The person's own themes, for the page's first frame (packages/shared/theme-files.ts).
+			handleCustomThemesScript(res, url.searchParams);
 		} else if (url.pathname === "/api/exit" && req.method === "POST") {
 			// Exit posts carry no body: the nonce rides the query string.
 			if (checkServerSession({ serverSession: url.searchParams.get("serverSession") ?? undefined }, serverSession) === "mismatch") {
@@ -1629,7 +1641,7 @@ export async function startAnnotateServer(options: {
 	agentTerminalCapabilityFor = agentTerminal.capabilityFor;
 	// Remote sessions serve the app page compressed (#1617); start gzip (what
 	// browsers ask for over plain http) now so the first load does not wait.
-	if (isRemoteSession()) prewarmAppHtml(app.html, likelyAppHtmlEncoding(false));
+	if (isRemoteSession()) prewarmAppHtml(app.page(), likelyAppHtmlEncoding(false));
 
 	if (options.liveApp) {
 		// Compose the proxy-served bridge body via the shared assembly (config

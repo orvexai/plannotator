@@ -1,6 +1,7 @@
 /** The route written back to the address, as a new history entry or in place. */
 
 import { systemHashOf } from '../system/route';
+import { localHashOf } from '../pulls/localRoute';
 import { sheetLayoutHash } from '../prs/tableModel';
 import { pushScreen, whileWritingRoute } from '../history';
 import { withFullMark, type FullMark } from '../fullScreenOrigin';
@@ -17,7 +18,8 @@ export function hashOf(route: Route): string {
   else if (route.page === 'whats-new') hash = new URLSearchParams({ 'whats-new': route.version ?? '' }).toString();
   else if (route.page === 'drafts') hash = 'drafts';
   else if (route.page === 'artifacts') hash = route.pinned ? 'artifacts=pinned' : 'artifacts';
-  else if (route.page === 'scheduled') hash = route.scheduled ? `routine=${encodeURIComponent(route.scheduled)}` : 'routines';
+  else if (route.page === 'plans') hash = plansHash(route);
+  else if (route.page === 'scheduled') hash = route.scheduled ? `routine=${encodeURIComponent(route.scheduled)}${route.routineRuns ? '&runs' : ''}` : 'routines';
   else if (route.page === 'shapes') hash = route.shape ? `shapes&shape=${encodeURIComponent(route.shape)}` : 'shapes';
   else if (route.page === 'board')
     hash =
@@ -31,11 +33,14 @@ export function hashOf(route: Route): string {
       (route.view && route.view !== 'all' ? `&view=${route.view}` : '') +
       (route.stack ? `&stack=${encodeURIComponent(route.stack)}` : '') +
       (route.stack && route.layer ? `&layer=${encodeURIComponent(route.layer)}${viewScopeHash(route.scope)}` : '') +
+      (!route.layer && route.backLayer ? `&back=${encodeURIComponent(route.backLayer)}` : '') +
       systemHashOf(route) +
+      localHashOf(route) +
       (route.new ? '&new' : '');
   else if (route.page === 'prs')
     hash =
       'prs' +
+      (route.project ? `&project=${encodeURIComponent(route.project)}` : '') +
       (route.prsView === 'merged' ? '&state=merged' : '') +
       sheetLayoutHash(route.prsLayout) +
       (route.stack ? `&stack=${encodeURIComponent(route.stack)}` : '') +
@@ -117,4 +122,12 @@ export function writeRoute(route: Route, options: { replace?: boolean; fullMark?
   }
   // Its own hashchange: a Back still on its way does not land in it (history.ts settleLanding).
   whileWritingRoute(() => window.dispatchEvent(new HashChangeEvent('hashchange')));
+}
+
+function plansHash(route: Route): string {
+  if (!route.plan) return route.planNew ? 'plans&new' : route.project ? `plans&project=${encodeURIComponent(route.project)}` : route.planAll ? 'plans&all' : 'plans';
+  const base = `plans=${encodeURIComponent(route.plan)}${route.planFile ? `&file=${encodeURIComponent(route.planFile)}` : route.planDoc ? `&doc=${encodeURIComponent(route.planDoc)}` : ''}`;
+  if (route.planFile) return base;
+  if (route.planDiff) return `${base}&from=${route.planDiff.from}&to=${route.planDiff.to}`;
+  return route.planVersion ? `${base}&v=${route.planVersion}` : base;
 }

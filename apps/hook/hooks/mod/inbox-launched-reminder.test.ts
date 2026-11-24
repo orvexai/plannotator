@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { inboxRegistryPathOf, readReminderSessions, STORE_INBOX_REMINDER_SESSIONS } from './inbox'
-import { INBOX_BRIDGE_EVENT_PATH, INBOX_BRIDGE_POLL_PATH, INBOX_LAUNCHED_LINE, inboxReminderFor, inboxWakeText, type InboxReplyCommand } from './inbox-contract'
+import { INBOX_BRIDGE_EVENT_PATH, INBOX_BRIDGE_POLL_PATH, INBOX_LAUNCHED_LINE, INBOX_MOVED_WAKE_INSTRUCTION, INBOX_REMINDER_MAX_CHARS, INBOX_RULES_LEAD, INBOX_WAKE_INSTRUCTION, inboxReminderFor, inboxReminderText, inboxWakeText, type InboxReplyCommand } from './inbox-contract'
 import type { register } from './register'
 
 // A session the Inbox launched (`claude --bg`) gets the Inbox reminder on its first turn (approval
@@ -9,7 +9,7 @@ import type { register } from './register'
 // carries the reminder in its own words. Through the real hooks, instance and link on an in-memory `$`.
 // The failures this catches: a launched session's first turn without the reminder; the reminder on a wake
 // the Inbox did not mark launched; the reminder twice (the wake, then the person's first typed prompt);
-// the reminder with `inboxReminder` off.
+// the reminder with `inboxReminder` off; the person's rules missing from it.
 
 const DATA = '/data'
 const REGISTRY = JSON.stringify({ v: 1, pid: 1, port: 4100, token: 't'.repeat(40), serverSession: 'srv', url: 'http://127.0.0.1:4100' })
@@ -52,6 +52,8 @@ function engineOver(command: InboxReplyCommand, config?: Record<string, unknown>
   const files = new Map<string, string>([
     ['/bin/sh', ''],
     [inboxRegistryPathOf(DATA), REGISTRY],
+    // The person turned the Inbox on here (inbox-turned-on.ts).
+    [`${DATA}/inbox/turned-on`, '{"on":true,"by":"command"}'],
     ...(config ? ([[`${DATA}/config.json`, JSON.stringify(config)]] as [string, string][]) : []),
   ])
   const store = new Map<string, unknown>()
@@ -173,5 +175,33 @@ describe("a launched session's first turn", () => {
     const custom = 'Use the Plannotator Inbox for anything I should see; I am not watching this terminal.'
     const { wake } = await start('custom', LAUNCHED_ROOT, { prompts: { inbox: { reminder: custom } } })
     expect(wake).toBe(`${inboxWakeText(LAUNCHED_ROOT)}\n\n${inboxReminderFor(custom, TOOL)}`)
+  })
+
+  test("the person's rules (prompts.inbox rules) follow the reminder on the launched wake, as on a typed first prompt", async () => {
+    const rules = 'Only message me when you are blocked or done.'
+    const { on, world, wake } = await start('rules', LAUNCHED_ROOT, { prompts: { inbox: { rules } } })
+    expect(wake).toBe(`${inboxWakeText(LAUNCHED_ROOT)}\n\n${inboxReminderText(TOOL)}\n\n${INBOX_RULES_LEAD}\n${rules}`)
+    expect((await typedPromptContext(on('prompt.submit'), world.$)).join('\n')).not.toContain(rules)
+  })
+
+  test("rules set only for another agent, or past the cap, are not on the launched wake", async () => {
+    const other = await start('rules-other', LAUNCHED_ROOT, { prompts: { inbox: { runtimes: { pi: { rules: 'Pi only.' } } } } })
+    expect(other.wake).toBe(`${inboxWakeText(LAUNCHED_ROOT)}\n\n${inboxReminderText(TOOL)}`)
+    const long = await start('rules-long', LAUNCHED_ROOT, { prompts: { inbox: { rules: 'x'.repeat(INBOX_REMINDER_MAX_CHARS) } } })
+    expect(long.wake).toBe(`${inboxWakeText(LAUNCHED_ROOT)}\n\n${inboxReminderText(TOOL)}`)
+  })
+})
+
+// The Inbox's note that this session's questions moved to another thread (resolve_message's `moved_to`), through the
+// mod's real delivery: the notice line under the first line, never the person's reply wrapper, whose "answer in the
+// same thread" would bring the archived thread back to the person.
+describe("the note that a session's questions moved", () => {
+  test("goes in as the Inbox's notice, never under the reply wrapper", async () => {
+    const note =
+      'Your questions in "Retry policy" (msg_01JZOLD00000000000000000) were moved to another thread by Codex: "Morning brief" (msg_01JZBRIEF000000000000000). Don\'t wait on them here. The person answers there, and Codex gets the answer.'
+    const moved: InboxReplyCommand = { type: 'reply', id: 'msg_01JZNOTE00000000000000000', thread_id: 'msg_01JZOLD00000000000000000', reply_to: 'msg_01JZOLD00000000000000000', subject: 'Retry policy', body: note, url: 'http://127.0.0.1:4100/#thread=msg_01JZOLD00000000000000000', moved: true }
+    const { wake } = await start('moved', moved)
+    expect(wake.split('\n')).toEqual(['Plannotator Inbox: Retry policy (msg_01JZNOTE00000000000000000)', INBOX_MOVED_WAKE_INSTRUCTION, '', note, '', '[thread msg_01JZOLD00000000000000000]'])
+    expect(wake).not.toContain(INBOX_WAKE_INSTRUCTION)
   })
 })
